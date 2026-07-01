@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import time
 from pathlib import Path
@@ -57,7 +58,8 @@ def resolve_embedding_sources(
     embeddings_suffix: str,
 ) -> list[tuple[Path, Path, str]]:
     sources = []
-    for embeddings_path in sorted(Path().glob(embeddings_glob)):
+    matched_paths = sorted(Path(path) for path in glob.glob(embeddings_glob))
+    for embeddings_path in matched_paths:
         video_id = infer_video_id(embeddings_path, embeddings_prefix, embeddings_suffix)
         metadata_path = Path(embedding_metadata_template.format(video_id=video_id))
         sources.append((embeddings_path, metadata_path, video_id))
@@ -293,14 +295,20 @@ def main() -> None:
             "video_id": record.get("video_id"),
             "shot_id": record.get("shot_id", ""),
             "segment_id": record.get("segment_id", ""),
+            "shot_index": record.get("shot_index"),
+            "shot_start": record.get("shot_start"),
+            "shot_end": record.get("shot_end"),
             "timestamp": record.get("timestamp"),
             "timestamp_source": infer_timestamp_source(record),
             "timestamp_confidence": infer_timestamp_confidence(record),
             "frame_index": record.get("frame_index"),
             "keyframe_path": record.get("keyframe_path"),
             "thumbnail_path": record.get("thumbnail_path", record.get("keyframe_path")),
+            "source_video_path": record.get("source_video_path") or record.get("video_path"),
+            "video_path": record.get("video_path") or record.get("source_video_path"),
             "embedding_id": record.get("embedding_id"),
             "embedding_index": record.get("embedding_index"),
+            "selection_reason": record.get("selection_reason"),
         }
         for record in index_records
     }

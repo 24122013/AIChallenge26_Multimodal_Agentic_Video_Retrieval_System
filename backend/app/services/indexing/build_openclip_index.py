@@ -15,7 +15,7 @@ try:
 except ImportError as exc:  # pragma: no cover - depends on local environment.
     raise SystemExit(
         "OpenCLIP, PyTorch, Pillow, and NumPy are required. Install them with: "
-        "pip install -r backend/requirements.txt"
+        "pip install -r requirements.txt"
     ) from exc
 
 
@@ -132,10 +132,18 @@ def encode_keyframes(
                         "video_id": record["video_id"],
                         "shot_id": record.get("shot_id", ""),
                         "segment_id": record.get("segment_id", ""),
+                        "shot_index": record.get("shot_index"),
+                        "shot_start": record.get("shot_start"),
+                        "shot_end": record.get("shot_end"),
                         "timestamp": record["timestamp"],
+                        "timestamp_source": record.get("timestamp_source"),
+                        "timestamp_confidence": record.get("timestamp_confidence"),
                         "frame_index": record.get("frame_index"),
                         "keyframe_path": record["keyframe_path"],
                         "thumbnail_path": record.get("thumbnail_path", record["keyframe_path"]),
+                        "source_video_path": record.get("source_video_path") or record.get("video_path"),
+                        "video_path": record.get("video_path") or record.get("source_video_path"),
+                        "selection_reason": record.get("selection_reason"),
                         "model_name": model_tag,
                         "vector_dim": int(features_np.shape[1]),
                         "embedding_index": embedding_index,

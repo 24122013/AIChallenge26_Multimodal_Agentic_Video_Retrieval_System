@@ -12,7 +12,7 @@ from typing import Protocol
 
 import numpy as np
 
-from backend.app.models.retrieval import RetrievalResult, VisualSearchResponse
+from backend.app.models.retrieval import NeighborFrame, RetrievalResult, VisualSearchResponse
 from backend.app.services.metadata.metadata_store import FrameRecord, MetadataStore
 
 
@@ -189,11 +189,33 @@ class VisualSearchEngine:
             record = self.metadata_store.get_by_faiss_index(faiss_index)
             if record is None:
                 continue
-            results.append(frame_record_to_result(record, float(raw_score)))
+            neighbors = self.metadata_store.get_same_shot_neighbors(
+                faiss_index=faiss_index,
+                max_neighbors=4,
+            )
+            results.append(frame_record_to_result(record, float(raw_score), neighbors))
         return results
 
 
-def frame_record_to_result(record: FrameRecord, score: float) -> RetrievalResult:
+def frame_record_to_neighbor(record: FrameRecord) -> NeighborFrame:
+    return NeighborFrame(
+        video_id=record.video_id,
+        frame_id=record.frame_id,
+        segment_id=record.segment_id,
+        shot_id=record.shot_id,
+        timestamp=record.timestamp,
+        frame_index=record.frame_index,
+        faiss_index=record.faiss_index,
+        keyframe_path=record.keyframe_path,
+        thumbnail_path=record.thumbnail_path,
+    )
+
+
+def frame_record_to_result(
+    record: FrameRecord,
+    score: float,
+    neighbors: list[FrameRecord] | None = None,
+) -> RetrievalResult:
     return RetrievalResult(
         video_id=record.video_id,
         frame_id=record.frame_id,
@@ -207,4 +229,5 @@ def frame_record_to_result(record: FrameRecord, score: float) -> RetrievalResult
         score=round(score, 6),
         keyframe_path=record.keyframe_path,
         thumbnail_path=record.thumbnail_path,
+        neighbors=[frame_record_to_neighbor(neighbor) for neighbor in neighbors or []],
     )

@@ -5,6 +5,24 @@ from dataclasses import asdict, dataclass, field
 
 
 @dataclass(frozen=True)
+class NeighborFrame:
+    """Frame shown as temporal context for a retrieval hit."""
+
+    video_id: str
+    frame_id: str
+    timestamp: float
+    shot_id: str = ""
+    segment_id: str = ""
+    faiss_index: int | None = None
+    frame_index: int | None = None
+    keyframe_path: str = ""
+    thumbnail_path: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class RetrievalResult:
     """Unified response item returned by retrieval modules."""
 
@@ -23,9 +41,12 @@ class RetrievalResult:
     caption: str = ""
     ocr_text: str = ""
     objects: list[str] = field(default_factory=list)
+    neighbors: list[NeighborFrame] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        data["neighbors"] = [neighbor.to_dict() for neighbor in self.neighbors]
+        return data
 
 
 @dataclass(frozen=True)
