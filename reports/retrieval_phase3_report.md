@@ -2,7 +2,6 @@
 
 ## 1. Ket luan nhanh
 
-Retrieval Phase 3 khong can doi cac thanh vien khac de lam core service.
 Phan co the lam doc lap da duoc trien khai tren nhanh `phase3`:
 
 - Hybrid reranking cho top visual candidates.
