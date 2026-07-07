@@ -6,6 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from backend.app.models.retrieval import VisualSearchResponse
+from backend.app.services.retrieval.hybrid_search import HybridSearchEngine, TemporalMatch
 from backend.app.services.retrieval.search_visual import (
     VisualSearchConfig,
     VisualSearchEngine,
@@ -37,5 +38,18 @@ def get_visual_search_engine() -> VisualSearchEngine:
     return VisualSearchEngine(load_visual_search_config())
 
 
+@lru_cache(maxsize=1)
+def get_hybrid_search_engine() -> HybridSearchEngine:
+    return HybridSearchEngine(get_visual_search_engine())
+
+
 def search_visual(query: str, top_k: int | None = None) -> VisualSearchResponse:
     return get_visual_search_engine().search(query=query, top_k=top_k)
+
+
+def search_hybrid(query: str, top_k: int | None = None) -> VisualSearchResponse:
+    return get_hybrid_search_engine().search(query=query, top_k=top_k)
+
+
+def search_temporal(query: str, top_k: int | None = None) -> list[TemporalMatch]:
+    return get_hybrid_search_engine().temporal_search(query=query, top_k=top_k)
