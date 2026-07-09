@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from typing import Iterable
 
 from backend.app.models.retrieval import RetrievalResult
+from backend.app.services.retrieval.candidate_merger import dedupe_by_same_shot
 
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -51,7 +52,7 @@ class HybridReranker:
         scored.sort(key=lambda item: (item.score, item.timestamp_confidence), reverse=True)
 
         if self.config.dedupe_same_shot:
-            scored = _dedupe_by_video_shot(scored)
+            scored = dedupe_by_same_shot(scored)
 
         if top_k is None:
             return scored
@@ -80,15 +81,3 @@ def _jaccard(left: set[str], right: set[str]) -> float:
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
-
-
-def _dedupe_by_video_shot(candidates: list[RetrievalResult]) -> list[RetrievalResult]:
-    seen: set[tuple[str, str]] = set()
-    kept: list[RetrievalResult] = []
-    for candidate in candidates:
-        key = (candidate.video_id, candidate.shot_id or candidate.frame_id)
-        if key in seen:
-            continue
-        seen.add(key)
-        kept.append(candidate)
-    return kept

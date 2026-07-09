@@ -1,0 +1,21 @@
+hybrid:
+  stage1_top_k: 500
+  rerank_pool_size: 100
+  default_top_k: 20
+  max_gap_seconds: 180.0
+
+weights:
+  visual: 0.45
+  caption: 0.25
+  ocr: 0.15
+  objects: 0.10
+  temporal: 0.05
+
+dedupe:
+  same_shot: true
+  same_frame: true
+
+text_index:
+  path: data/indexes/retrieval_text_index.json
+  default_top_k: 20
+  max_top_k: 200

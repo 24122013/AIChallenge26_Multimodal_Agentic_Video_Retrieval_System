@@ -7,6 +7,7 @@ from pathlib import Path
 
 from backend.app.models.retrieval import RetrievalResult, VisualSearchResponse
 from backend.app.services.metadata.metadata_store import MetadataStore
+from backend.app.services.retrieval.candidate_merger import merge_candidates
 from backend.app.services.retrieval.hybrid_search import HybridSearchEngine
 from backend.app.services.retrieval.rerank import HybridReranker
 from backend.app.services.retrieval.temporal_search import (
@@ -134,6 +135,20 @@ class Phase3RetrievalTest(unittest.TestCase):
 
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0].video_id, "V001")
+
+    def test_candidate_merger_keeps_best_duplicate_and_dedupes_shot(self) -> None:
+        lower_duplicate = _result("F001", timestamp=10.0, score=0.4, shot_id="S001")
+        higher_duplicate = _result("F001", timestamp=10.0, score=0.9, shot_id="S001")
+        same_shot = _result("F002", timestamp=11.0, score=0.8, shot_id="S001")
+        other_shot = _result("F003", timestamp=20.0, score=0.7, shot_id="S002")
+
+        merged = merge_candidates(
+            [[lower_duplicate, same_shot], [higher_duplicate, other_shot]],
+            dedupe_same_shot=True,
+        )
+
+        self.assertEqual([item.frame_id for item in merged], ["F001", "F003"])
+        self.assertEqual(merged[0].score, 0.9)
 
 
 if __name__ == "__main__":

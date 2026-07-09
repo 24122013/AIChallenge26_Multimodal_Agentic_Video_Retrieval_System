@@ -1,13 +1,17 @@
-# Bao cao Retrieval Phase 3
+# Bao cao Retrieval Phase 2 + 3
 
 ## 1. Ket luan nhanh
 
-Phan co the lam doc lap da duoc trien khai tren nhanh `phase3`:
+Phan co the lam doc lap da duoc trien khai va gom tren nhanh `codex/retrieval-phase2-3`:
 
+- Phase 2 text index cho caption/OCR/ASR/object metadata.
+- Search wrapper cho caption, OCR, object.
+- Config weighted score tai `configs/retrieval.yaml`.
 - Hybrid reranking cho top visual candidates.
 - Temporal search cho query nhieu su kien theo thu tu thoi gian.
-- API endpoint cho hybrid search va temporal search.
-- Unit test pure-Python cho logic Phase 3.
+- Candidate merging va duplicate removal.
+- API endpoint cho visual, hybrid, caption, OCR, object, temporal search.
+- Unit test pure-Python cho logic Phase 2 va Phase 3.
 
 Tuy nhien, chat luong retrieval that van phu thuoc cac artifact tu pipeline khac:
 
@@ -16,6 +20,39 @@ Tuy nhien, chat luong retrieval that van phu thuoc cac artifact tu pipeline khac
 - Metadata caption, OCR, object, ASR neu muon hybrid score day du.
 
 ## 2. Pham vi da lam
+
+### Phase 2 text index va modality search
+
+File chinh:
+
+- `backend/app/services/indexing/build_text_index.py`
+- `backend/app/services/retrieval/text_index.py`
+- `backend/app/services/retrieval/search_caption.py`
+- `backend/app/services/retrieval/search_ocr.py`
+- `backend/app/services/retrieval/search_object.py`
+- `configs/retrieval.yaml`
+
+Lenh build text index:
+
+```bash
+python -m backend.app.services.indexing.build_text_index --metadata data/metadata/openclip_vit_b16_frame_map.json --output data/indexes/retrieval_text_index.json
+```
+
+Index nay doc cac field:
+
+- `caption`
+- `ocr` hoac `ocr_text`
+- `asr`, `asr_text`, hoac `transcript`
+- `objects`
+
+Endpoint/wrapper moi:
+
+- `POST /retrieval/caption`
+- `POST /retrieval/ocr`
+- `POST /retrieval/object`
+- `search_caption(query, top_k)`
+- `search_ocr(query, top_k)`
+- `search_object(query, top_k)`
 
 ### Hybrid rerank
 
@@ -36,6 +73,10 @@ hybrid_score =
 
 Reranker co the chay ngay ca khi chua co caption/OCR/object metadata. Modality nao thieu thi diem modality do bang 0, khong lam vo pipeline.
 
+Weights duoc cau hinh trong:
+
+- `configs/retrieval.yaml`
+
 ### Temporal search
 
 File chinh:
@@ -54,13 +95,15 @@ Da co:
 File chinh:
 
 - `backend/app/services/retrieval/hybrid_search.py`
+- `backend/app/services/retrieval/candidate_merger.py`
 
 Pipeline:
 
 ```text
 Stage 1: visual search top-500
-Stage 2: hybrid rerank pool top-100
-Stage 3: tra ve top-k hoac ghep temporal match
+Stage 2: candidate merge/dedupe
+Stage 3: hybrid rerank pool top-100
+Stage 4: tra ve top-k hoac ghep temporal match
 ```
 
 ### API va entrypoint
@@ -72,12 +115,18 @@ File da cap nhat:
 
 Endpoint moi:
 
+- `POST /retrieval/caption`
 - `POST /retrieval/hybrid`
+- `POST /retrieval/object`
+- `POST /retrieval/ocr`
 - `POST /retrieval/temporal`
 
 Wrapper Python moi:
 
+- `search_caption(query, top_k)`
 - `search_hybrid(query, top_k)`
+- `search_object(query, top_k)`
+- `search_ocr(query, top_k)`
 - `search_temporal(query, top_k)`
 
 ### Metadata support
@@ -98,8 +147,9 @@ Frame map bay gio co the doc va propagate cac field:
 Da pass:
 
 ```bash
+python -m unittest backend.tests.test_retrieval_phase2 backend.tests.test_retrieval_phase3
 python -m unittest backend.tests.test_retrieval_phase3
-python -m py_compile backend\app\services\metadata\metadata_store.py backend\app\services\retrieval\rerank.py backend\app\services\retrieval\temporal_search.py backend\app\services\retrieval\hybrid_search.py backend\app\services\retrieval\retrieval_manager.py backend\app\api\retrieval.py backend\tests\test_retrieval_phase3.py
+python -m py_compile backend\app\services\indexing\build_text_index.py backend\app\services\retrieval\text_index.py backend\app\services\retrieval\retrieval_config.py backend\app\services\retrieval\candidate_merger.py backend\app\services\retrieval\hybrid_search.py backend\app\services\retrieval\rerank.py backend\app\services\retrieval\retrieval_manager.py backend\app\api\retrieval.py backend\app\api\search.py backend\tests\test_retrieval_phase2.py backend\tests\test_retrieval_phase3.py
 ```
 
 Chua chay duoc test baseline cu trong moi truong hien tai:
@@ -121,11 +171,11 @@ Retrieval Phase 3 code da co the merge/push, nhung de demo chat luong that can c
 | Caption | Caption pipeline | Caption score bang 0 |
 | OCR | OCR pipeline | OCR score bang 0 |
 | Objects | Object detection pipeline | Object score bang 0 |
-| ASR | ASR pipeline | Chua duoc dua vao score Phase 3 hien tai |
+| ASR | ASR pipeline | Text index co doc ASR, nhung rerank hybrid chua cham ASR truc tiep |
 
 ## 5. Huong tiep theo
 
 1. Khi co artifact that, chay `/retrieval/hybrid` tren subset 100-500 video.
 2. Do Recall@10, Recall@50, latency cho CLIP-only va hybrid rerank.
-3. Them ASR/text-index score vao reranker neu metadata ASR da on dinh.
+3. Them ASR text score vao reranker neu metadata ASR da on dinh.
 4. Neu co VLM/LLM runtime, them expensive rerank cho top-20 hoac top-50.

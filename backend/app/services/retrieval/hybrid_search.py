@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from backend.app.models.retrieval import VisualSearchResponse
+from backend.app.services.retrieval.candidate_merger import merge_candidates
 from backend.app.services.retrieval.rerank import HybridReranker
 from backend.app.services.retrieval.temporal_search import (
     TemporalMatch,
@@ -43,7 +44,12 @@ class HybridSearchEngine:
         requested_top_k = top_k if top_k is not None else self.config.default_top_k
         stage1 = self.visual_engine.search(query, top_k=self.config.stage1_top_k)
         pool = stage1.results[: self.config.rerank_pool_size]
-        results = self.reranker.rerank(query=query, candidates=pool, top_k=requested_top_k)
+        merged_pool = merge_candidates([pool], dedupe_same_shot=False)
+        results = self.reranker.rerank(
+            query=query,
+            candidates=merged_pool,
+            top_k=requested_top_k,
+        )
         latency_ms = round((time.perf_counter() - started_at) * 1000, 3)
         return VisualSearchResponse(
             query=query,

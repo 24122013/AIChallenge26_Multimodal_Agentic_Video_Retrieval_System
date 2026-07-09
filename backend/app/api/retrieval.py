@@ -6,7 +6,10 @@ even when the web dependency has not been installed yet.
 from __future__ import annotations
 
 from backend.app.services.retrieval.retrieval_manager import (
+    search_caption,
     search_hybrid,
+    search_object,
+    search_ocr,
     search_temporal,
     search_visual,
 )
@@ -50,6 +53,39 @@ if APIRouter is not None:
         except Exception as exc:  # noqa: BLE001 - convert service errors to API response.
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    @router.post("/caption")
+    def caption_search_endpoint(body: VisualSearchBody) -> dict:
+        try:
+            return {
+                "success": True,
+                "data": search_caption(body.query, body.top_k).to_dict(),
+                "message": None,
+            }
+        except Exception as exc:  # noqa: BLE001 - convert service errors to API response.
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post("/ocr")
+    def ocr_search_endpoint(body: VisualSearchBody) -> dict:
+        try:
+            return {
+                "success": True,
+                "data": search_ocr(body.query, body.top_k).to_dict(),
+                "message": None,
+            }
+        except Exception as exc:  # noqa: BLE001 - convert service errors to API response.
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post("/object")
+    def object_search_endpoint(body: VisualSearchBody) -> dict:
+        try:
+            return {
+                "success": True,
+                "data": search_object(body.query, body.top_k).to_dict(),
+                "message": None,
+            }
+        except Exception as exc:  # noqa: BLE001 - convert service errors to API response.
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     @router.post("/temporal")
     def temporal_search_endpoint(body: VisualSearchBody) -> dict:
         try:
@@ -72,6 +108,18 @@ def visual_search(query: str, top_k: int = 20) -> dict:
 def hybrid_search(query: str, top_k: int = 20) -> dict:
     """Plain Python wrapper for Phase 3 hybrid reranking."""
     return search_hybrid(query=query, top_k=top_k).to_dict()
+
+
+def caption_search(query: str, top_k: int = 20) -> dict:
+    return search_caption(query=query, top_k=top_k).to_dict()
+
+
+def ocr_search(query: str, top_k: int = 20) -> dict:
+    return search_ocr(query=query, top_k=top_k).to_dict()
+
+
+def object_search(query: str, top_k: int = 20) -> dict:
+    return search_object(query=query, top_k=top_k).to_dict()
 
 
 def temporal_search(query: str, top_k: int = 20) -> list[dict]:
