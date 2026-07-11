@@ -42,6 +42,9 @@ class FrameRecord:
     thumbnail_path: str = ""
     embedding_id: str = ""
     embedding_index: int | None = None
+    shot_start: float | None = None
+    shot_end: float | None = None
+    shot_index: int | None = None
 
     # Timestamp provenance — bổ sung v1.1
     timestamp_source: str = "unknown"
@@ -66,6 +69,9 @@ class FrameRecord:
             thumbnail_path=data.get("thumbnail_path") or data.get("keyframe_path") or "",
             embedding_id=data.get("embedding_id") or "",
             embedding_index=data.get("embedding_index"),
+            shot_start=_optional_float(data.get("shot_start")),
+            shot_end=_optional_float(data.get("shot_end")),
+            shot_index=data.get("shot_index"),
             timestamp_source=data.get("timestamp_source") or _infer_timestamp_source(data),
             timestamp_confidence=float(
                 data.get("timestamp_confidence") if data.get("timestamp_confidence") is not None
@@ -88,7 +94,16 @@ class FrameRecord:
             "thumbnail_path": self.thumbnail_path,
             "embedding_id": self.embedding_id,
             "embedding_index": self.embedding_index,
+            "shot_start": self.shot_start,
+            "shot_end": self.shot_end,
+            "shot_index": self.shot_index,
         }
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
 
 
 def _infer_timestamp_source(data: dict) -> str:
@@ -325,6 +340,43 @@ class MetadataStore:
             if abs(frame.timestamp - center.timestamp) <= window * 2.0:
                 result.append(frame)
         return sorted(result, key=lambda r: r.timestamp)
+
+    def get_same_shot_neighbors(
+        self,
+        faiss_index: int,
+        max_neighbors: int = 4,
+    ) -> list[FrameRecord]:
+        """Return nearby keyframes from the same shot as the retrieval hit.
+
+        New extraction metadata contains stable shot fields. Older metadata can
+        still use the timestamp-window fallback, which keeps existing indexes
+        usable while the team rebuilds artifacts.
+        """
+        center = self._by_faiss_index.get(faiss_index)
+        if center is None:
+            return []
+
+        video_frames = self.get_by_video_id(center.video_id)
+        if center.shot_id:
+            candidates = [
+                frame
+                for frame in video_frames
+                if frame.faiss_index != center.faiss_index
+                and frame.shot_id == center.shot_id
+            ]
+        elif center.shot_start is not None and center.shot_end is not None:
+            candidates = [
+                frame
+                for frame in video_frames
+                if frame.faiss_index != center.faiss_index
+                and center.shot_start <= frame.timestamp <= center.shot_end
+            ]
+        else:
+            candidates = self.get_neighbor_frames(faiss_index=faiss_index, window=2)
+
+        candidates = sorted(candidates, key=lambda frame: abs(frame.timestamp - center.timestamp))
+        candidates = candidates[:max(0, max_neighbors)]
+        return sorted(candidates, key=lambda frame: frame.timestamp)
 
     # ------------------------------------------------------------------
     # Stats & validation helpers
