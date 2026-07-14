@@ -229,5 +229,8 @@ def frame_record_to_result(
         score=round(score, 6),
         keyframe_path=record.keyframe_path,
         thumbnail_path=record.thumbnail_path,
+        caption=record.caption,
+        ocr_text=record.ocr_text,
+        objects=record.objects,
         neighbors=[frame_record_to_neighbor(neighbor) for neighbor in neighbors or []],
     )

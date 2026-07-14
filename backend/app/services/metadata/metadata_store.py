@@ -45,6 +45,9 @@ class FrameRecord:
     shot_start: float | None = None
     shot_end: float | None = None
     shot_index: int | None = None
+    caption: str = ""
+    ocr_text: str = ""
+    objects: list[str] = field(default_factory=list)
 
     # Timestamp provenance — bổ sung v1.1
     timestamp_source: str = "unknown"
@@ -72,6 +75,9 @@ class FrameRecord:
             shot_start=_optional_float(data.get("shot_start")),
             shot_end=_optional_float(data.get("shot_end")),
             shot_index=data.get("shot_index"),
+            caption=data.get("caption") or "",
+            ocr_text=data.get("ocr_text") or data.get("ocr") or "",
+            objects=_normalize_objects(data.get("objects")),
             timestamp_source=data.get("timestamp_source") or _infer_timestamp_source(data),
             timestamp_confidence=float(
                 data.get("timestamp_confidence") if data.get("timestamp_confidence") is not None
@@ -97,6 +103,9 @@ class FrameRecord:
             "shot_start": self.shot_start,
             "shot_end": self.shot_end,
             "shot_index": self.shot_index,
+            "caption": self.caption,
+            "ocr_text": self.ocr_text,
+            "objects": self.objects,
         }
 
 
@@ -104,6 +113,16 @@ def _optional_float(value: object) -> float | None:
     if value is None or value == "":
         return None
     return float(value)
+
+
+def _normalize_objects(value: object) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()]
 
 
 def _infer_timestamp_source(data: dict) -> str:
