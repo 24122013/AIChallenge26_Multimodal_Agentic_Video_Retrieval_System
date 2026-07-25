@@ -164,3 +164,186 @@ docs/keyframe_extraction.md                              # giải thích chi ti�
 - `siglip2_so400m_patch16_384_frame_map.json`, FAISS index và manifest phải được build cùng một encoder contract.
 - Sau khi extract lại keyframes thì cần encode lại embeddings và build lại FAISS.
 - Extractor chỉ dùng TransNetV2. Nếu thiếu FFmpeg hoặc TransNetV2 lỗi, sửa môi trường rồi chạy lại.
+
+## Multimodal metadata ingestion
+
+Bốn pipeline trong `backend/app/services/ingestion/` sinh artifact JSONL riêng,
+không sửa metadata keyframe gốc, SigLIP2 embeddings hoặc FAISS:
+
+- Caption: `Salesforce/blip-image-captioning-base`, baseline gọn, có batch GPU
+  và sinh caption tiếng Anh trực tiếp bằng Transformers.
+- OCR: EasyOCR với `vi` + `en`, phù hợp baseline song ngữ, giữ Unicode và trả
+  polygon/confidence.
+- Objects: Ultralytics YOLO11n (`yolo11n.pt`), checkpoint COCO nhỏ và dễ tái lập.
+- ASR: `faster-whisper` model `small`, auto language + VAD; có fallback sang
+  `openai-whisper` nếu package đó đã được cài.
+
+### Cài dependency
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+ffprobe -version
+```
+
+`ffmpeg-python` không cung cấp binary. Cần cài FFmpeg system sao cho cả
+`ffmpeg.exe` và `ffprobe.exe` có trong `PATH`. Model được lazy-load sau khi CLI
+parse xong; cache nằm dưới `data/model_cache/` và đã được Git ignore.
+
+### Chạy một video
+
+```powershell
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_caption.py --metadata-path data\metadata\keyframes_L27_V001.jsonl --device auto --batch-size 4 --segment-caption
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_ocr.py --metadata-path data\metadata\keyframes_L27_V001.jsonl --device auto --batch-size 4 --conf-threshold 0.3
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_object_detection.py --metadata-path data\metadata\keyframes_L27_V001.jsonl --device auto --batch-size 8 --conf-threshold 0.25 --iou-threshold 0.7
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_asr.py --video-path data\raw\video\L27_V001.mp4 --metadata-path data\metadata\keyframes_L27_V001.jsonl --device auto --backend auto --model-size small
+```
+
+### Chạy toàn dataset
+
+CLI nhận trực tiếp thư mục. Chúng tự chọn `keyframes_*.jsonl` hoặc `*.mp4`:
+
+```powershell
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_caption.py --metadata-path data\metadata --device auto --batch-size 4
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_ocr.py --metadata-path data\metadata --device auto --batch-size 4
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_object_detection.py --metadata-path data\metadata --device auto --batch-size 8
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_asr.py --video-path data\raw\video --metadata-path data\metadata --video-glob "*.mp4" --device auto
+```
+
+Output mặc định:
+
+```text
+data/metadata/captions_<video_id>.jsonl
+data/metadata/ocr_<video_id>.jsonl
+data/metadata/objects_<video_id>.jsonl
+data/metadata/asr_<video_id>.jsonl
+data/metadata/asr_segments_<video_id>.jsonl
+data/metadata/<artifact>_<video_id>_report.json
+```
+
+Mặc định, record đã có trong output được skip để resume an toàn. Dùng
+`--overwrite` để tạo lại artifact của pipeline đó. Record lỗi ảnh/model được ghi
+riêng và không dừng batch; frame không có text/object vẫn là success. ASR dùng
+`ffprobe`: video không có audio là `skipped/no_audio_stream`, không phải error.
+
+Schema đầy đủ và JSON mẫu nằm trong `docs/metadata_schema.md`.
+
+### Tài nguyên và giới hạn
+
+Ước lượng thực hành: BLIP base khoảng 2 GB VRAM, EasyOCR dưới 2 GB, YOLO11n
+dưới 1 GB và faster-whisper small khoảng 2–3 GB; RAM CPU nên có tối thiểu
+8 GB. Batch mặc định phù hợp GPU 8 GB nhưng nên giảm khi ảnh lớn hoặc CUDA OOM.
+BLIP và YOLO COCO có thể bỏ sót chữ nhỏ, vật thể miền chuyên biệt hoặc chi tiết
+tiếng Việt. EasyOCR không trả language tin cậy theo từng vùng nên artifact ghi
+tập ngôn ngữ cấu hình. Confidence ASR được suy ra từ `avg_logprob`, không phải
+xác suất đã calibration. `segment_caption` là phép khử trùng lặp caption frame,
+không phải một lượt suy luận video-temporal.
+
+## Neighbor index và segment-level metadata
+
+Hai bước này chỉ tạo thêm artifact indexing/metadata, không sửa metadata keyframe
+gốc và không thay đổi retrieval hoặc ranking. Thứ tự chạy khuyến nghị:
+
+```text
+keyframes_<video_id>.jsonl
+  -> neighbor index
+  -> caption/OCR/object/ASR ingestion
+  -> segment-level metadata
+```
+
+### Build neighbor index
+
+Neighbor được tính trong cùng `video_id` theo cửa sổ timestamp. Output chỉ lưu
+`frame_id` và `delta_seconds` của neighbor; timestamp, frame index và path đầy đủ
+vẫn được resolve từ frame map/keyframe metadata chuẩn.
+
+Chạy cho một video:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.indexing.build_neighbor_index `
+  --input data\metadata\keyframes_L27_V001.jsonl `
+  --output data\metadata\neighbors_L27_V001.jsonl `
+  --window-seconds 5
+```
+
+Chạy trên toàn bộ `keyframes_*.jsonl` trong thư mục:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.indexing.build_neighbor_index `
+  --input data\metadata `
+  --output data\metadata\neighbors_all.jsonl `
+  --window-seconds 5
+```
+
+Tool ưu tiên `timestamp` có sẵn. Nếu record chỉ có `frame_index`, FPS được lấy
+từ `fps`/`video_fps` của từng record. Chỉ dùng fallback chung khi mọi video đầu
+vào có cùng FPS:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.indexing.build_neighbor_index `
+  --input data\metadata\legacy_keyframes.jsonl `
+  --output data\metadata\legacy_neighbors.jsonl `
+  --window-seconds 5 `
+  --fps 25
+```
+
+Neighbor luôn được sort theo timestamp, không chứa center frame và không bao giờ
+trộn giữa hai video. Duplicate `(video_id, frame_id)` đồng nhất được bỏ; duplicate
+xung đột sẽ báo lỗi.
+
+### Build segment-level metadata
+
+Chế độ mặc định `--strategy auto` dùng `segment_id`, fallback `shot_id`, cùng
+`shot_start/shot_end` đã có từ keyframe extraction. Nếu metadata cũ không có
+boundary, dùng fixed-duration window:
+
+```powershell
+--strategy fixed --fixed-duration-seconds 10
+```
+
+Chạy cho một video sau khi đã sinh multimodal metadata:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.indexing.build_segment_metadata `
+  --input data\metadata\keyframes_L27_V001.jsonl `
+  --captions data\metadata\captions_L27_V001.jsonl `
+  --ocr data\metadata\ocr_L27_V001.jsonl `
+  --asr data\metadata\asr_L27_V001.jsonl `
+  --objects data\metadata\objects_L27_V001.jsonl `
+  --output data\metadata\segments_L27_V001.jsonl `
+  --strategy auto
+```
+
+Chạy toàn dataset:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.indexing.build_segment_metadata `
+  --input data\metadata `
+  --captions data\metadata `
+  --ocr data\metadata `
+  --asr data\metadata `
+  --objects data\metadata `
+  --output data\metadata\segments_all.jsonl `
+  --strategy auto
+```
+
+Khi nhận thư mục, tool tự chọn `keyframes_*.jsonl`, `captions_*.jsonl`,
+`ocr_*.jsonl`, `objects_*.jsonl` và `asr_*.jsonl`; `asr_segments_*` không được
+đọc lại để tránh duplicate.
+
+Mỗi segment chứa:
+
+- `segment_id`, `video_id`, `start_time`, `end_time`;
+- `start_frame`/`end_frame` khi nguồn có frame index;
+- `start_keyframe`, `end_keyframe`, `keyframe_ids`;
+- `captions_aggregated`, OCR, ASR và objects đã aggregate;
+- `source_ids`/`source_intervals` để truy ngược frame hoặc ASR chunk nguồn.
+
+Caption và OCR trùng được chuẩn hóa/gộp deterministic. ASR chỉ lấy chunk có
+khoảng thời gian giao với segment. Object có `track_id` được đếm theo track;
+nếu không có track, `occurrence_count_semantics` ghi rõ đây là số detection
+occurrence.
+
+Output JSONL được ghi compact và atomic. Chạy lại với cùng input/config cho cùng
+kết quả và tool từ chối ghi đè trực tiếp bất kỳ artifact nguồn nào. Schema,
+benchmark và các trade-off chi tiết nằm trong
+`reports/index_size_latency.md`.

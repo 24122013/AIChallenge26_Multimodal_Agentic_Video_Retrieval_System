@@ -61,13 +61,18 @@ def write_jsonl(records: list[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         for record in records:
-            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            file.write(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            )
 
 
-def write_json(data: dict | list, path: Path) -> None:
+def write_json(data: dict | list, path: Path, *, compact: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
+        if compact:
+            json.dump(data, file, ensure_ascii=False, separators=(",", ":"))
+        else:
+            json.dump(data, file, ensure_ascii=False, indent=2)
 
 
 def infer_video_id(path: Path, prefix: str, suffix: str) -> str:
@@ -372,7 +377,9 @@ def build_faiss_artifacts(
     frame_map = {
         str(record["faiss_index"]): frame_map_record(record) for record in index_records
     }
-    write_json(frame_map, frame_map_path)
+    # frame_map is a production artifact and can be large. Whitespace is not
+    # part of its contract, so compact JSON is backward compatible.
+    write_json(frame_map, frame_map_path, compact=True)
 
     runtime_sec = time.perf_counter() - started_at
     encoder_manifest = {

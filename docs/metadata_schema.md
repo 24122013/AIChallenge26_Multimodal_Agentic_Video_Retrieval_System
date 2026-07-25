@@ -200,3 +200,155 @@ query bằng OpenCLIP rồi search trong index SigLIP2.
 
 Caption, OCR, ASR và objects giữ schema hiện tại và không được tạo trong Phase
 2. Các pipeline OpenCLIP/artifact cũ cũng không bị xóa hoặc overwrite.
+
+## Multimodal ingestion metadata v1.0
+
+Caption, OCR, object detection và ASR là các JSONL độc lập. Chúng không sửa
+`keyframes_<video_id>.jsonl`, embedding, FAISS index hoặc frame map. Mọi record
+keyframe giữ nguyên giá trị của các khóa nhận dạng:
+
+`frame_id`, `video_id`, `segment_id`, `shot_id`, `timestamp`, `shot_start`,
+`shot_end`, `keyframe_path`, `source_video_path`.
+
+Các field provenance chung gồm:
+
+```json
+{
+  "schema_version": "1.0",
+  "pipeline": "caption|ocr|objects|asr|asr_segment_mapping",
+  "model_name": "checkpoint-or-backend",
+  "model_version": "installed-package-version",
+  "run_at": "2026-07-25T12:00:00+00:00",
+  "status": "success|skipped|error",
+  "skip_reason": "optional_machine_readable_reason",
+  "error": "optional_error_message"
+}
+```
+
+### Caption
+
+File: `captions_<video_id>.jsonl`.
+
+```json
+{
+  "frame_id": "FRAME_L27_V001_000001",
+  "video_id": "L27_V001",
+  "segment_id": "SHOT_L27_V001_000001",
+  "shot_id": "SHOT_L27_V001_000001",
+  "timestamp": 0.2,
+  "shot_start": 0.0,
+  "shot_end": 0.32,
+  "keyframe_path": "data/keyframes/L27_V001/FRAME_L27_V001_000001.jpg",
+  "source_video_path": "data/raw/video/L27_V001.mp4",
+  "schema_version": "1.0",
+  "pipeline": "caption",
+  "model_name": "Salesforce/blip-image-captioning-base",
+  "model_version": "4.x",
+  "run_at": "2026-07-25T12:00:00+00:00",
+  "status": "success",
+  "caption": "two people standing beside a red car on a street",
+  "caption_language": "en",
+  "segment_caption": "Two people standing beside a red car on a street."
+}
+```
+
+`segment_caption` chỉ xuất hiện khi bật `--segment-caption`. Caption frame vẫn
+luôn được giữ riêng.
+
+### OCR
+
+File: `ocr_<video_id>.jsonl`.
+
+```json
+{
+  "frame_id": "FRAME_L27_V001_000001",
+  "video_id": "L27_V001",
+  "status": "success",
+  "ocr_text": "THÀNH PHỐ HỒ CHÍ MINH",
+  "text_regions": [
+    {
+      "text": "THÀNH PHỐ HỒ CHÍ MINH",
+      "polygon": [[10.0, 20.0], [300.0, 20.0], [300.0, 60.0], [10.0, 60.0]],
+      "confidence": 0.94
+    }
+  ],
+  "languages": ["vi", "en"],
+  "confidence_threshold": 0.3
+}
+```
+
+Frame không có chữ có `status: "success"`, `ocr_text: ""` và
+`text_regions: []`. Unicode tiếng Việt được giữ nguyên; chỉ khoảng trắng được
+chuẩn hóa.
+
+### Objects
+
+File: `objects_<video_id>.jsonl`. `bbox_xyxy` dùng pixel và `image_size` có dạng
+`[width, height]`.
+
+```json
+{
+  "frame_id": "FRAME_L27_V001_000001",
+  "video_id": "L27_V001",
+  "status": "success",
+  "objects": [
+    {
+      "class_id": 0,
+      "class_name": "person",
+      "confidence": 0.88,
+      "bbox_xyxy": [12.0, 20.0, 210.0, 350.0]
+    }
+  ],
+  "object_classes": ["person"],
+  "class_counts": {"person": 1},
+  "image_size": [640, 360],
+  "confidence_threshold": 0.25,
+  "iou_threshold": 0.7
+}
+```
+
+Frame không có object vẫn là record thành công với ba collection rỗng.
+
+### ASR timeline và mapping
+
+`asr_<video_id>.jsonl` lưu timeline:
+
+```json
+{
+  "video_id": "L27_V001",
+  "source_video_path": "data/raw/video/L27_V001.mp4",
+  "transcript_segment_id": "ASR_L27_V001_000000",
+  "status": "success",
+  "start": 1.2,
+  "end": 3.8,
+  "text": "Xin chào các bạn",
+  "language": "vi",
+  "confidence": 0.91,
+  "avg_logprob": -0.09,
+  "no_speech_probability": 0.01
+}
+```
+
+Video không có audio sinh một record `status: "skipped"` với
+`skip_reason: "no_audio_stream"`. `asr_segments_<video_id>.jsonl` nhóm keyframe
+theo `segment_id` (fallback `shot_id`) và chỉ gắn transcript có khoảng thời gian
+giao với `[segment_start, segment_end]`:
+
+```json
+{
+  "video_id": "L27_V001",
+  "segment_id": "SHOT_L27_V001_000001",
+  "shot_id": "SHOT_L27_V001_000001",
+  "frame_ids": ["FRAME_L27_V001_000001"],
+  "segment_start": 0.0,
+  "segment_end": 4.0,
+  "transcript_text": "Xin chào các bạn",
+  "transcript_segments": [
+    {"start": 1.2, "end": 3.8, "text": "Xin chào các bạn", "language": "vi"}
+  ],
+  "status": "success"
+}
+```
+
+Mỗi pipeline còn sinh `<artifact>_<video_id>_report.json` chứa tổng số
+success/skip/error, runtime, throughput, model, device và đường dẫn input/output.

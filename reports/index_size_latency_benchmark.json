@@ -1,0 +1,62 @@
+{
+  "benchmark_kind": "synthetic_microbenchmark",
+  "build": {
+    "neighbor_index": {
+      "python_peak_memory_median_mb": 0.05161571502685547,
+      "runs": 3,
+      "runtime_max_ms": 215.73850000277162,
+      "runtime_median_ms": 212.86349999718368,
+      "runtime_min_ms": 202.7500000258442
+    },
+    "segment_metadata": {
+      "python_peak_memory_median_mb": 4.2132720947265625,
+      "runs": 3,
+      "runtime_max_ms": 401.0959999868646,
+      "runtime_median_ms": 364.90749998483807,
+      "runtime_min_ms": 350.00099998433143
+    }
+  },
+  "dataset": {
+    "asr_chunk_count": 288,
+    "caption_count": 1000,
+    "fps": 25.0,
+    "frames_per_shot": 5,
+    "frames_per_video": 250,
+    "keyframe_count": 1000,
+    "keyframe_interval_seconds": 1.0,
+    "object_record_count": 1000,
+    "ocr_record_count": 336,
+    "video_count": 4,
+    "window_seconds": 5.0
+  },
+  "environment": {
+    "machine": "AMD64",
+    "platform": "Windows-11-10.0.26100-SP0",
+    "processor": "AMD64 Family 25 Model 68 Stepping 1, AuthenticAMD",
+    "python": "3.13.9"
+  },
+  "lookup": {
+    "id_map_median_ms": 0.09439999121241271,
+    "linear_scan_median_ms": 26.2732999981381,
+    "query_count_per_run": 500,
+    "runs": 3,
+    "speedup": 278.3188818208641
+  },
+  "measurement": {
+    "memory_statistic": "median tracemalloc Python allocation peak",
+    "quality_benchmark_included": false,
+    "runs": 3,
+    "runtime_statistic": "median with min/max",
+    "vector_index_included": false
+  },
+  "size_bytes": {
+    "compact_neighbor_index": 781248,
+    "existing_frame_level_metadata": 887408,
+    "expanded_neighbor_counterfactual": 4393104,
+    "frame_map_compact_serialization": 410431,
+    "frame_map_pretty_serialization": 496433,
+    "segment_metadata": 357444,
+    "total_existing_plus_compact_artifacts": 2026100,
+    "total_existing_plus_expanded_artifacts": 5637956
+  }
+}
