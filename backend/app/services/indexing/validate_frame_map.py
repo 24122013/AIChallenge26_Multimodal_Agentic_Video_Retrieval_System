@@ -9,8 +9,8 @@ Nhiệm vụ:
 
 Usage:
     python backend/app/services/indexing/validate_frame_map.py \\
-        --frame-map data/metadata/openclip_vit_b16_frame_map.json \\
-        --faiss-index data/indexes/openclip_vit_b16_flat_ip.faiss \\
+        --frame-map data/metadata/siglip2_so400m_patch16_384_frame_map.json \\
+        --faiss-index data/indexes/siglip2_so400m_patch16_384_flat_ip.faiss \\
         --report data/metadata/frame_map_validation_report.json \\
         [--fix]  # Tự động bổ sung timestamp_source/confidence nếu thiếu
 """
@@ -124,6 +124,7 @@ def validate_frame_map(
 
     # 3. Per-record validation
     schema_errors = []
+    encoder_contract_warnings = []
     missing_timestamp_source = []
     fixed_frame_map = dict(frame_map)
 
@@ -140,6 +141,20 @@ def validate_frame_map(
                 "missing_fields": missing_fields,
                 "empty_fields": empty_fields,
             })
+
+        missing_encoder_fields = [
+            field
+            for field in ("model_name", "model_revision", "vector_dim")
+            if record.get(field) in ("", None)
+        ]
+        if missing_encoder_fields:
+            encoder_contract_warnings.append(
+                {
+                    "faiss_index": idx,
+                    "frame_id": record.get("frame_id"),
+                    "missing_fields": missing_encoder_fields,
+                }
+            )
 
         # timestamp_source / timestamp_confidence
         needs_fix = False
@@ -172,6 +187,13 @@ def validate_frame_map(
             f"'timestamp_source' field. Chạy với --fix để tự động bổ sung."
         )
 
+    if encoder_contract_warnings:
+        warnings.append(
+            f"MISSING_ENCODER_CONTRACT: {len(encoder_contract_warnings)} records are "
+            "missing model_name, model_revision, or vector_dim. Legacy frame maps remain "
+            "readable, but new SigLIP2 indexes must include these fields."
+        )
+
     # 4. Timestamp source summary
     source_counts: dict[str, int] = {}
     for rec in fixed_frame_map.values():
@@ -196,6 +218,8 @@ def validate_frame_map(
             "schema_error_count": len(schema_errors),
             "schema_errors_sample": schema_errors[:10],
             "missing_timestamp_source_count": len(missing_timestamp_source),
+            "encoder_contract_warning_count": len(encoder_contract_warnings),
+            "encoder_contract_warnings_sample": encoder_contract_warnings[:10],
             "fixes_applied_count": len(fixes_applied),
             "timestamp_source_distribution": source_counts,
         },
@@ -215,19 +239,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--frame-map",
         type=Path,
-        default=Path("data/metadata/openclip_vit_b16_frame_map.json"),
+        default=Path("data/metadata/siglip2_so400m_patch16_384_frame_map.json"),
         help="Đường dẫn tới frame_map.json",
     )
     parser.add_argument(
         "--faiss-index",
         type=Path,
-        default=Path("data/indexes/openclip_vit_b16_flat_ip.faiss"),
+        default=Path("data/indexes/siglip2_so400m_patch16_384_flat_ip.faiss"),
         help="Đường dẫn tới FAISS index file (.faiss)",
     )
     parser.add_argument(
         "--report",
         type=Path,
-        default=Path("data/metadata/frame_map_validation_report.json"),
+        default=Path(
+            "data/metadata/siglip2_so400m_patch16_384_frame_map_validation.json"
+        ),
         help="Đường dẫn xuất báo cáo JSON",
     )
     parser.add_argument(

@@ -45,6 +45,9 @@ class FrameRecord:
     shot_start: float | None = None
     shot_end: float | None = None
     shot_index: int | None = None
+    model_name: str = ""
+    model_revision: str = ""
+    vector_dim: int | None = None
 
     # Timestamp provenance — bổ sung v1.1
     timestamp_source: str = "unknown"
@@ -72,6 +75,9 @@ class FrameRecord:
             shot_start=_optional_float(data.get("shot_start")),
             shot_end=_optional_float(data.get("shot_end")),
             shot_index=data.get("shot_index"),
+            model_name=data.get("model_name") or "",
+            model_revision=data.get("model_revision") or "",
+            vector_dim=_optional_int(data.get("vector_dim")),
             timestamp_source=data.get("timestamp_source") or _infer_timestamp_source(data),
             timestamp_confidence=float(
                 data.get("timestamp_confidence") if data.get("timestamp_confidence") is not None
@@ -97,6 +103,9 @@ class FrameRecord:
             "shot_start": self.shot_start,
             "shot_end": self.shot_end,
             "shot_index": self.shot_index,
+            "model_name": self.model_name,
+            "model_revision": self.model_revision,
+            "vector_dim": self.vector_dim,
         }
 
 
@@ -104,6 +113,12 @@ def _optional_float(value: object) -> float | None:
     if value is None or value == "":
         return None
     return float(value)
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
 
 
 def _infer_timestamp_source(data: dict) -> str:

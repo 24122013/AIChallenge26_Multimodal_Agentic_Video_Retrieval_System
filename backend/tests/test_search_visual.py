@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 
 from backend.app.services.metadata.metadata_store import MetadataStore
 import backend.app.services.indexing.extract_keyframes as keyframe_extractor
@@ -16,8 +17,11 @@ from backend.app.services.indexing.extract_keyframes import (
     select_frame_indices,
 )
 from backend.app.services.retrieval.search_visual import (
+    EncoderContract,
+    Siglip2TextEncoder,
     VisualSearchConfig,
     VisualSearchEngine,
+    load_encoder_contract,
     normalize_query_vector,
 )
 
@@ -43,12 +47,135 @@ class FakeSearcher:
         )
 
 
+class FakeSiglip2Processor:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(self, *, text, padding: str, return_tensors: str):
+        self.calls.append(
+            {
+                "text": text,
+                "padding": padding,
+                "return_tensors": return_tensors,
+            }
+        )
+        return {
+            "input_ids": torch.tensor([[1, 2]], dtype=torch.int64),
+            "attention_mask": torch.tensor([[1, 1]], dtype=torch.int64),
+        }
+
+
+class FakeSiglip2Model:
+    def __init__(self, vector: list[float] | None = None) -> None:
+        self.vector = vector or [3.0, 4.0]
+        self.eval_called = False
+        self.get_text_features_called = False
+
+    def to(self, device: str):
+        self.device = device
+        return self
+
+    def eval(self):
+        self.eval_called = True
+        return self
+
+    def get_text_features(self, input_ids, attention_mask):
+        self.get_text_features_called = True
+        return torch.tensor([self.vector], dtype=torch.float32)
+
+
+def siglip2_contract(vector_dim: int = 2) -> EncoderContract:
+    return EncoderContract(
+        model_family="siglip2",
+        model_name="google/siglip2-so400m-patch16-384",
+        model_revision="test-revision",
+        processor_name="google/siglip2-so400m-patch16-384",
+        vector_dim=vector_dim,
+        input_resolution=384,
+        normalized=True,
+        similarity="cosine",
+        output_dtype="float32",
+    )
+
+
 class VisualSearchEngineTest(unittest.TestCase):
     def test_normalize_query_vector_returns_single_unit_vector(self) -> None:
         vector = normalize_query_vector(np.array([3.0, 4.0], dtype="float32"))
 
         self.assertEqual(vector.shape, (1, 2))
         self.assertAlmostEqual(float(np.linalg.norm(vector)), 1.0, places=6)
+
+    def test_siglip2_encoder_uses_processor_and_get_text_features(self) -> None:
+        model = FakeSiglip2Model()
+        processor = FakeSiglip2Processor()
+        encoder = Siglip2TextEncoder(
+            contract=siglip2_contract(),
+            device="cpu",
+            model=model,
+            processor=processor,
+        )
+
+        vector = encoder.encode("a red bus")
+
+        self.assertTrue(model.eval_called)
+        self.assertTrue(model.get_text_features_called)
+        self.assertEqual(
+            processor.calls,
+            [
+                {
+                    "text": ["a red bus"],
+                    "padding": "max_length",
+                    "return_tensors": "pt",
+                }
+            ],
+        )
+        self.assertEqual(vector.shape, (1, 2))
+        self.assertEqual(vector.dtype, np.float32)
+        self.assertAlmostEqual(float(np.linalg.norm(vector)), 1.0, places=6)
+
+    def test_siglip2_encoder_rejects_manifest_dimension_mismatch(self) -> None:
+        encoder = Siglip2TextEncoder(
+            contract=siglip2_contract(vector_dim=3),
+            device="cpu",
+            model=FakeSiglip2Model(),
+            processor=FakeSiglip2Processor(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not match FAISS manifest"):
+            encoder.encode("a red bus")
+
+    def test_load_encoder_contract_reads_siglip2_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            manifest_path = Path(tmp_dir) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.2",
+                        "encoder": {
+                            "model_family": "siglip2",
+                            "model_name": "google/siglip2-so400m-patch16-384",
+                            "model_revision": "test-revision",
+                            "processor_name": "google/siglip2-so400m-patch16-384",
+                            "vector_dim": 1152,
+                            "input_resolution": 384,
+                            "normalized": True,
+                            "similarity": "cosine",
+                            "output_dtype": "float32",
+                        },
+                        "index_type": "IndexFlatIP",
+                        "metric": "ip",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            contract = load_encoder_contract(manifest_path)
+
+            self.assertEqual(contract.model_family, "siglip2")
+            self.assertEqual(contract.vector_dim, 1152)
+            self.assertEqual(
+                contract.model_name, "google/siglip2-so400m-patch16-384"
+            )
 
     def test_search_maps_faiss_indices_to_retrieval_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

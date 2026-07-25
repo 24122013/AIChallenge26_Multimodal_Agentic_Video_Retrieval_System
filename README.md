@@ -1,6 +1,6 @@
 # AIChallenge26 Multimodal Agentic Video Retrieval System
 
-Repo này xây dựng baseline video retrieval cho kì thi: video -> shot-aware keyframes -> OpenCLIP embeddings -> FAISS -> search trả frame và frame lân cận cùng shot.
+Repo này xây dựng baseline video retrieval cho kì thi: video -> shot-aware keyframes -> SigLIP2 embeddings -> FAISS -> search trả frame và frame lân cận cùng shot.
 
 ## Pipeline hiện tại
 
@@ -9,12 +9,14 @@ data/raw/video/*.mp4
   -> TransNetV2 shot detection
   -> keyframe sampling + FFmpeg frame extraction + pHash dedup
   -> keyframe metadata JSONL
-  -> OpenCLIP image embeddings
-  -> FAISS IndexFlatIP + frame_map
-  -> text query -> OpenCLIP text embedding -> FAISS top-k -> results + same-shot neighbors
+  -> SigLIP2 image embeddings
+  -> FAISS IndexFlatIP + frame_map + encoder manifest
+  -> text query -> SigLIP2 text embedding -> FAISS top-k -> results + same-shot neighbors
 ```
 
-Baseline retrieval đang dùng OpenCLIP ViT-B/16 (`laion2b_s34b_b88k`) và FAISS `IndexFlatIP` với vector đã normalize, tức inner product hoạt động như cosine similarity.
+Indexing và retrieval mặc định dùng `google/siglip2-so400m-patch16-384`. Retrieval đọc model name, revision và vector dimension từ FAISS manifest để bảo đảm text query dùng đúng embedding space. FAISS dùng `IndexFlatIP` với vector đã normalize, tức inner product hoạt động như cosine similarity.
+
+Pipeline OpenCLIP cũ vẫn được giữ làm legacy baseline và cho tùy chọn CLIP dedup.
 
 ## Cài đặt
 
@@ -24,7 +26,7 @@ Chạy từ root repo bằng PowerShell:
 py -m venv .venv; .\.venv\Scripts\python.exe -m pip install --upgrade pip; .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-`requirements.txt` đã gồm các thư viện chính: OpenCV, PyTorch, OpenCLIP, FAISS CPU, Pillow, TransNetV2 PyTorch, FastAPI/Uvicorn.
+`requirements.txt` đã gồm các thư viện chính: OpenCV, PyTorch, Transformers, OpenCLIP, FAISS CPU, Pillow, TransNetV2 PyTorch, FastAPI/Uvicorn.
 
 Lưu ý: `ffmpeg-python` chỉ là Python wrapper, không tự cài binary FFmpeg. TransNetV2 PyTorch cần `ffmpeg.exe` trong `PATH`.
 
@@ -84,35 +86,40 @@ Nếu muốn bật CLIP dedup gần nhau:
 .\.venv\Scripts\python.exe -B backend\app\services\indexing\extract_keyframes.py --video-dir data\raw\video --enable-clip-dedup --phash-window-sec 12 --clip-similarity-threshold 0.985 --clip-window-sec 12
 ```
 
-## Bước 2: Encode keyframes bằng OpenCLIP
+## Bước 2: Encode keyframes bằng SigLIP2
 
 Chạy cho toàn bộ metadata keyframe:
 
 ```powershell
-Get-ChildItem data\metadata\keyframes_*.jsonl | ForEach-Object { $videoId = $_.BaseName -replace '^keyframes_', ''; .\.venv\Scripts\python.exe -B backend\app\services\indexing\build_openclip_index.py --metadata-path $_.FullName --embeddings-path "data\embeddings\openclip_vit_b16_$videoId.npy" --embedding-metadata-path "data\metadata\openclip_vit_b16_embeddings_$videoId.jsonl" --skipped-path "data\metadata\openclip_vit_b16_skipped_$videoId.jsonl" --benchmark-path "data\metadata\openclip_vit_b16_benchmark_$videoId.json" --batch-size 32 --device auto }
+Get-ChildItem data\metadata\keyframes_*.jsonl | ForEach-Object { .\.venv\Scripts\python.exe -B backend\app\services\indexing\build_siglip2_index.py --metadata-path $_.FullName --batch-size auto --num-workers 4 --device auto }
 ```
 
 Output chính:
 
 ```text
-data/embeddings/openclip_vit_b16_<video_id>.npy
-data/metadata/openclip_vit_b16_embeddings_<video_id>.jsonl
+data/embeddings/siglip2_so400m_patch16_384_<video_id>.npy
+data/metadata/siglip2_so400m_patch16_384_embeddings_<video_id>.jsonl
+data/metadata/siglip2_so400m_patch16_384_skipped_<video_id>.jsonl
+data/metadata/siglip2_so400m_patch16_384_benchmark_<video_id>.json
 ```
 
 ## Bước 3: Build FAISS index
 
 ```powershell
-.\.venv\Scripts\python.exe -B backend\app\services\indexing\build_faiss_index.py --embeddings-glob "data/embeddings/openclip_vit_b16_*.npy" --embedding-metadata-template "data/metadata/openclip_vit_b16_embeddings_{video_id}.jsonl" --index-path data\indexes\openclip_vit_b16_flat_ip.faiss --frame-map-path data\metadata\openclip_vit_b16_frame_map.json --manifest-path data\metadata\openclip_vit_b16_faiss_manifest.json --report-path data\metadata\openclip_vit_b16_index_report.json
+.\.venv\Scripts\python.exe -B backend\app\services\indexing\build_faiss_index.py --embeddings-glob "data/embeddings/siglip2_so400m_patch16_384_*.npy" --embedding-metadata-template "data/metadata/siglip2_so400m_patch16_384_embeddings_{video_id}.jsonl" --embeddings-prefix "siglip2_so400m_patch16_384_" --index-path data\indexes\siglip2_so400m_patch16_384_flat_ip.faiss --index-metadata-path data\metadata\siglip2_so400m_patch16_384_faiss_metadata.jsonl --frame-map-path data\metadata\siglip2_so400m_patch16_384_frame_map.json --manifest-path data\metadata\siglip2_so400m_patch16_384_faiss_manifest.json --report-path data\metadata\siglip2_so400m_patch16_384_index_report.json
 ```
 
 Output retrieval cần có:
 
 ```text
-data/indexes/openclip_vit_b16_flat_ip.faiss
-data/metadata/openclip_vit_b16_frame_map.json
+data/indexes/siglip2_so400m_patch16_384_flat_ip.faiss
+data/metadata/siglip2_so400m_patch16_384_frame_map.json
+data/metadata/siglip2_so400m_patch16_384_faiss_manifest.json
 ```
 
 ## Bước 4: Test retrieval bằng Python
+
+Retrieval tự đọc manifest để load đúng SigLIP2 checkpoint và kiểm tra query vector dimension trước khi search.
 
 ```powershell
 .\.venv\Scripts\python.exe -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person cooking', top_k=5), ensure_ascii=False, indent=2))"
@@ -137,16 +144,16 @@ Vì vậy cách test retrieval chắc chắn nhất hiện tại là gọi trự
 ## Kiểm tra nhanh
 
 ```powershell
-.\.venv\Scripts\python.exe -B -m unittest backend.tests.test_search_visual; .\.venv\Scripts\python.exe -B backend\app\services\indexing\extract_keyframes.py --help
+.\.venv\Scripts\python.exe -B -m unittest discover -s backend\tests -p "test_*.py"; .\.venv\Scripts\python.exe -B backend\app\services\indexing\extract_keyframes.py --help
 ```
 
 ## Cấu trúc quan trọng
 
 ```text
 backend/app/services/indexing/extract_keyframes.py       # TransNetV2 + keyframe sampling + dedup
-backend/app/services/indexing/build_openclip_index.py    # encode ảnh keyframe thành OpenCLIP embeddings
+backend/app/services/indexing/build_siglip2_index.py     # encode ảnh keyframe thành SigLIP2 embeddings
 backend/app/services/indexing/build_faiss_index.py       # gom embeddings thành FAISS + frame_map
-backend/app/services/retrieval/search_visual.py          # text query -> OpenCLIP -> FAISS -> results
+backend/app/services/retrieval/search_visual.py          # text query -> SigLIP2 -> FAISS -> results
 backend/app/services/metadata/metadata_store.py          # lookup frame_map và same-shot neighbors
 docs/keyframe_extraction.md                              # giải thích chi tiết chiến lược keyframe
 ```
@@ -154,6 +161,6 @@ docs/keyframe_extraction.md                              # giải thích chi ti�
 ## Ghi chú cho team
 
 - Dùng `.\.venv\Scripts\python.exe`, không dùng `python` global nếu máy có nhiều Python.
-- `data/metadata/openclip_vit_b16_frame_map.json` phải khớp với FAISS index.
+- `siglip2_so400m_patch16_384_frame_map.json`, FAISS index và manifest phải được build cùng một encoder contract.
 - Sau khi extract lại keyframes thì cần encode lại embeddings và build lại FAISS.
 - Extractor chỉ dùng TransNetV2. Nếu thiếu FFmpeg hoặc TransNetV2 lỗi, sửa môi trường rồi chạy lại.

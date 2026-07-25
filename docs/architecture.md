@@ -327,11 +327,11 @@ Lưu:
 
 * CLIP embeddings
 * OpenCLIP embeddings
-* SigLIP embeddings
+* SigLIP2 embeddings with a versioned encoder manifest
 
 Có thể sử dụng:
 
-* FAISS
+* FAISS `IndexFlatIP` over L2-normalized float32 vectors
 * Qdrant
 * Milvus
 
