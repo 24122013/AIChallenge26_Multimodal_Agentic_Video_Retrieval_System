@@ -1,4 +1,4 @@
-# Retrieval API Contract v0
+# Retrieval API Contract v0.1
 
 Owner: P4 Retrieval
 
@@ -46,22 +46,69 @@ Output:
 
 ## Runtime Inputs
 
-The visual retrieval service expects these artifacts:
+### Current implemented runtime
 
-- FAISS index: `data/indexes/openclip_vit_b16_flat_ip.faiss`
-- Frame map: `data/metadata/openclip_vit_b16_frame_map.json`
-- OpenCLIP model: `ViT-B-16` with `laion2b_s34b_b88k`
+The current `search_visual.py` implementation expects:
+
+- FAISS index:
+  `data/indexes/siglip2_so400m_patch16_384_flat_ip.faiss`
+- Frame map:
+  `data/metadata/siglip2_so400m_patch16_384_frame_map.json`
+- Manifest:
+  `data/metadata/siglip2_so400m_patch16_384_faiss_manifest.json`
+- Model cache: `data/model_cache/siglip2`
+
+Retrieval reads the model name, revision, vector dimension and normalization
+contract from the manifest. It encodes text with
+`model.get_text_features(**inputs)` and rejects a query/index dimension
+mismatch before FAISS search.
 
 These defaults can be overridden with environment variables:
 
 - `RETRIEVAL_INDEX_PATH`
 - `RETRIEVAL_FRAME_MAP_PATH`
-- `RETRIEVAL_MODEL_NAME`
-- `RETRIEVAL_PRETRAINED`
+- `RETRIEVAL_MANIFEST_PATH`
 - `RETRIEVAL_DEVICE`
 - `RETRIEVAL_MODEL_CACHE_DIR`
+- `RETRIEVAL_NO_AUTOCAST`
 - `RETRIEVAL_DEFAULT_TOP_K`
 - `RETRIEVAL_MAX_TOP_K`
+
+### Encoder contract
+
+The new offline indexing artifacts are:
+
+- FAISS index:
+  `data/indexes/siglip2_so400m_patch16_384_flat_ip.faiss`
+- Frame map:
+  `data/metadata/siglip2_so400m_patch16_384_frame_map.json`
+- Manifest:
+  `data/metadata/siglip2_so400m_patch16_384_faiss_manifest.json`
+
+The manifest `schema_version` is `1.2`. Its `encoder` object is the authoritative
+query-encoder contract:
+
+```json
+{
+  "model_family": "siglip2",
+  "model_name": "google/siglip2-so400m-patch16-384",
+  "model_revision": "<resolved-or-requested-revision>",
+  "processor_name": "google/siglip2-so400m-patch16-384",
+  "vector_dim": 1152,
+  "input_resolution": 384,
+  "normalized": true,
+  "similarity": "cosine",
+  "output_dtype": "float32"
+}
+```
+
+`vector_dim` above is illustrative. Retrieval must trust the value detected and
+stored in the actual manifest.
+
+The current retrieval runtime validates this contract, loads the exact model
+name and revision, uses the SigLIP2 processor with max-length padding, calls
+`get_text_features()`, L2-normalizes to float32 and verifies
+`encoder.vector_dim`.
 
 ## Definition of Done
 
