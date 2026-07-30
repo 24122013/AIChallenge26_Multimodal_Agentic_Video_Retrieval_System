@@ -225,6 +225,41 @@ class VisualSearchEngineTest(unittest.TestCase):
             self.assertEqual(response.results[0].score, 0.91)
             self.assertEqual(response.results[1].frame_id, "FRAME_L01_V001_000001")
 
+    def test_search_filters_scores_below_configured_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            frame_map_path = Path(tmp_dir) / "frame_map.json"
+            frame_map_path.write_text(
+                json.dumps(
+                    {
+                        "0": {
+                            "frame_id": "F000",
+                            "video_id": "V001",
+                            "timestamp": 0.0,
+                            "keyframe_path": "data/keyframes/V001/F000.jpg",
+                        },
+                        "1": {
+                            "frame_id": "F001",
+                            "video_id": "V001",
+                            "timestamp": 1.0,
+                            "keyframe_path": "data/keyframes/V001/F001.jpg",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            engine = VisualSearchEngine(
+                config=VisualSearchConfig(default_top_k=3, min_score=0.8),
+                encoder=FakeEncoder(),
+                searcher=FakeSearcher(),
+                metadata_store=MetadataStore.from_frame_map(frame_map_path),
+            )
+
+            response = engine.search("a man cooking in a kitchen")
+
+            self.assertEqual(len(response.results), 1)
+            self.assertEqual(response.results[0].frame_id, "F001")
+            self.assertEqual(response.results[0].modality_scores, {"visual": 0.91})
+
     def test_search_returns_neighbors_from_same_shot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             frame_map_path = Path(tmp_dir) / "frame_map.json"

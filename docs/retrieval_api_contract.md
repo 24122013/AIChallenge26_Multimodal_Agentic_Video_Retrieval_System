@@ -2,7 +2,14 @@
 
 Owner: P4 Retrieval
 
-Phase 1 scope is visual text-to-keyframe retrieval only.
+Implemented scope:
+
+- Phase 1: SigLIP2 visual text-to-keyframe retrieval.
+- Phase 2: lexical caption, OCR, ASR and object retrieval.
+- Phase 3: hybrid candidate merge/rerank and ordered temporal retrieval.
+
+Phase 2 and multimodal Phase 3 require a generated Retrieval text index. Hybrid
+mode degrades to visual-only when that optional index is not present.
 
 ## Visual Search
 
@@ -38,7 +45,11 @@ Output:
       "thumbnail_path": "data/keyframes/L01_V001/000001.jpg",
       "caption": "",
       "ocr_text": "",
-      "objects": []
+      "asr_text": "",
+      "objects": [],
+      "modality_scores": {
+        "visual": 0.92
+      }
     }
   ]
 }
@@ -73,6 +84,35 @@ These defaults can be overridden with environment variables:
 - `RETRIEVAL_NO_AUTOCAST`
 - `RETRIEVAL_DEFAULT_TOP_K`
 - `RETRIEVAL_MAX_TOP_K`
+- `RETRIEVAL_MIN_SCORE`
+- `RETRIEVAL_TEXT_INDEX_PATH`
+- `RETRIEVAL_CONFIG_PATH`
+
+`RETRIEVAL_MIN_SCORE` is optional. When set, visual candidates below the
+threshold are discarded instead of returning a low-confidence match merely to
+fill `top_k`.
+
+## Multimodal and Hybrid Search
+
+Build the lexical text index after Metadata has generated caption, OCR, ASR,
+object or `segments_*.jsonl` artifacts:
+
+```powershell
+.\.venv\Scripts\python.exe -B backend\app\services\indexing\build_text_index.py `
+  --metadata data\metadata `
+  --output data\indexes\retrieval_text_index.json
+```
+
+Supported modes in `backend.app.api.search.search`:
+
+- `visual`: SigLIP2 query embedding against FAISS.
+- `caption`, `ocr`, `asr`, `object`: one lexical metadata modality.
+- `hybrid`: visual and available text candidates, deduplicated and reranked.
+- `temporal`: ordered subqueries in the same video with a configurable time gap.
+
+The mode-specific score is preserved in `modality_scores`. Text-only modes fail
+with a dependency-specific `FileNotFoundError` if the text index has not been
+built. The HTTP router converts this condition to HTTP 503.
 
 ### Encoder contract
 
@@ -117,3 +157,5 @@ name and revision, uses the SigLIP2 processor with max-length padding, calls
 - Invalid FAISS ids are skipped.
 - Missing metadata records are skipped.
 - Results always include `score`, `video_id`, `frame_id`, `timestamp`, and keyframe paths.
+- Low-score filtering is deterministic when `RETRIEVAL_MIN_SCORE` is configured.
+- Hybrid mode remains usable as visual-only when multimodal metadata is pending.

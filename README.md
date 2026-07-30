@@ -135,6 +135,39 @@ Mỗi result sẽ có:
 - `score`
 - `neighbors`: các keyframe lân cận cùng shot để UI hiển thị thêm ngữ cảnh.
 
+## Retrieval Phase 2-3: text, hybrid and temporal
+
+Sau khi role Metadata sinh caption/OCR/ASR/object hoac `segments_*.jsonl`, build
+text index:
+
+```powershell
+.\.venv\Scripts\python.exe -B backend\app\services\indexing\build_text_index.py `
+  --metadata data\metadata `
+  --output data\indexes\retrieval_text_index.json
+```
+
+Cac mode da co trong Python wrapper:
+
+```powershell
+.\.venv\Scripts\python.exe -c "from backend.app.api.search import search; print(search('a person cooking', 5, 'visual'))"
+.\.venv\Scripts\python.exe -c "from backend.app.api.search import search; print(search('a person cooking', 5, 'caption'))"
+.\.venv\Scripts\python.exe -c "from backend.app.api.search import search; print(search('a person cooking', 5, 'hybrid'))"
+.\.venv\Scripts\python.exe -c "from backend.app.api.search import search; print(search('a person enters then sits down', 5, 'temporal'))"
+```
+
+Mode `hybrid` tu dong fallback ve visual neu text index chua co. Cac mode
+`caption`, `ocr`, `asr`, `object` se bao ro artifact Metadata dang thieu.
+
+Neu khong muon tra ket qua visual co similarity qua thap:
+
+```powershell
+$env:RETRIEVAL_MIN_SCORE="0.10"
+```
+
+Nguong production can duoc chon tren tap query co ground truth, khong nen coi
+`0.10` la nguong mac dinh cho moi bo du lieu. Cau hinh weights va index path nam
+trong `configs/retrieval.yaml`.
+
 ## API
 
 Repo hiện có router/wrapper trong `backend/app/api/search.py`, nhưng chưa có file app tổng kiểu `main.py` tạo `FastAPI()` và `include_router(...)`.
