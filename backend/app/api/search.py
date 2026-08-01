@@ -7,6 +7,7 @@ from backend.app.services.retrieval.retrieval_manager import (
     search_hybrid,
     search_object,
     search_ocr,
+    search_qa_evidence,
     search_temporal,
     search_visual,
 )
@@ -65,6 +66,8 @@ def _dispatch_search(query: str, top_k: int, mode: str) -> dict:
         return search_asr(query=query, top_k=top_k).to_dict()
     if normalized in {"object", "objects"}:
         return search_object(query=query, top_k=top_k).to_dict()
+    if normalized in {"qa", "qa_evidence", "question", "question_answering"}:
+        return search_qa_evidence(question=query, top_k=top_k)
     if normalized == "temporal":
         matches = search_temporal(query=query, top_k=top_k)
         return {
@@ -74,5 +77,5 @@ def _dispatch_search(query: str, top_k: int, mode: str) -> dict:
         }
     raise ValueError(
         "Unsupported search mode. Expected visual, hybrid, caption, OCR, "
-        "ASR, object, or temporal."
+        "ASR, object, QA evidence, or temporal."
     )

@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 .env
 data/raw/video/
+data/raw/*.zip
 data/**/*.jpg
 data/**/*.jpeg
 data/**/*.png

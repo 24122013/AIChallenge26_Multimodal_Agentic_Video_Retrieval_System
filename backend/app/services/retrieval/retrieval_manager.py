@@ -7,6 +7,7 @@ from pathlib import Path
 
 from backend.app.models.retrieval import VisualSearchResponse
 from backend.app.services.retrieval.hybrid_search import HybridSearchEngine
+from backend.app.services.retrieval.qa_evidence import QaEvidenceSearchEngine
 from backend.app.services.retrieval.rerank import HybridReranker
 from backend.app.services.retrieval.retrieval_config import (
     RetrievalRuntimeConfig,
@@ -140,9 +141,15 @@ def get_hybrid_search_engine() -> HybridSearchEngine:
     )
 
 
+@lru_cache(maxsize=1)
+def get_qa_evidence_search_engine() -> QaEvidenceSearchEngine:
+    return QaEvidenceSearchEngine(get_hybrid_search_engine())
+
+
 def clear_retrieval_caches() -> None:
     """Clear cached engines after changing environment paths in tests or tools."""
     for cached in (
+        get_qa_evidence_search_engine,
         get_hybrid_search_engine,
         get_object_search_engine,
         get_asr_search_engine,
@@ -201,3 +208,14 @@ def search_temporal(
     top_k: int | None = None,
 ) -> list[TemporalMatch]:
     return get_hybrid_search_engine().temporal_search(query=query, top_k=top_k)
+
+
+def search_qa_evidence(
+    question: str,
+    top_k: int | None = None,
+) -> dict:
+    requested_top_k = 10 if top_k is None else int(top_k)
+    return get_qa_evidence_search_engine().search(
+        question=question,
+        top_k=requested_top_k,
+    )

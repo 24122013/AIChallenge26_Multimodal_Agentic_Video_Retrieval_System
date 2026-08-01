@@ -14,7 +14,10 @@ from backend.app.services.ingestion.asr_pipeline import (
     map_transcript_to_segments,
     run_asr_file,
 )
-from backend.app.services.ingestion.caption_pipeline import run_caption_file
+from backend.app.services.ingestion.caption_pipeline import (
+    BlipCaptionBackend,
+    run_caption_file,
+)
 from backend.app.services.ingestion.common import read_jsonl
 from backend.app.services.ingestion.object_pipeline import run_object_file
 from backend.app.services.ingestion.ocr_pipeline import run_ocr_file
@@ -26,6 +29,37 @@ class FakeCaptionBackend:
 
     def infer(self, paths: Sequence[Path]) -> Sequence[str]:
         return [f"a visible frame named {path.stem}" for path in paths]
+
+
+class FakeBlipProcessor:
+    def __init__(self) -> None:
+        self.inputs: dict[str, Any] = {}
+
+    def __call__(self, **kwargs: Any) -> dict[str, Any]:
+        import torch
+
+        self.inputs = kwargs
+        return {
+            "pixel_values": torch.zeros(
+                (len(kwargs["images"]), 3, 2, 2),
+                dtype=torch.float32,
+            )
+        }
+
+    def batch_decode(
+        self,
+        tokens: Any,
+        *,
+        skip_special_tokens: bool,
+    ) -> list[str]:
+        self.skip_special_tokens = skip_special_tokens
+        return ["a red object", "a blue object"]
+
+
+class FakeBlipModel:
+    def generate(self, **kwargs: Any) -> list[list[int]]:
+        self.inputs = kwargs
+        return [[1], [2]]
 
 
 class FakeOcrBackend:
@@ -242,6 +276,19 @@ class MultimodalIngestionTest(unittest.TestCase):
         self.assertEqual(objects[1]["objects"], [])
         self.assertEqual(objects[1]["status"], "success")
         self.assertEqual(objects[5]["status"], "error")
+
+    def test_blip_caption_backend_does_not_send_instruction_prompt(self) -> None:
+        processor = FakeBlipProcessor()
+        model = FakeBlipModel()
+        backend = BlipCaptionBackend(device="cpu")
+        backend._processor = processor
+        backend._model = model
+
+        values = backend.infer([self.one, self.two])
+
+        self.assertEqual(values, ["a red object", "a blue object"])
+        self.assertNotIn("text", processor.inputs)
+        self.assertTrue(processor.skip_special_tokens)
 
     def test_asr_mapping_uses_only_overlapping_time_ranges(self) -> None:
         transcript = FakeAsrBackend().transcribe(Path("unused"))[0]

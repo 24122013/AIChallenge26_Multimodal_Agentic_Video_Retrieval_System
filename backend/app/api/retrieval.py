@@ -11,6 +11,7 @@ from backend.app.services.retrieval.retrieval_manager import (
     search_hybrid,
     search_object,
     search_ocr,
+    search_qa_evidence,
     search_temporal,
     search_visual,
 )
@@ -69,6 +70,12 @@ if APIRouter is not None:
             }
         )
 
+    @router.post("/qa-evidence")
+    def qa_evidence_search_endpoint(body: VisualSearchBody) -> dict:
+        return _response(
+            lambda: search_qa_evidence(body.query, body.top_k)
+        )
+
     def _response(callable_) -> dict:
         try:
             return {
@@ -116,3 +123,7 @@ def temporal_search(query: str, top_k: int = 20) -> list[dict]:
         match.to_dict()
         for match in search_temporal(query=query, top_k=top_k)
     ]
+
+
+def qa_evidence_search(question: str, top_k: int = 10) -> dict:
+    return search_qa_evidence(question=question, top_k=top_k)

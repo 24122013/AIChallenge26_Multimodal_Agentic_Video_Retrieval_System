@@ -399,6 +399,42 @@ Ngưỡng production cần được chọn trên tập query có ground truth, k
 `0.10` là ngưỡng mặc định cho mọi bộ dữ liệu. Cấu hình weights và index path nằm
 trong `configs/retrieval.yaml`.
 
+## QA evidence retrieval
+
+Mode `qa`/`qa_evidence` hỗ trợ QA dạng human-in-the-loop: hệ thống không tự sinh
+câu trả lời mà tìm các frame liên quan để người dùng nhìn ảnh và chọn đáp án.
+Mode này dùng lại nguyên pipeline hybrid hiện có, không cần artifact hoặc model
+index mới.
+
+Ví dụ:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm cái gì?', 5, 'qa'), ensure_ascii=False, indent=2))"
+```
+
+Query planner sẽ:
+
+```text
+Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm cái gì?
+  -> Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm một vật
+  -> a woman wearing a red shirt sitting at a table holding an object
+  -> a woman wearing a red shirt sitting on a table holding an object
+```
+
+Các query Việt/Anh được search bằng hybrid, gộp theo frame, khử trùng cùng shot
+và cộng một bonus nhỏ cho frame xuất hiện trong nhiều query. Response chứa:
+
+- `answer_target`: loại thông tin cần quan sát, ví dụ `held_object`;
+- `retrieval_queries`: các query bằng chứng đã dùng;
+- `answer_mode = manual_visual_inspection`;
+- `results[].keyframe_path` và `thumbnail_path` để frontend hiển thị ảnh;
+- `timestamp`, `video_id`, caption/OCR/ASR/object và `neighbors` để xem ngữ cảnh.
+
+Endpoint tương ứng là `POST /retrieval/qa-evidence`. Repo chưa có FastAPI app
+tổng nên hiện tại có thể test chắc chắn bằng Python wrapper ở trên. Nếu không có
+frame khớp hoàn toàn, mode QA vẫn trả best-effort evidence; người dùng cần kiểm
+tra ảnh thay vì coi caption hoặc score là đáp án tự động.
+
 ## Kiểm tra sau khi build
 
 ### 1. Kiểm tra artifact bắt buộc
@@ -468,6 +504,12 @@ Temporal:
 
 ```powershell
 .\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person enters then sits down', 5, 'temporal'), ensure_ascii=False, indent=2))"
+```
+
+QA evidence:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm cái gì?', 5, 'qa'), ensure_ascii=False, indent=2))"
 ```
 
 ### 4. Đọc kết quả kiểm tra

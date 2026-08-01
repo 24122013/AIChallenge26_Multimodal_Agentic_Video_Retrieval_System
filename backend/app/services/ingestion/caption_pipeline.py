@@ -29,10 +29,6 @@ from backend.app.services.ingestion.common import (
 
 
 DEFAULT_MODEL_NAME = "Salesforce/blip-image-captioning-base"
-PROMPT = (
-    "an accurate retrieval caption describing visible people, actions, objects, "
-    "setting, prominent colors, spatial relations, and readable text:"
-)
 
 
 class CaptionBackend(Protocol):
@@ -89,8 +85,14 @@ class BlipCaptionBackend:
         try:
             for path in paths:
                 images.append(Image.open(path).convert("RGB"))
-            prompts = [PROMPT] * len(images)
-            inputs = self._processor(images=images, text=prompts, return_tensors="pt", padding=True)
+            # BLIP base is an image-captioning model, not an instruction-following
+            # model. Supplying a long text prompt makes the decoder reproduce that
+            # prompt instead of describing the image.
+            inputs = self._processor(
+                images=images,
+                return_tensors="pt",
+                padding=True,
+            )
             inputs = {
                 key: value.to(self.device) if hasattr(value, "to") else value
                 for key, value in inputs.items()
@@ -100,7 +102,7 @@ class BlipCaptionBackend:
             with torch.inference_mode():
                 tokens = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens)
             values = self._processor.batch_decode(tokens, skip_special_tokens=True)
-            return [value.removeprefix(PROMPT).strip() for value in values]
+            return [value.strip() for value in values]
         finally:
             for image in images:
                 image.close()
