@@ -196,6 +196,84 @@ class Phase3RetrievalTest(unittest.TestCase):
             ["enter", "cook"],
         )
 
+    def test_temporal_matching_prefers_complete_event_semantics(self) -> None:
+        first_event = [
+            _result(
+                "wrong_enter",
+                timestamp=10.0,
+                score=0.9,
+                caption="a person climbing a wall",
+            ),
+            _result(
+                "correct_enter",
+                timestamp=20.0,
+                score=0.7,
+                caption="a person entering a room",
+            ),
+        ]
+        second_event = [
+            _result(
+                "wrong_sit",
+                timestamp=30.0,
+                score=0.9,
+                caption="a man walking down the street",
+            ),
+            _result(
+                "correct_sit",
+                timestamp=40.0,
+                score=0.7,
+                caption="a man sitting down at a table",
+            ),
+        ]
+
+        matches = match_ordered_events(
+            [first_event, second_event],
+            max_gap_seconds=60.0,
+            event_queries=["a person enters", "a man sits down"],
+        )
+
+        self.assertEqual(
+            [event.frame_id for event in matches[0].events],
+            ["correct_enter", "correct_sit"],
+        )
+
+    def test_temporal_matching_does_not_reuse_a_frame_when_alternative_exists(
+        self,
+    ) -> None:
+        first_event = [
+            _result("same", timestamp=10.0, score=0.9),
+        ]
+        second_event = [
+            _result("same", timestamp=11.0, score=1.0),
+            _result("distinct", timestamp=12.0, score=0.8),
+        ]
+
+        matches = match_ordered_events(
+            [first_event, second_event],
+            max_gap_seconds=60.0,
+        )
+
+        self.assertEqual(
+            [event.frame_id for event in matches[0].events],
+            ["same", "distinct"],
+        )
+
+    def test_temporal_matching_keeps_best_effort_sparse_fallback(self) -> None:
+        matches = match_ordered_events(
+            [
+                [_result("only", timestamp=10.0, score=0.8)],
+                [_result("only", timestamp=10.0, score=0.7)],
+            ],
+            max_gap_seconds=60.0,
+            event_queries=["person enters", "person sits"],
+        )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(
+            [event.frame_id for event in matches[0].events],
+            ["only", "only"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

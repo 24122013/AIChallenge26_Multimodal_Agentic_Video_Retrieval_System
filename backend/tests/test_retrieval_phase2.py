@@ -12,6 +12,10 @@ from backend.app.services.indexing.build_text_index import (
 from backend.app.services.retrieval.retrieval_config import (
     load_retrieval_runtime_config,
 )
+from backend.app.services.retrieval.query_terms import (
+    content_tokens,
+    weighted_query_coverage,
+)
 from backend.app.services.retrieval.text_index import (
     TextIndexSearcher,
     build_text_index,
@@ -25,6 +29,24 @@ class Phase2RetrievalTest(unittest.TestCase):
         self.assertEqual(
             tokenize("Người đàn ông nấu ăn ở Thành phố Hồ Chí Minh"),
             ["người", "đàn", "ông", "nấu", "ăn", "ở", "thành", "phố", "hồ", "chí", "minh"],
+        )
+
+    def test_query_terms_normalize_actions_and_downweight_generic_subjects(
+        self,
+    ) -> None:
+        self.assertEqual(
+            content_tokens("a person sits down", fallback_to_all=True),
+            ["person", "sit", "down"],
+        )
+        self.assertGreater(
+            weighted_query_coverage(
+                "a person sits down",
+                "a person is sitting down",
+            ),
+            weighted_query_coverage(
+                "a person sits down",
+                "a person is walking down the street",
+            ),
         )
 
     def test_current_segment_schema_is_indexed_for_all_modalities(self) -> None:
@@ -89,6 +111,41 @@ class Phase2RetrievalTest(unittest.TestCase):
             self.assertEqual(ocr[0].frame_id, "F001")
             self.assertEqual(asr[0].asr_text, "hôm nay chúng ta nấu phở")
             self.assertEqual(objects[0].objects, ["person", "bowl"])
+
+    def test_text_search_prefers_complete_action_over_partial_overlap(
+        self,
+    ) -> None:
+        records = [
+            {
+                "video_id": "V1",
+                "frame_id": "walking",
+                "timestamp": 1.0,
+                "caption": "a person is walking down the street",
+            },
+            {
+                "video_id": "V1",
+                "frame_id": "sitting",
+                "timestamp": 2.0,
+                "caption": "a person is sitting down at a table",
+            },
+            {
+                "video_id": "V1",
+                "frame_id": "entering",
+                "timestamp": 3.0,
+                "caption": "a person is entering a room",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            index_path = Path(tmp_dir) / "retrieval_text_index.json"
+            write_text_index(records, index_path)
+            searcher = TextIndexSearcher(index_path)
+
+            sitting = searcher.search_results("a person sits down", "caption", 3)
+            entering = searcher.search_results("a person enters", "caption", 3)
+
+            self.assertEqual(sitting[0].frame_id, "sitting")
+            self.assertEqual(entering[0].frame_id, "entering")
+            self.assertGreater(sitting[0].score, sitting[1].score)
 
     def test_directory_loader_prefers_segments_all(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

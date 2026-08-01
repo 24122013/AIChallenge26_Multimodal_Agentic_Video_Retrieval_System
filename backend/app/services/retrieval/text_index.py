@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from backend.app.models.retrieval import RetrievalResult, VisualSearchResponse
+from backend.app.services.retrieval.query_terms import (
+    content_phrase_match,
+    content_tokens,
+    stem_token,
+    weighted_term_coverage,
+)
 
 
 _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
@@ -22,6 +28,7 @@ class TextIndexSearcher:
     def __init__(self, index_path: str | Path) -> None:
         self.index_path = Path(index_path)
         self._payload: dict[str, Any] | None = None
+        self._stem_postings: dict[str, dict[str, dict[str, int]]] = {}
 
     def _load(self) -> dict[str, Any]:
         if self._payload is not None:
@@ -71,8 +78,10 @@ class TextIndexSearcher:
         top_k: int = 20,
     ) -> list[RetrievalResult]:
         modality = normalize_modality(modality)
-        query_tokens = tokenize(query)
-        if not query_tokens:
+        query_terms = list(
+            dict.fromkeys(content_tokens(query, fallback_to_all=True))
+        )
+        if not query_terms:
             return []
 
         payload = self._load()
@@ -88,9 +97,14 @@ class TextIndexSearcher:
         doc_count = max(1, int(stats.get("doc_count") or len(documents) or 1))
         avg_len = max(1.0, float(stats.get("avg_doc_len") or 1.0))
         scores: dict[str, float] = {}
+        matched_terms: dict[str, set[str]] = {}
+        postings_by_stem = self._stem_postings.get(modality)
+        if postings_by_stem is None:
+            postings_by_stem = _merge_postings_by_stem(postings)
+            self._stem_postings[modality] = postings_by_stem
 
-        for token in query_tokens:
-            token_postings = postings.get(token, {})
+        for term in query_terms:
+            token_postings = postings_by_stem.get(term, {})
             if not isinstance(token_postings, dict):
                 continue
             doc_freq = len(token_postings)
@@ -108,17 +122,32 @@ class TextIndexSearcher:
                     avg_len=avg_len,
                     idf=idf,
                 )
+                matched_terms.setdefault(doc_id, set()).add(term)
 
+        quality_scores = {
+            doc_id: _lexical_quality_score(
+                query=query,
+                query_terms=query_terms,
+                matched_terms=matched_terms.get(doc_id, set()),
+                bm25_score=score,
+                document=documents.get(doc_id, {}),
+            )
+            for doc_id, score in scores.items()
+        }
         ranked_ids = sorted(
-            scores,
-            key=lambda doc_id: (scores[doc_id], doc_id),
+            quality_scores,
+            key=lambda doc_id: (
+                quality_scores[doc_id],
+                scores.get(doc_id, 0.0),
+                doc_id,
+            ),
             reverse=True,
         )[: max(0, int(top_k))]
         return [
             _document_to_result(
                 documents[doc_id],
                 modality=modality,
-                score=_normalize_score(scores[doc_id]),
+                score=quality_scores[doc_id],
             )
             for doc_id in ranked_ids
         ]
@@ -357,6 +386,51 @@ def _bm25(term_freq: float, doc_len: int, avg_len: float, idf: float) -> float:
 
 def _normalize_score(score: float) -> float:
     return round(score / (score + 1.0), 6)
+
+
+def _merge_postings_by_stem(
+    postings: dict[str, Any],
+) -> dict[str, dict[str, int]]:
+    """Merge raw-token postings so old indexes gain query-time stemming."""
+    merged: dict[str, dict[str, int]] = {}
+    for raw_token, raw_postings in postings.items():
+        if not isinstance(raw_postings, dict):
+            continue
+        stem = stem_token(raw_token)
+        if not stem:
+            continue
+        stem_postings = merged.setdefault(stem, {})
+        for doc_id, term_freq in raw_postings.items():
+            try:
+                count = int(term_freq)
+            except (TypeError, ValueError):
+                continue
+            stem_postings[str(doc_id)] = (
+                stem_postings.get(str(doc_id), 0) + max(0, count)
+            )
+    return merged
+
+
+def _lexical_quality_score(
+    *,
+    query: str,
+    query_terms: list[str],
+    matched_terms: set[str],
+    bm25_score: float,
+    document: Any,
+) -> float:
+    """Blend BM25 with query coverage without hard-filtering partial matches."""
+    document_text = (
+        str(document.get("text") or "") if isinstance(document, dict) else ""
+    )
+    coverage = weighted_term_coverage(query_terms, matched_terms)
+    phrase = content_phrase_match(query, document_text)
+    score = (
+        0.50 * _normalize_score(bm25_score)
+        + 0.40 * coverage
+        + 0.10 * phrase
+    )
+    return round(max(0.0, min(1.0, score)), 6)
 
 
 def _stats(documents: Iterable[dict[str, Any]]) -> dict[str, Any]:

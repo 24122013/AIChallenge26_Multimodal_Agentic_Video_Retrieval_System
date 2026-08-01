@@ -1,15 +1,15 @@
 """Phase 3 multimodal reranking for merged retrieval candidates."""
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, replace
 from typing import Iterable
 
 from backend.app.models.retrieval import RetrievalResult
 from backend.app.services.retrieval.candidate_merger import dedupe_by_same_shot
-
-
-_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+from backend.app.services.retrieval.query_terms import (
+    content_tokens,
+    weighted_term_coverage,
+)
 
 
 @dataclass(frozen=True)
@@ -76,19 +76,22 @@ class HybridReranker:
 
         caption = max(
             _unit(modality_scores.get("caption", 0.0)),
-            _jaccard(query_tokens, _tokens(candidate.caption)),
+            _metadata_match_score(query_tokens, _tokens(candidate.caption)),
         )
         ocr = max(
             _unit(modality_scores.get("ocr", 0.0)),
-            _jaccard(query_tokens, _tokens(candidate.ocr_text)),
+            _metadata_match_score(query_tokens, _tokens(candidate.ocr_text)),
         )
         asr = max(
             _unit(modality_scores.get("asr", 0.0)),
-            _jaccard(query_tokens, _tokens(candidate.asr_text)),
+            _metadata_match_score(query_tokens, _tokens(candidate.asr_text)),
         )
         objects = max(
             _unit(modality_scores.get("objects", 0.0)),
-            _jaccard(query_tokens, _tokens(" ".join(candidate.objects))),
+            _metadata_match_score(
+                query_tokens,
+                _tokens(" ".join(candidate.objects)),
+            ),
         )
         temporal = _unit(candidate.timestamp_confidence)
         weighted = (
@@ -104,7 +107,15 @@ class HybridReranker:
 
 
 def _tokens(text: str) -> set[str]:
-    return set(_TOKEN_RE.findall(str(text).casefold()))
+    return set(content_tokens(text, fallback_to_all=True))
+
+
+def _metadata_match_score(left: set[str], right: set[str]) -> float:
+    """Favor coverage of important query terms over incidental token overlap."""
+    if not left or not right:
+        return 0.0
+    coverage = weighted_term_coverage(left, right)
+    return 0.80 * coverage + 0.20 * _jaccard(left, right)
 
 
 def _jaccard(left: set[str], right: set[str]) -> float:

@@ -121,6 +121,7 @@ class HybridSearchEngine:
             event_results=event_results,
             max_gap_seconds=self.config.max_gap_seconds,
             top_k=bounded_top_k,
+            event_queries=[event.text for event in events],
         )
 
     def _top_k(self, requested: int | None) -> int:
