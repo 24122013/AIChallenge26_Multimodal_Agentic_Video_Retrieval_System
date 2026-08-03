@@ -3,6 +3,7 @@ opencv-python>=4.9.0
 open-clip-torch>=2.24.0
 faiss-cpu>=1.8.0
 pillow>=10.0.0
+PyYAML>=6.0
 torch>=2.2.0
 torchvision>=0.17.0
 transformers>=4.53.0
