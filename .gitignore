@@ -1,15 +1,18 @@
 
 .pytest_cache/
+.venv/
 __pycache__/
 *.py[cod]
 .env
 data/raw/video/
+data/raw/*.zip
 data/**/*.jpg
 data/**/*.jpeg
 data/**/*.png
 data/embeddings/
 data/indexes/
 data/model_cache/
+data/smoke/
 data/keyframes/*
 !data/keyframes/.gitkeep
 data/keyframes_*/

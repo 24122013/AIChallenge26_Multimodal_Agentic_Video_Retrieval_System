@@ -40,7 +40,9 @@ class RetrievalResult:
     timestamp_confidence: float = 0.0
     caption: str = ""
     ocr_text: str = ""
+    asr_text: str = ""
     objects: list[str] = field(default_factory=list)
+    modality_scores: dict[str, float] = field(default_factory=dict)
     neighbors: list[NeighborFrame] = field(default_factory=list)
 
     def to_dict(self) -> dict:

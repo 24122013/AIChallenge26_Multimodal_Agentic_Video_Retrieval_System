@@ -53,6 +53,13 @@ class FrameRecord:
     timestamp_source: str = "unknown"
     timestamp_confidence: float = 1.0
 
+    # Optional multimodal metadata. Production frame maps may omit these fields;
+    # text indexes can still provide them as independent candidate sources.
+    caption: str = ""
+    ocr_text: str = ""
+    asr_text: str = ""
+    objects: list[str] = field(default_factory=list)
+
     def __post_init__(self) -> None:
         if not self.thumbnail_path:
             self.thumbnail_path = self.keyframe_path
@@ -83,6 +90,14 @@ class FrameRecord:
                 data.get("timestamp_confidence") if data.get("timestamp_confidence") is not None
                 else _infer_timestamp_confidence(data)
             ),
+            caption=str(data.get("caption") or data.get("segment_caption") or ""),
+            ocr_text=str(data.get("ocr_text") or _joined_text(data.get("ocr"))),
+            asr_text=str(
+                data.get("asr_text")
+                or data.get("transcript_text")
+                or _joined_text(data.get("asr"))
+            ),
+            objects=_object_labels(data.get("objects") or data.get("object_classes")),
         )
 
     def to_dict(self) -> dict:
@@ -106,6 +121,10 @@ class FrameRecord:
             "model_name": self.model_name,
             "model_revision": self.model_revision,
             "vector_dim": self.vector_dim,
+            "caption": self.caption,
+            "ocr_text": self.ocr_text,
+            "asr_text": self.asr_text,
+            "objects": list(self.objects),
         }
 
 
@@ -119,6 +138,42 @@ def _optional_int(value: object) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
+
+
+def _joined_text(value: object) -> str:
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return str(value)
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            text = item.get("text") or item.get("transcript_text") or item.get("ocr_text")
+            if text:
+                parts.append(str(text))
+        elif item:
+            parts.append(str(item))
+    return " ".join(parts)
+
+
+def _object_labels(value: object) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if not isinstance(value, list):
+        return [str(value)]
+    labels: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            label = item.get("label") or item.get("class_name") or item.get("class")
+            if label:
+                labels.append(str(label))
+        elif item:
+            labels.append(str(item))
+    return list(dict.fromkeys(labels))
 
 
 def _infer_timestamp_source(data: dict) -> str:

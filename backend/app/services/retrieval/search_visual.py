@@ -44,6 +44,7 @@ class VisualSearchConfig:
     no_autocast: bool = False
     default_top_k: int = 20
     max_top_k: int = 200
+    min_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -383,6 +384,9 @@ class VisualSearchEngine:
     def _to_results(self, scores: np.ndarray, indices: np.ndarray) -> list[RetrievalResult]:
         results: list[RetrievalResult] = []
         for raw_score, raw_index in zip(scores, indices):
+            score = float(raw_score)
+            if self.config.min_score is not None and score < self.config.min_score:
+                continue
             faiss_index = int(raw_index)
             if faiss_index < 0:
                 continue
@@ -393,7 +397,7 @@ class VisualSearchEngine:
                 faiss_index=faiss_index,
                 max_neighbors=4,
             )
-            results.append(frame_record_to_result(record, float(raw_score), neighbors))
+            results.append(frame_record_to_result(record, score, neighbors))
         return results
 
 
@@ -429,5 +433,10 @@ def frame_record_to_result(
         score=round(score, 6),
         keyframe_path=record.keyframe_path,
         thumbnail_path=record.thumbnail_path,
+        caption=record.caption,
+        ocr_text=record.ocr_text,
+        asr_text=record.asr_text,
+        objects=list(record.objects),
+        modality_scores={"visual": round(score, 6)},
         neighbors=[frame_record_to_neighbor(neighbor) for neighbor in neighbors or []],
     )

@@ -241,13 +241,16 @@ không phải một lượt suy luận video-temporal.
 ## Neighbor index và segment-level metadata
 
 Hai bước này chỉ tạo thêm artifact indexing/metadata, không sửa metadata keyframe
-gốc và không thay đổi retrieval hoặc ranking. Thứ tự chạy khuyến nghị:
+gốc. Neighbor index là tùy chọn; segment metadata phải được build trước text
+index. Thứ tự chạy đầy đủ được khuyến nghị:
 
 ```text
 keyframes_<video_id>.jsonl
-  -> neighbor index
+  -> neighbor index (tùy chọn)
   -> caption/OCR/object/ASR ingestion
   -> segment-level metadata
+  -> Retrieval text index
+  -> caption/OCR/ASR/object/hybrid/temporal search
 ```
 
 ### Build neighbor index
@@ -347,3 +350,184 @@ Output JSONL được ghi compact và atomic. Chạy lại với cùng input/con
 kết quả và tool từ chối ghi đè trực tiếp bất kỳ artifact nguồn nào. Schema,
 benchmark và các trade-off chi tiết nằm trong
 `reports/index_size_latency.md`.
+
+## Retrieval Phase 2-3: text, hybrid and temporal
+
+Chỉ build text index sau khi đã sinh caption/OCR/ASR/object và build
+`segments_<video_id>.jsonl` hoặc `segments_all.jsonl`. Khi nhận một thư mục,
+tool ưu tiên đọc `segments_all.jsonl`, sau đó `segments_*.jsonl`, rồi mới
+fallback về các artifact multimodal riêng lẻ.
+
+```powershell
+.\.venv\Scripts\python.exe -B backend\app\services\indexing\build_text_index.py `
+  --metadata data\metadata `
+  --output data\indexes\retrieval_text_index.json
+```
+
+Mode `hybrid` tự động fallback về visual nếu text index chưa có. Các mode
+`caption`, `ocr`, `asr`, `object` sẽ báo rõ artifact Metadata đang thiếu.
+
+### Scoring lexical và temporal
+
+Text search giữ nguyên BM25 artifact nhưng bổ sung xử lý ở query time:
+
+- bỏ các stopword không mô tả nội dung;
+- stemming nhẹ cho động từ tiếng Anh, ví dụ `sits`/`sitting` -> `sit`;
+- ưu tiên document khớp đủ từ quan trọng và đúng cụm từ;
+- giảm trọng số của chủ thể chung như `person` so với hành động như `enter`;
+- không hard-filter partial match, vì vậy hệ thống vẫn trả best-effort result
+  khi dataset không có cảnh khớp hoàn toàn.
+
+Temporal search vẫn dùng cùng flow `hybrid candidates -> ordered event matching`.
+Pass đầu yêu cầu cùng video, timestamp tăng, frame khác nhau và gap nằm trong
+`max_gap_seconds`. Nếu không có chain hợp lệ, hệ thống nới gap rồi mới dùng
+fallback tương thích cho index quá thưa. Điểm chain ưu tiên event yếu nhất để
+một event đúng không che mất event còn lại bị sai.
+
+Thay đổi scoring này tương thích text index hiện có; không đổi schema artifact,
+CLI hoặc thứ tự pipeline. Khi query một event không tồn tại trong dataset, kết
+quả vẫn được trả nhưng cần đọc `score`, caption và `modality_scores` như một kết
+quả gần đúng, không phải ground truth.
+
+Nếu không muốn trả kết quả visual có similarity quá thấp:
+
+```powershell
+$env:RETRIEVAL_MIN_SCORE="0.10"
+```
+
+Ngưỡng production cần được chọn trên tập query có ground truth, không nên coi
+`0.10` là ngưỡng mặc định cho mọi bộ dữ liệu. Cấu hình weights và index path nằm
+trong `configs/retrieval.yaml`.
+
+## QA evidence retrieval
+
+Mode `qa`/`qa_evidence` hỗ trợ QA dạng human-in-the-loop: hệ thống không tự sinh
+câu trả lời mà tìm các frame liên quan để người dùng nhìn ảnh và chọn đáp án.
+Mode này dùng lại nguyên pipeline hybrid hiện có, không cần artifact hoặc model
+index mới.
+
+Ví dụ:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm cái gì?', 5, 'qa'), ensure_ascii=False, indent=2))"
+```
+
+Query planner sẽ:
+
+```text
+Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm cái gì?
+  -> Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm một vật
+  -> a woman wearing a red shirt sitting at a table holding an object
+  -> a woman wearing a red shirt sitting on a table holding an object
+```
+
+Các query Việt/Anh được search bằng hybrid, gộp theo frame, khử trùng cùng shot
+và cộng một bonus nhỏ cho frame xuất hiện trong nhiều query. Response chứa:
+
+- `answer_target`: loại thông tin cần quan sát, ví dụ `held_object`;
+- `retrieval_queries`: các query bằng chứng đã dùng;
+- `answer_mode = manual_visual_inspection`;
+- `results[].keyframe_path` và `thumbnail_path` để frontend hiển thị ảnh;
+- `timestamp`, `video_id`, caption/OCR/ASR/object và `neighbors` để xem ngữ cảnh.
+
+Endpoint tương ứng là `POST /retrieval/qa-evidence`. Repo chưa có FastAPI app
+tổng nên hiện tại có thể test chắc chắn bằng Python wrapper ở trên. Nếu không có
+frame khớp hoàn toàn, mode QA vẫn trả best-effort evidence; người dùng cần kiểm
+tra ảnh thay vì coi caption hoặc score là đáp án tự động.
+
+## Kiểm tra sau khi build
+
+### 1. Kiểm tra artifact bắt buộc
+
+```powershell
+Get-Item `
+  data\indexes\siglip2_so400m_patch16_384_flat_ip.faiss, `
+  data\metadata\siglip2_so400m_patch16_384_frame_map.json, `
+  data\metadata\siglip2_so400m_patch16_384_faiss_manifest.json, `
+  data\indexes\retrieval_text_index.json |
+  Select-Object FullName, Length, LastWriteTime
+```
+
+Nếu một đường dẫn báo `Cannot find path`, pipeline tương ứng chưa được build
+xong. Ba artifact SigLIP2/FAISS đầu tiên phục vụ `visual`; text index cuối cùng
+phục vụ `caption`, `ocr`, `asr`, `object` và `hybrid`.
+
+### 2. Kiểm tra số document của từng modality trong text index
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "import json; from pathlib import Path; p=json.loads(Path('data/indexes/retrieval_text_index.json').read_text(encoding='utf-8')); print(json.dumps({k:v.get('stats', {}) for k,v in p.get('modalities', {}).items()}, ensure_ascii=False, indent=2))"
+```
+
+`doc_count` lớn hơn `0` nghĩa là modality đó đã có dữ liệu để search. Nếu một
+modality có `doc_count = 0`, kiểm tra lại artifact nguồn và build lại segment,
+sau đó build lại text index.
+
+### 3. Test từng search mode
+
+Visual SigLIP2 + FAISS:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person cooking', 5, 'visual'), ensure_ascii=False, indent=2))"
+```
+
+Caption:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person cooking', 5, 'caption'), ensure_ascii=False, indent=2))"
+```
+
+OCR:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('restaurant menu', 5, 'ocr'), ensure_ascii=False, indent=2))"
+```
+
+ASR:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('how to prepare food', 5, 'asr'), ensure_ascii=False, indent=2))"
+```
+
+Object:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('person', 5, 'object'), ensure_ascii=False, indent=2))"
+```
+
+Hybrid:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person cooking', 5, 'hybrid'), ensure_ascii=False, indent=2))"
+```
+
+Temporal:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person enters then sits down', 5, 'temporal'), ensure_ascii=False, indent=2))"
+```
+
+QA evidence:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm cái gì?', 5, 'qa'), ensure_ascii=False, indent=2))"
+```
+
+### 4. Đọc kết quả kiểm tra
+
+- Không có exception và `results` là một list: mode đã load được artifact.
+- `results` rỗng không nhất thiết là lỗi; query có thể không khớp dữ liệu.
+- Trong kết quả `hybrid`, kiểm tra `modality_scores`. Các key như `caption`,
+  `ocr`, `asr` hoặc `objects` cho biết candidate có đóng góp từ text metadata.
+- Nếu chưa có `retrieval_text_index.json`, `hybrid` chỉ fallback về `visual`;
+  khi đó chưa được coi là kiểm tra multimodal hoàn chỉnh.
+- Với `temporal`, kiểm tra từng phần tử trong `events`. Tất cả event phải đúng
+  nội dung và có timestamp tăng; điểm thấp cho biết đây có thể là best-effort
+  fallback vì dataset không chứa đủ chuỗi hành động.
+
+### 5. Chạy test hồi quy Retrieval
+
+```powershell
+.\.venv\Scripts\python.exe -B -m unittest `
+  backend.tests.test_retrieval_phase2 `
+  backend.tests.test_retrieval_phase3
+```
