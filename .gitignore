@@ -4,6 +4,11 @@
 __pycache__/
 *.py[cod]
 .env
+
+# Local/public competition datasets and generated submissions.
+data/public/
+data/competition/
+
 data/raw/video/
 data/raw/*.zip
 data/**/*.jpg
