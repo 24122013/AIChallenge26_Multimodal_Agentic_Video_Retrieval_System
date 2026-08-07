@@ -38,7 +38,14 @@ from backend.app.services.indexing.build_siglip2_index import (
     write_json,
     write_jsonl,
 )
-from backend.app.services.indexing.extract_keyframes import extract_keyframes_for_video
+from backend.app.services.indexing.extract_keyframes import (
+    DEFAULT_DEDUP_TEMPORAL_WINDOW_SEC,
+    DEFAULT_LONG_SHOT_INTERVAL_SEC,
+    DEFAULT_PHASH_THRESHOLD,
+    DEFAULT_REGULAR_SHOT_MAX_SEC,
+    DEFAULT_SHORT_SHOT_MAX_SEC,
+    extract_keyframes_for_video,
+)
 from backend.app.services.indexing.normalize_keyframe_metadata import (
     image_to_small_array,
     mse,
@@ -289,6 +296,9 @@ def extract_command(args: argparse.Namespace) -> None:
             jpeg_quality=args.jpeg_quality,
             shot_threshold=args.shot_threshold,
             shot_device=args.device,
+            short_shot_max_sec=args.short_shot_max_sec,
+            regular_shot_max_sec=args.regular_shot_max_sec,
+            long_shot_interval_sec=args.long_shot_interval_sec,
         )
 
 
@@ -1080,10 +1090,25 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "cuda", "cpu"),
         default="auto",
     )
-    extract_parser.add_argument("--phash-threshold", type=int, default=6)
-    extract_parser.add_argument("--phash-window-sec", type=float, default=12.0)
+    extract_parser.add_argument(
+        "--phash-threshold", type=int, default=DEFAULT_PHASH_THRESHOLD
+    )
+    extract_parser.add_argument(
+        "--phash-window-sec",
+        type=float,
+        default=DEFAULT_DEDUP_TEMPORAL_WINDOW_SEC,
+    )
     extract_parser.add_argument("--jpeg-quality", type=int, default=95)
     extract_parser.add_argument("--shot-threshold", type=float, default=0.5)
+    extract_parser.add_argument(
+        "--short-shot-max-sec", type=float, default=DEFAULT_SHORT_SHOT_MAX_SEC
+    )
+    extract_parser.add_argument(
+        "--regular-shot-max-sec", type=float, default=DEFAULT_REGULAR_SHOT_MAX_SEC
+    )
+    extract_parser.add_argument(
+        "--long-shot-interval-sec", type=float, default=DEFAULT_LONG_SHOT_INTERVAL_SEC
+    )
     extract_parser.add_argument("--resume", action="store_true")
 
     embed_parser = subparsers.add_parser(

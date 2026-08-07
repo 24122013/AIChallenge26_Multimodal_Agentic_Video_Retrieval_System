@@ -313,6 +313,7 @@ def frame_map_record(record: dict) -> dict:
         "video_path": record.get("video_path") or record.get("source_video_path"),
         "embedding_id": record.get("embedding_id"),
         "embedding_index": record.get("embedding_index"),
+        "keyframe_strategy": record.get("keyframe_strategy"),
         "selection_reason": record.get("selection_reason"),
         "model_name": record.get("model_name"),
         "model_revision": record.get("model_revision"),

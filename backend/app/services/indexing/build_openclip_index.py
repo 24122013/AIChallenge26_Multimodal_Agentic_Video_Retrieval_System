@@ -143,6 +143,7 @@ def encode_keyframes(
                         "thumbnail_path": record.get("thumbnail_path", record["keyframe_path"]),
                         "source_video_path": record.get("source_video_path") or record.get("video_path"),
                         "video_path": record.get("video_path") or record.get("source_video_path"),
+                        "keyframe_strategy": record.get("keyframe_strategy"),
                         "selection_reason": record.get("selection_reason"),
                         "model_name": model_tag,
                         "vector_dim": int(features_np.shape[1]),

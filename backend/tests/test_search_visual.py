@@ -12,6 +12,8 @@ import torch
 from backend.app.services.metadata.metadata_store import MetadataStore
 import backend.app.services.indexing.extract_keyframes as keyframe_extractor
 from backend.app.services.indexing.extract_keyframes import (
+    KEYFRAME_STRATEGY,
+    PerceptualHashDeduper,
     Shot,
     extract_keyframes_for_video,
     select_frame_indices,
@@ -297,13 +299,57 @@ class VisualSearchEngineTest(unittest.TestCase):
             self.assertEqual(response.results[0].neighbors[0].frame_id, "FRAME_L01_V001_000001")
 
     def test_select_frame_indices_uses_competition_sampling_rules(self) -> None:
-        short_shot = Shot(shot_index=1, start_frame=0, end_frame=89, fps=30.0)
-        medium_shot = Shot(shot_index=2, start_frame=0, end_frame=179, fps=30.0)
-        long_shot = Shot(shot_index=3, start_frame=0, end_frame=299, fps=30.0)
+        short_shot = Shot(shot_index=1, start_frame=100, end_frame=159, fps=30.0)
+        regular_shot = Shot(shot_index=2, start_frame=200, end_frame=319, fps=30.0)
+        long_shot = Shot(shot_index=3, start_frame=400, end_frame=639, fps=30.0)
 
-        self.assertEqual(len(select_frame_indices(short_shot)), 1)
-        self.assertEqual(len(select_frame_indices(medium_shot)), 2)
-        self.assertGreaterEqual(len(select_frame_indices(long_shot)), 2)
+        self.assertEqual(
+            select_frame_indices(short_shot),
+            [(130, "short_shot_midpoint")],
+        )
+        self.assertEqual(
+            select_frame_indices(regular_shot),
+            [
+                (240, "regular_shot_one_third_two_thirds"),
+                (280, "regular_shot_one_third_two_thirds"),
+            ],
+        )
+        self.assertEqual(
+            select_frame_indices(long_shot),
+            [
+                (430, "long_shot_centered_interval"),
+                (490, "long_shot_centered_interval"),
+                (550, "long_shot_centered_interval"),
+                (610, "long_shot_centered_interval"),
+            ],
+        )
+
+    def test_select_frame_indices_handles_thresholds_and_tiny_final_shot(self) -> None:
+        at_two_seconds = Shot(shot_index=1, start_frame=0, end_frame=49, fps=25.0)
+        just_over_two = Shot(shot_index=2, start_frame=50, end_frame=100, fps=25.0)
+        at_four_seconds = Shot(shot_index=3, start_frame=101, end_frame=200, fps=25.0)
+        tiny_final_shot = Shot(shot_index=4, start_frame=999, end_frame=999, fps=25.0)
+
+        self.assertEqual(len(select_frame_indices(at_two_seconds)), 1)
+        self.assertEqual(len(select_frame_indices(just_over_two)), 2)
+        self.assertEqual(len(select_frame_indices(at_four_seconds)), 2)
+        self.assertEqual(
+            select_frame_indices(tiny_final_shot),
+            [(999, "short_shot_midpoint")],
+        )
+        for shot in (at_two_seconds, just_over_two, at_four_seconds, tiny_final_shot):
+            indices = [index for index, _ in select_frame_indices(shot)]
+            self.assertEqual(len(indices), len(set(indices)))
+            self.assertTrue(all(shot.start_frame <= index <= shot.end_frame for index in indices))
+
+    def test_phash_dedup_requires_same_shot_and_nearby_timestamp(self) -> None:
+        deduper = PerceptualHashDeduper(hamming_threshold=6, temporal_window_sec=2.0)
+        deduper.add(phash=0, frame_id="frame-1", shot_index=1, timestamp=1.0)
+
+        self.assertEqual(deduper.find_duplicate(0, 1, 3.0), ("frame-1", 0))
+        self.assertIsNone(deduper.find_duplicate(0, 2, 1.1))
+        self.assertIsNone(deduper.find_duplicate(0, 1, 3.001))
+        self.assertIsNone(deduper.find_duplicate(127, 1, 1.1))
 
     def test_extract_keyframes_records_successful_ffmpeg_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -336,7 +382,9 @@ class VisualSearchEngineTest(unittest.TestCase):
                     jpeg_quality: int,
                 ) -> None:
                     output_path.parent.mkdir(parents=True, exist_ok=True)
-                    image = np.full((32, 48, 3), 128, dtype=np.uint8)
+                    image = np.random.default_rng(int(round(timestamp * 1000))).integers(
+                        0, 256, size=(32, 48, 3), dtype=np.uint8
+                    )
                     ok = cv2.imwrite(str(output_path), image)
                     if not ok:
                         raise AssertionError(f"failed to write {output_path}")
@@ -354,15 +402,18 @@ class VisualSearchEngineTest(unittest.TestCase):
                 keyframe_extractor.detect_shots_transnetv2 = original_detect
                 keyframe_extractor.extract_frame_ffmpeg = original_extract
 
-            self.assertEqual(report["keyframe_count"], 1)
+            self.assertEqual(report["keyframe_count"], 2)
             self.assertEqual(report["skipped_count"], 0)
             records = [
                 json.loads(line)
                 for line in metadata_path.read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            self.assertEqual(len(records), 1)
+            self.assertEqual(len(records), 2)
             self.assertEqual(records[0]["source_video_path"], video_path.as_posix())
+            self.assertEqual(records[0]["keyframe_strategy"], KEYFRAME_STRATEGY)
+            self.assertEqual(report["keyframe_strategy"], KEYFRAME_STRATEGY)
+            self.assertEqual(report["dedup_scope"], "within_shot")
             self.assertTrue(Path(records[0]["keyframe_path"]).exists())
 
 
