@@ -24,7 +24,7 @@ tra đồng bộ.
   "thumbnail_path": "data/keyframes/L01_V001/000001.jpg",
   "source_video_path": "data/raw/video/L01_V001.mp4",
   "video_path": "data/raw/video/L01_V001.mp4",
-  "keyframe_strategy": "adaptive_shot_sampling_v2",
+  "keyframe_strategy": "adaptive_shot_sampling_v3",
   "selection_reason": "regular_shot_one_third_two_thirds"
 }
 ```
@@ -56,7 +56,7 @@ một row trong file `.npy`.
   "thumbnail_path": "data/keyframes/L01_V001/000001.jpg",
   "source_video_path": "data/raw/video/L01_V001.mp4",
   "video_path": "data/raw/video/L01_V001.mp4",
-  "keyframe_strategy": "adaptive_shot_sampling_v2",
+  "keyframe_strategy": "adaptive_shot_sampling_v3",
   "selection_reason": "regular_shot_one_third_two_thirds",
   "embedding_index": 0,
   "model_family": "siglip2",
@@ -158,7 +158,7 @@ v1.2 bổ sung `model_name`, `model_revision`, `vector_dim`.
     "video_path": "data/raw/video/L01_V001.mp4",
     "embedding_id": "EMB_FRAME_L01_V001_000001",
     "embedding_index": 0,
-    "keyframe_strategy": "adaptive_shot_sampling_v2",
+    "keyframe_strategy": "adaptive_shot_sampling_v3",
     "selection_reason": "regular_shot_one_third_two_thirds",
     "model_name": "google/siglip2-so400m-patch16-384",
     "model_revision": "<resolved-or-requested-revision>",

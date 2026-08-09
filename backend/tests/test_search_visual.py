@@ -299,19 +299,19 @@ class VisualSearchEngineTest(unittest.TestCase):
             self.assertEqual(response.results[0].neighbors[0].frame_id, "FRAME_L01_V001_000001")
 
     def test_select_frame_indices_uses_competition_sampling_rules(self) -> None:
-        short_shot = Shot(shot_index=1, start_frame=100, end_frame=159, fps=30.0)
-        regular_shot = Shot(shot_index=2, start_frame=200, end_frame=319, fps=30.0)
+        short_shot = Shot(shot_index=1, start_frame=100, end_frame=129, fps=30.0)
+        regular_shot = Shot(shot_index=2, start_frame=200, end_frame=259, fps=30.0)
         long_shot = Shot(shot_index=3, start_frame=400, end_frame=639, fps=30.0)
 
         self.assertEqual(
             select_frame_indices(short_shot),
-            [(130, "short_shot_midpoint")],
+            [(115, "short_shot_midpoint")],
         )
         self.assertEqual(
             select_frame_indices(regular_shot),
             [
+                (220, "regular_shot_one_third_two_thirds"),
                 (240, "regular_shot_one_third_two_thirds"),
-                (280, "regular_shot_one_third_two_thirds"),
             ],
         )
         self.assertEqual(
@@ -325,19 +325,27 @@ class VisualSearchEngineTest(unittest.TestCase):
         )
 
     def test_select_frame_indices_handles_thresholds_and_tiny_final_shot(self) -> None:
-        at_two_seconds = Shot(shot_index=1, start_frame=0, end_frame=49, fps=25.0)
-        just_over_two = Shot(shot_index=2, start_frame=50, end_frame=100, fps=25.0)
-        at_four_seconds = Shot(shot_index=3, start_frame=101, end_frame=200, fps=25.0)
-        tiny_final_shot = Shot(shot_index=4, start_frame=999, end_frame=999, fps=25.0)
+        at_one_second = Shot(shot_index=1, start_frame=0, end_frame=24, fps=25.0)
+        just_over_one = Shot(shot_index=2, start_frame=25, end_frame=50, fps=25.0)
+        at_two_seconds = Shot(shot_index=3, start_frame=51, end_frame=100, fps=25.0)
+        at_four_seconds = Shot(shot_index=4, start_frame=101, end_frame=200, fps=25.0)
+        tiny_final_shot = Shot(shot_index=5, start_frame=999, end_frame=999, fps=25.0)
 
-        self.assertEqual(len(select_frame_indices(at_two_seconds)), 1)
-        self.assertEqual(len(select_frame_indices(just_over_two)), 2)
+        self.assertEqual(len(select_frame_indices(at_one_second)), 1)
+        self.assertEqual(len(select_frame_indices(just_over_one)), 2)
+        self.assertEqual(len(select_frame_indices(at_two_seconds)), 2)
         self.assertEqual(len(select_frame_indices(at_four_seconds)), 2)
         self.assertEqual(
             select_frame_indices(tiny_final_shot),
             [(999, "short_shot_midpoint")],
         )
-        for shot in (at_two_seconds, just_over_two, at_four_seconds, tiny_final_shot):
+        for shot in (
+            at_one_second,
+            just_over_one,
+            at_two_seconds,
+            at_four_seconds,
+            tiny_final_shot,
+        ):
             indices = [index for index, _ in select_frame_indices(shot)]
             self.assertEqual(len(indices), len(set(indices)))
             self.assertTrue(all(shot.start_frame <= index <= shot.end_frame for index in indices))

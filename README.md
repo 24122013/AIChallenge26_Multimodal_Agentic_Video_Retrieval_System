@@ -73,8 +73,8 @@ data/metadata/keyframes_<video_id>_extract_report.json
 
 Rule keyframe:
 
-- Shot `duration <= 2s`: lấy midpoint.
-- Shot `2s < duration <= 4s`: lấy 2 frame tại 1/3 và 2/3 shot.
+- Shot `duration <= 1s`: lấy midpoint.
+- Shot `1s < duration <= 4s`: lấy 2 frame tại 1/3 và 2/3 shot.
 - Shot `duration > 4s`: lấy một frame mỗi 2s theo centered sampling (`start+1s`, `+3s`, ...).
 - Extract frame bằng FFmpeg theo timestamp đã chọn.
 - Conservative dedup chỉ so sánh frame cùng shot và cách nhau tối đa 2s; pHash mặc định dùng Hamming distance <= 6.

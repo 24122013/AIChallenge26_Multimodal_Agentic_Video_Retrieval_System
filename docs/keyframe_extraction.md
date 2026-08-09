@@ -6,8 +6,8 @@ Pipeline chính thức nên chạy theo thứ tự:
 
 1. Detect shot bằng TransNetV2.
 2. Chọn keyframe theo độ dài shot:
-   - Shot `duration <= 2s`: lấy 1 frame ở midpoint.
-   - Shot `2s < duration <= 4s`: lấy 2 frame tại 1/3 và 2/3 shot.
+   - Shot `duration <= 1s`: lấy 1 frame ở midpoint.
+   - Shot `1s < duration <= 4s`: lấy 2 frame tại 1/3 và 2/3 shot.
    - Shot `duration > 4s`: lấy 1 frame mỗi 2 giây theo centered sampling (`start+1s`, `+3s`, ...).
 3. Conservative dedup chỉ so sánh các frame cùng shot và gần nhau tối đa 2 giây.
 4. pHash mặc định chỉ bỏ frame có Hamming distance <= 6; không dedup cross-shot.
@@ -19,7 +19,7 @@ Pipeline chính thức nên chạy theo thứ tự:
 
 ## Tham số ablation
 
-- `--short-shot-max-sec`: ngưỡng shot ngắn, mặc định `2.0`.
+- `--short-shot-max-sec`: ngưỡng shot ngắn, mặc định `1.0`.
 - `--regular-shot-max-sec`: ngưỡng shot thường, mặc định `4.0`.
 - `--long-shot-interval-sec`: chu kỳ centered sampling, mặc định `2.0`.
 - `--phash-threshold`: Hamming distance tối đa để coi là gần như trùng, mặc định `6`.
