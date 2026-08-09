@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -13,6 +15,7 @@ from PIL import Image
 from backend.app.services.indexing.build_siglip2_index import (
     DEFAULT_MODEL_NAME,
     encode_keyframes,
+    load_siglip2_model_processor,
     tune_batch_size,
 )
 
@@ -83,10 +86,69 @@ def make_record(path: Path, number: int) -> dict:
         "timestamp": float(number),
         "frame_index": number,
         "keyframe_path": path.as_posix(),
+        "candidate_index": number,
+        "candidate_id": f"CANDIDATE_L01_V001_{number:09d}",
+        "candidate_reasons": ["dense_interval"],
+        "keyframe_strategy": "dense_coverage",
+        "selection_phase": "coverage_fill",
+        "selection_rank": number,
+        "selection_reasons": ["temporal_coverage"],
+        "covered_event_ids": [],
+        "selection_score": None,
+        "protected": False,
+        "coverage_added": True,
     }
 
 
 class Siglip2IndexingTest(unittest.TestCase):
+    def test_cuda_loader_materializes_model_directly_in_inference_dtype(self) -> None:
+        calls: dict[str, dict] = {}
+
+        class FakeLoadedModel:
+            def to(self, device: str):
+                calls["to"] = {"device": device}
+                return self
+
+            def eval(self):
+                calls["eval"] = {}
+                return self
+
+        class FakeAutoModel:
+            @staticmethod
+            def from_pretrained(_name: str, **kwargs):
+                calls["model"] = kwargs
+                return FakeLoadedModel()
+
+        class FakeAutoProcessor:
+            @staticmethod
+            def from_pretrained(_name: str, **kwargs):
+                calls["processor"] = kwargs
+                return object()
+
+        fake_transformers = SimpleNamespace(
+            AutoModel=FakeAutoModel,
+            AutoProcessor=FakeAutoProcessor,
+        )
+        with (
+            patch.dict(sys.modules, {"transformers": fake_transformers}),
+            patch(
+                "backend.app.services.indexing.build_siglip2_index.compute_dtype_for",
+                return_value=torch.bfloat16,
+            ),
+        ):
+            load_siglip2_model_processor(
+                model_name=DEFAULT_MODEL_NAME,
+                model_revision=None,
+                device="cuda",
+                model_cache_dir=None,
+                use_autocast=True,
+            )
+
+        self.assertIs(calls["model"]["dtype"], torch.bfloat16)
+        self.assertNotIn("dtype", calls["processor"])
+        self.assertEqual(calls["to"]["device"], "cuda")
+        self.assertIn("eval", calls)
+
     def test_fake_encoder_normalizes_and_skips_bad_image(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -129,6 +191,23 @@ class Siglip2IndexingTest(unittest.TestCase):
                 {record["model_name"] for record in metadata}, {DEFAULT_MODEL_NAME}
             )
             self.assertTrue(all(record["normalized"] is True for record in metadata))
+            self.assertEqual(
+                [record["candidate_id"] for record in metadata],
+                ["CANDIDATE_L01_V001_000000001", "CANDIDATE_L01_V001_000000003"],
+            )
+            self.assertTrue(
+                all(
+                    record["keyframe_strategy"] == "dense_coverage"
+                    for record in metadata
+                )
+            )
+            self.assertTrue(
+                all(record["coverage_added"] is True for record in metadata)
+            )
+            self.assertEqual(
+                [record["candidate_index"] for record in metadata],
+                [1, 3],
+            )
             self.assertEqual(len(skipped), 1)
             self.assertEqual(skipped[0]["skip_reason"], "image_load_error")
             self.assertEqual(benchmark["embedding_shape"], [2, 3])

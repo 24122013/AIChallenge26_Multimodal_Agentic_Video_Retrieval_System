@@ -35,3 +35,7 @@ competition/indexes/*
 !competition/indexes/.gitkeep
 competition/results/*
 !competition/results/.gitkeep
+competition/evaluation/*
+!competition/evaluation/.gitkeep
+competition/work/*
+!competition/work/.gitkeep

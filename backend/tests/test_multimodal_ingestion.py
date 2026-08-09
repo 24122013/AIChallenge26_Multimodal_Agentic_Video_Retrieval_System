@@ -191,11 +191,15 @@ class MultimodalIngestionTest(unittest.TestCase):
         segment_id: str,
     ) -> dict[str, Any]:
         return {
+            "candidate_id": frame_id.replace("FRAME", "CANDIDATE"),
+            "candidate_index": int(round(timestamp * 10)),
             "frame_id": frame_id,
             "video_id": "TEST",
             "segment_id": segment_id,
             "shot_id": segment_id.replace("SEG", "SHOT"),
             "timestamp": timestamp,
+            "frame_index": int(round(timestamp * 10)),
+            "candidate_reasons": ["dense_interval"],
             "shot_start": start,
             "shot_end": end,
             "keyframe_path": str(path),
@@ -228,6 +232,16 @@ class MultimodalIngestionTest(unittest.TestCase):
             ["success", "success", "success", "success", "success", "error"],
         )
         self.assertEqual(captions[0]["frame_id"], self.records[0]["frame_id"])
+        self.assertEqual(captions[0]["candidate_id"], self.records[0]["candidate_id"])
+        self.assertEqual(
+            captions[0]["candidate_index"],
+            self.records[0]["candidate_index"],
+        )
+        self.assertEqual(captions[0]["frame_index"], self.records[0]["frame_index"])
+        self.assertEqual(
+            captions[0]["candidate_reasons"],
+            self.records[0]["candidate_reasons"],
+        )
         self.assertEqual(captions[0]["timestamp"], self.records[0]["timestamp"])
         self.assertTrue(captions[0]["segment_caption"])
 

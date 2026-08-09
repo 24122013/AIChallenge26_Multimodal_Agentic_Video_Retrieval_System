@@ -95,6 +95,7 @@ class Keyframe:
     segment_id: str
     boundary_start: float | None
     boundary_end: float | None
+    selection_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -151,6 +152,34 @@ def _source_id(
     if frame_id:
         return str(frame_id)
     return f"{fallback_prefix}_{ordinal:08d}"
+
+
+def _selection_metadata(record: dict[str, Any], frame_id: str) -> dict[str, Any]:
+    """Retain selection audit fields while segmenting final keyframes."""
+
+    value: dict[str, Any] = {"frame_id": frame_id}
+    for name in (
+        "candidate_id",
+        "candidate_index",
+        "candidate_reasons",
+        "keyframe_strategy",
+        "selection_phase",
+        "selection_rank",
+        "selection_reasons",
+        "covered_event_ids",
+        "selection_score",
+        "protected",
+        "coverage_added",
+        "importance_score",
+        "semantic_novelty",
+        "component_scores",
+        "available_modalities",
+        "protected_event_ids",
+        "selection_provenance",
+    ):
+        if name in record:
+            value[name] = record[name]
+    return value
 
 
 def _load_artifacts(
@@ -254,6 +283,7 @@ def build_segments(
             segment_id=segment_id,
             boundary_start=boundary_start,
             boundary_end=boundary_end,
+            selection_metadata=_selection_metadata(record, frame_id),
         )
         identity = (video_id, frame_id)
         if identity in seen:
@@ -684,6 +714,20 @@ def build_segment_records(
             "start_keyframe": first.frame_id,
             "end_keyframe": last.frame_id,
             "keyframe_ids": [item.frame_id for item in ordered],
+            "keyframe_selection": [item.selection_metadata for item in ordered],
+            "covered_event_ids": sorted(
+                {
+                    str(event_id)
+                    for item in ordered
+                    for event_id in item.selection_metadata.get(
+                        "covered_event_ids",
+                        [],
+                    )
+                }
+            ),
+            "protected": any(
+                bool(item.selection_metadata.get("protected")) for item in ordered
+            ),
             "captions_aggregated": caption_text,
             "caption_source_ids": caption_source_ids,
             "ocr": aggregate_ocr(ocr_records),
