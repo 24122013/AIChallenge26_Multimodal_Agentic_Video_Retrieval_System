@@ -56,7 +56,7 @@ class EndToEndRunnerTest(unittest.TestCase):
         )
         self.assertEqual(
             keyframes[keyframes.index("--max-gap-seconds") + 1],
-            "5.0",
+            "2.0",
         )
         self.assertEqual(
             keyframes[keyframes.index("--asr-timeout-seconds") + 1],

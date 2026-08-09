@@ -19,6 +19,7 @@ if __package__:
         generate_keyframe_candidates,
     )
     from .keyframe_selection import (
+        DEFAULT_MAX_GAP_SECONDS,
         PHASE_COVERAGE,
         PHASE_PROTECTED,
         SelectedCandidate,
@@ -39,6 +40,7 @@ else:  # Preserve the documented direct-script CLI invocation.
         generate_keyframe_candidates,
     )
     from backend.app.services.indexing.keyframe_selection import (
+        DEFAULT_MAX_GAP_SECONDS,
         PHASE_COVERAGE,
         PHASE_PROTECTED,
         SelectedCandidate,
@@ -778,7 +780,7 @@ def extract_keyframes_for_video(
     candidate_interval_sec: float = DEFAULT_INTERVAL_SEC,
     boundary_guard_sec: float = DEFAULT_BOUNDARY_GUARD_SEC,
     tiny_shot_max_sec: float = DEFAULT_TINY_SHOT_MAX_SEC,
-    max_gap_seconds: float = 5.0,
+    max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS,
     gap_tolerance_seconds: float = 0.0,
     target_keyframes: int | None = None,
     hard_max_keyframes: int | None = None,
@@ -1053,7 +1055,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_TINY_SHOT_MAX_SEC,
     )
-    parser.add_argument("--max-gap-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--max-gap-seconds",
+        type=float,
+        default=DEFAULT_MAX_GAP_SECONDS,
+    )
     parser.add_argument("--gap-tolerance-seconds", type=float, default=0.0)
     parser.add_argument("--target-keyframes", type=int, default=None)
     parser.add_argument("--hard-max-keyframes", type=int, default=None)

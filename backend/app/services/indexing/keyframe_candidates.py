@@ -21,12 +21,16 @@ REASON_DENSE_INTERVAL = "dense_interval"
 REASON_SHOT_BOUNDARY_START = "shot_boundary_start"
 REASON_SHOT_BOUNDARY_END = "shot_boundary_end"
 REASON_TINY_SHOT_MIDPOINT = "tiny_shot_midpoint"
+REASON_VIDEO_START = "video_start"
+REASON_VIDEO_END = "video_end"
 
 _REASON_ORDER = {
     REASON_TINY_SHOT_MIDPOINT: 0,
     REASON_DENSE_INTERVAL: 1,
     REASON_SHOT_BOUNDARY_START: 2,
     REASON_SHOT_BOUNDARY_END: 3,
+    REASON_VIDEO_START: 4,
+    REASON_VIDEO_END: 5,
 }
 
 
@@ -177,6 +181,7 @@ def generate_keyframe_candidates(
     boundary_guard_sec: float = DEFAULT_BOUNDARY_GUARD_SEC,
     tiny_shot_max_sec: float = DEFAULT_TINY_SHOT_MAX_SEC,
     frame_count: int | None = None,
+    include_video_endpoints: bool = False,
 ) -> list[KeyframeCandidate]:
     """Generate dense candidates plus boundary anchors for validated shots.
 
@@ -203,6 +208,8 @@ def generate_keyframe_candidates(
         raise ValueError("boundary_guard_sec must be non-negative")
     if tiny_shot_max_sec < 0:
         raise ValueError("tiny_shot_max_sec must be non-negative")
+    if not isinstance(include_video_endpoints, bool):
+        raise TypeError("include_video_endpoints must be a boolean")
 
     validated_shots = _validate_shots(shots, frame_count=frame_count)
     by_frame: dict[int, _CandidateAccumulator] = {}
@@ -240,6 +247,18 @@ def generate_keyframe_candidates(
         add_candidate(shot, start_anchor, REASON_SHOT_BOUNDARY_START)
         add_candidate(shot, end_anchor, REASON_SHOT_BOUNDARY_END)
 
+    if include_video_endpoints and validated_shots:
+        add_candidate(
+            validated_shots[0],
+            validated_shots[0].start_frame,
+            REASON_VIDEO_START,
+        )
+        add_candidate(
+            validated_shots[-1],
+            validated_shots[-1].end_frame,
+            REASON_VIDEO_END,
+        )
+
     candidates: list[KeyframeCandidate] = []
     for frame_index in sorted(by_frame):
         accumulator = by_frame[frame_index]
@@ -273,6 +292,8 @@ __all__ = [
     "REASON_SHOT_BOUNDARY_END",
     "REASON_SHOT_BOUNDARY_START",
     "REASON_TINY_SHOT_MIDPOINT",
+    "REASON_VIDEO_END",
+    "REASON_VIDEO_START",
     "ShotLike",
     "generate_keyframe_candidates",
 ]

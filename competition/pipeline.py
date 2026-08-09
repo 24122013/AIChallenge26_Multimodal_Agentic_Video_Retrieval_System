@@ -17,8 +17,10 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -64,7 +66,10 @@ from backend.app.services.indexing.keyframe_feature_adapter import (
 from backend.app.services.indexing.keyframe_multimodal_pipeline import (
     run_multimodal_keyframe_pipeline,
 )
-from backend.app.services.indexing.keyframe_selection import SelectionConfig
+from backend.app.services.indexing.keyframe_selection import (
+    DEFAULT_MAX_GAP_SECONDS,
+    SelectionConfig,
+)
 from backend.app.services.indexing.normalize_keyframe_metadata import (
     image_to_small_array,
     mse,
@@ -105,6 +110,18 @@ from backend.app.services.retrieval.text_index import (
     INDEX_VERSION as TEXT_INDEX_VERSION,
     TextIndexSearcher,
 )
+from backend.app.services.retrieval.advanced_search import (
+    AdvancedSearchConfig,
+    advanced_text_search,
+    advanced_vector_search,
+)
+from backend.app.services.retrieval.advanced_rerank import AdvancedRankedFrame
+from backend.app.services.retrieval.vlm_reranker import (
+    DEFAULT_VLM_MODEL,
+    VLM_MODES,
+    build_local_vlm_runner,
+    rerank_with_vlm,
+)
 from backend.app.services.retrieval.temporal_search import decompose_temporal_query
 from backend.app.services.retrieval.search_visual import (
     FaissVectorSearcher,
@@ -121,6 +138,12 @@ from competition.downstream_lineage import (
     validate_stage_manifest,
     write_stage_manifest,
 )
+from competition.dense_index import (
+    DenseCandidateIndex,
+    build_dense_index,
+    resolve_run_reference,
+    validate_dense_index,
+)
 from competition.keyframe_phase3 import (
     PHASE3_FEATURE_CONTRACT_VERSION,
     PHASE3_SELECTION_CONTRACT_VERSION,
@@ -136,12 +159,22 @@ from competition.keyframe_phase3 import (
     sha256_file as phase3_sha256_file,
     sha256_json,
     validate_candidate_pool,
+    workspace_paths,
 )
 from competition.keyframe_phase5 import (
     evaluate_split_artifacts,
     load_split_manifest,
     write_config_lock,
     write_split_manifest,
+)
+from competition.run_manifest import (
+    initialize_run_manifest,
+    git_fingerprint,
+    promote_active_run,
+    record_leaderboard_score,
+    record_submission,
+    set_active_baseline,
+    update_run_manifest,
 )
 
 
@@ -419,6 +452,7 @@ def _phase3_candidate_config(args: argparse.Namespace) -> CandidatePoolConfig:
         candidate_interval_sec=args.candidate_interval_sec,
         boundary_guard_sec=args.boundary_guard_sec,
         tiny_shot_max_sec=args.tiny_shot_max_sec,
+        include_video_endpoints=args.endpoint_protection == "on",
     )
 
 
@@ -428,6 +462,7 @@ def _phase3_adapter_config(args: argparse.Namespace) -> FeatureAdapterConfig:
         object_min_confidence=args.object_event_min_confidence,
         transition_absolute_floor=args.transition_absolute_floor,
         transition_mad_multiplier=args.transition_mad_multiplier,
+        asr_event_min_quality=args.asr_protection_threshold,
     )
 
 
@@ -440,6 +475,11 @@ def _phase3_selection_config(args: argparse.Namespace) -> SelectionConfig:
         importance_weight=args.importance_weight,
         novelty_weight=args.novelty_weight,
         protect_each_shot=True,
+        protect_video_endpoints=args.endpoint_protection == "on",
+        enable_event_aware_dedup=True,
+        target_density_per_second=args.target_density_per_second,
+        dedup_similarity_threshold=args.dedup_similarity_threshold,
+        dedup_temporal_window_seconds=args.dedup_temporal_window_seconds,
     )
 
 
@@ -2668,6 +2708,212 @@ def keyframes_command(args: argparse.Namespace) -> None:
         )
 
 
+def reselect_keyframes_command(args: argparse.Namespace) -> None:
+    """Reselect cached Phase-3 features into an isolated experiment run.
+
+    The source workspace remains read-only.  Only selection ledgers and
+    canonical outputs are written below ``run_root``, so offline ablations can
+    reuse the expensive five-modality artifacts without mutating the 5s
+    baseline.
+    """
+
+    public_root = args.public_root.resolve()
+    source_output_root = args.source_output_root.resolve()
+    run_root = args.run_root.resolve()
+    if run_root == source_output_root:
+        raise ValueError("--run-root must differ from --source-output-root")
+    args.public_root = public_root
+    args.output_root = run_root
+    corpus = load_corpus(public_root)
+
+    prepared: list[
+        tuple[
+            CorpusVideo,
+            Phase3WorkspacePaths,
+            Phase3WorkspacePaths,
+            dict[str, object],
+            list[dict],
+            dict[str, object],
+        ]
+    ] = []
+    canonical_feature_config: dict[str, object] | None = None
+    missing_endpoints: list[str] = []
+    for video in corpus:
+        phase3_manifest_path = (
+            source_output_root
+            / "metadata"
+            / f"keyframes_{video.video_id}_phase3_manifest.json"
+        )
+        phase3_manifest = read_phase3_json(phase3_manifest_path)
+        run_id = str(phase3_manifest.get("candidate_pool_run_id") or "")
+        if not run_id:
+            raise RuntimeError(
+                f"Missing candidate_pool_run_id in {phase3_manifest_path}"
+            )
+        workspace_root = (
+            source_output_root / "work" / "keyframe_v3" / video.video_id / run_id
+        )
+        candidate_report = read_phase3_json(workspace_root / "candidate_report.json")
+        candidate_contract = candidate_report.get("phase3_candidate_contract")
+        if not isinstance(candidate_contract, Mapping):
+            raise RuntimeError(
+                f"Missing Phase-3 candidate contract for {video.video_id}"
+            )
+        source_paths = workspace_paths(
+            source_output_root,
+            video.video_id,
+            candidate_contract,
+        )
+        if source_paths.run_id != run_id:
+            raise RuntimeError(
+                f"Candidate run lineage mismatch for {video.video_id}: "
+                f"canonical={run_id}, contract={source_paths.run_id}"
+            )
+        validated_report, candidate_records = validate_candidate_pool(
+            paths=source_paths,
+            expected_contract=candidate_contract,
+        )
+        feature_manifest = read_phase3_json(source_paths.feature_manifest)
+        feature_config = feature_manifest.get("feature_config")
+        if not isinstance(feature_config, dict):
+            raise RuntimeError(
+                f"Missing feature_config in {source_paths.feature_manifest}"
+            )
+        if canonical_feature_config is None:
+            canonical_feature_config = dict(feature_config)
+        elif feature_config != canonical_feature_config:
+            raise RuntimeError(
+                f"Feature config drift detected at {video.video_id}; "
+                "refusing a mixed offline run"
+            )
+
+        if args.endpoint_protection == "on":
+            reasons = {
+                str(reason)
+                for record in candidate_records
+                for reason in (record.get("candidate_reasons") or ())
+            }
+            absent = {"video_start", "video_end"} - reasons
+            if absent:
+                missing_endpoints.append(
+                    f"{video.video_id}({','.join(sorted(absent))})"
+                )
+
+        target_workspace = run_root / "work" / "keyframe_v3" / video.video_id / run_id
+        publish_paths = replace(
+            source_paths,
+            root=target_workspace,
+            candidate_scores=target_workspace / "candidate_scores.jsonl",
+            protected_events=target_workspace / "protected_events.jsonl",
+            selection_report=target_workspace / "selection_report.json",
+        )
+        prepared.append(
+            (
+                video,
+                source_paths,
+                publish_paths,
+                validated_report,
+                candidate_records,
+                dict(feature_config),
+            )
+        )
+
+    if missing_endpoints:
+        preview = ", ".join(missing_endpoints[:10])
+        raise RuntimeError(
+            "Endpoint-on reselect requires endpoint candidates and features. "
+            "The cached pool is missing them for "
+            f"{len(missing_endpoints)} videos ({preview}). Build an endpoint-enabled "
+            "candidate/feature cache first; no canonical files were written."
+        )
+    if canonical_feature_config is None:
+        raise RuntimeError("No Phase-3 feature configuration found")
+
+    siglip_config = canonical_feature_config.get("siglip2")
+    if not isinstance(siglip_config, Mapping):
+        raise RuntimeError("Cached feature config has no SigLIP2 contract")
+    resolved_device = str(siglip_config.get("device") or "cpu")
+    resolved_revision = str(siglip_config.get("resolved_model_revision") or "")
+    if not resolved_revision:
+        raise RuntimeError("Cached feature config has no resolved SigLIP2 revision")
+    args.model_name = str(siglip_config.get("model_name") or args.model_name)
+    args.model_revision = siglip_config.get("requested_model_revision")
+    args.no_autocast = not bool(siglip_config.get("use_autocast", True))
+    args.batch_size = siglip_config.get("batch_size", args.batch_size)
+    args.num_workers = int(siglip_config.get("num_workers", args.num_workers))
+    args.prefetch_factor = int(
+        siglip_config.get("prefetch_factor", args.prefetch_factor)
+    )
+
+    started = time.perf_counter()
+    initialize_run_manifest(
+        run_root=run_root,
+        repo_root=Path(__file__).resolve().parents[1],
+        public_root=public_root,
+        offline_config={
+            "source_output_root": Path(
+                os.path.relpath(source_output_root, run_root)
+            ).as_posix(),
+            "selection_config": asdict(_phase3_selection_config(args)),
+            "feature_adapter_config": asdict(_phase3_adapter_config(args)),
+            "feature_config": canonical_feature_config,
+        },
+    )
+    selected_total = 0
+    candidate_total = 0
+    for number, (
+        video,
+        source_paths,
+        publish_paths,
+        candidate_report,
+        candidate_records,
+        feature_config,
+    ) in enumerate(prepared, start=1):
+        print(f"[reselect {number}/{len(prepared)}] {video.filename}")
+        features = _phase3_load_and_validate_features(
+            video=video,
+            paths=source_paths,
+            candidate_report=candidate_report,
+            candidate_records=candidate_records,
+            feature_config=feature_config,
+            allow_partial_features=args.allow_partial_features,
+            require_manifest=True,
+        )
+        manifest = _phase3_publish_video(
+            args,
+            video=video,
+            paths=publish_paths,
+            candidate_report=candidate_report,
+            candidate_records=candidate_records,
+            features=features,
+            feature_config=feature_config,
+            resolved_device=resolved_device,
+            resolved_model_revision=resolved_revision,
+        )
+        selected_total += int(manifest["selected_count"])
+        candidate_total += int(manifest["candidate_count"])
+
+    elapsed = round(time.perf_counter() - started, 3)
+    manifest = update_run_manifest(
+        run_root,
+        git=git_fingerprint(Path(__file__).resolve().parents[1]),
+        offline={
+            "candidate_count": candidate_total,
+            "selected_count": selected_total,
+            "source_feature_cache_reused": True,
+        },
+        stages={
+            "offline_reselect": {
+                "status": "passed",
+                "elapsed_seconds": elapsed,
+                "videos": len(prepared),
+            }
+        },
+        status="offline_reselect_passed",
+    )
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
+
+
 def neighbors_command(args: argparse.Namespace) -> None:
     corpus = load_corpus(args.public_root)
     canonical_sources = _require_current_canonical_publish(
@@ -3291,6 +3537,60 @@ def answers_from_results(
     raise ValueError("Could not produce 100 unique valid hybrid answers")
 
 
+def answers_from_advanced(
+    ranked: Sequence[AdvancedRankedFrame],
+    *,
+    corpus: Sequence[CorpusVideo],
+    public_root: Path,
+    run_root: Path,
+    query_image: Path | None = None,
+    refine_top_k: int = 0,
+    refine_radius_frames: int = 75,
+) -> list[str]:
+    """Convert dense results without fabricating a frame-zero padding tail."""
+    by_video_id = {video.video_id: video for video in corpus}
+    answers: list[str] = []
+    seen: set[tuple[str, int]] = set()
+    for rank, item in enumerate(ranked):
+        record = item.record
+        video = by_video_id.get(str(record.get("video_id") or ""))
+        if video is None:
+            continue
+        frame_index = int(record.get("frame_index") or 0)
+        if query_image is not None and rank < refine_top_k:
+            frame_record = FrameRecord.from_dict(
+                item.dense_row,
+                {
+                    **dict(record),
+                    "keyframe_path": resolve_run_reference(
+                        run_root,
+                        str(record.get("candidate_image") or ""),
+                    ).as_posix(),
+                },
+            )
+            frame_index = localize_vkis_frame(
+                query_image=query_image,
+                video_path=public_root / video.relative_path,
+                candidate=frame_record,
+                fps=video.fps,
+                frame_count=video.frame_count,
+                radius_frames=refine_radius_frames,
+            )
+        _append_answer(
+            answers,
+            seen,
+            filename=video.filename,
+            frame_index=frame_index,
+            frame_count=video.frame_count,
+        )
+        if len(answers) == ANSWER_COUNT:
+            return answers
+    raise ValueError(
+        "Advanced retrieval produced fewer than 100 unique answers; "
+        f"got {len(answers)}. Increase the coarse/dense reserve instead of padding."
+    )
+
+
 def build_competition_hybrid_engine(
     visual_engine: VisualSearchEngine,
     *,
@@ -3360,23 +3660,156 @@ def write_submission(
     predictions: dict[str, list[str]],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle, quoting=csv.QUOTE_MINIMAL)
-        writer.writerow(columns)
-        for question in questions:
-            answers = predictions.get(question.query_id)
-            if answers is None or len(answers) != ANSWER_COUNT:
-                raise ValueError(f"Missing 100 answers for {question.query_id}")
-            writer.writerow([question.query_id, *answers])
+    for question in questions:
+        answers = predictions.get(question.query_id)
+        if answers is None or len(answers) != ANSWER_COUNT:
+            raise ValueError(f"Missing 100 answers for {question.query_id}")
+    descriptor, raw_temp = tempfile.mkstemp(
+        dir=output_path.parent,
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(raw_temp)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(columns)
+            for question in questions:
+                writer.writerow([question.query_id, *predictions[question.query_id]])
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, output_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def init_run_command(args: argparse.Namespace) -> None:
+    baseline: dict[str, object] = {}
+    if args.baseline_source_root is not None:
+        source_root = args.baseline_source_root.resolve()
+        baseline["source_output_root"] = Path(
+            os.path.relpath(source_root, args.run_root.resolve())
+        ).as_posix()
+        baseline["expected_max_gap_seconds"] = args.baseline_max_gap_seconds
+    manifest = initialize_run_manifest(
+        run_root=args.run_root,
+        repo_root=Path(__file__).resolve().parents[1],
+        public_root=args.public_root,
+        baseline=baseline,
+    )
+    if args.baseline_submission is not None:
+        report = validate_submission(args.baseline_submission, args.public_root)
+        destination = args.run_root.resolve() / "results" / "submission.csv"
+        atomic_copy(args.baseline_submission.resolve(), destination)
+        record_submission(
+            args.run_root,
+            destination,
+            query_count=int(report["query_count"]),
+            answers_per_query=int(report["answers_per_query"]),
+        )
+        if args.baseline_score is not None:
+            record_leaderboard_score(
+                args.run_root,
+                score=args.baseline_score,
+                split="public_private",
+                source="user_reported",
+            )
+            set_active_baseline(
+                run_root=args.run_root,
+                runs_root=args.run_root.resolve().parent,
+            )
+        manifest = update_run_manifest(args.run_root, status="baseline_registered")
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
+
+
+def dense_index_command(args: argparse.Namespace) -> None:
+    initialize_run_manifest(
+        run_root=args.run_root,
+        repo_root=Path(__file__).resolve().parents[1],
+        public_root=args.public_root,
+    )
+    started = time.perf_counter()
+    manifest = build_dense_index(
+        run_root=args.run_root,
+        source_workspace=args.source_workspace,
+        source_output_root=args.source_output_root,
+    )
+    report = validate_dense_index(args.run_root, verify_sources=True)
+    elapsed = round(time.perf_counter() - started, 3)
+    update_run_manifest(
+        args.run_root,
+        offline={
+            "config_sha256": manifest["offline_config_sha256"],
+            "encoder": manifest["encoder"],
+            "candidate_count": manifest["candidate_count"],
+        },
+        artifacts={
+            "dense_manifest": {
+                "path": "dense/dense_manifest.json",
+                "sha256": _sha256_file(
+                    args.run_root.resolve() / "dense" / "dense_manifest.json"
+                ),
+            }
+        },
+        stages={
+            "dense_index": {
+                "status": "passed",
+                "elapsed_seconds": elapsed,
+                "candidate_count": report["candidate_count"],
+            }
+        },
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def validate_dense_index_command(args: argparse.Namespace) -> None:
+    report = validate_dense_index(
+        args.run_root,
+        verify_sources=not args.skip_source_validation,
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def record_score_command(args: argparse.Namespace) -> None:
+    manifest = record_leaderboard_score(
+        args.run_root,
+        score=args.score,
+        split=args.split,
+        source=args.source,
+    )
+    print(json.dumps(manifest["leaderboard"][-1], ensure_ascii=False, indent=2))
+
+
+def promote_run_command(args: argparse.Namespace) -> None:
+    active = promote_active_run(
+        run_root=args.run_root,
+        runs_root=args.runs_root,
+        minimum_score=args.minimum_score,
+    )
+    print(json.dumps(active, ensure_ascii=False, indent=2))
 
 
 def predict_command(args: argparse.Namespace) -> None:
-    public_root = args.public_root
-    output_root = args.output_root
+    public_root = args.public_root.resolve()
+    output_root = args.output_root.resolve()
+    advanced_mode = args.retrieval_mode == "advanced"
+    if advanced_mode and args.run_root is None:
+        raise ValueError("--run-root is required for --retrieval-mode advanced")
+    run_root = args.run_root.resolve() if args.run_root is not None else None
+    dense_run_root = (
+        args.dense_run_root.resolve()
+        if args.dense_run_root is not None
+        else run_root
+    )
     submission_path = (
         args.submission_path
         if args.submission_path is not None
-        else output_root / "results" / "submission.csv"
+        else (
+            run_root / "results" / "submission.csv"
+            if run_root is not None
+            else output_root / "results" / "submission.csv"
+        )
     )
     corpus = load_corpus(public_root)
     questions = load_questions(public_root)
@@ -3403,6 +3836,7 @@ def predict_command(args: argparse.Namespace) -> None:
         device=resolved_device,
         model_cache_dir=args.model_cache_dir,
         use_autocast=not args.no_autocast,
+        local_files_only=args.offline_model_cache,
     )
     text_encoder = Siglip2TextEncoder(
         contract=contract,
@@ -3453,9 +3887,100 @@ def predict_command(args: argparse.Namespace) -> None:
         processor=processor,
     )
 
+    dense_index: DenseCandidateIndex | None = None
+    advanced_config: AdvancedSearchConfig | None = None
+    if advanced_mode:
+        assert run_root is not None
+        initialize_run_manifest(
+            run_root=run_root,
+            repo_root=Path(__file__).resolve().parents[1],
+            public_root=public_root,
+        )
+        assert dense_run_root is not None
+        dense_index = DenseCandidateIndex(dense_run_root, verify_sources=True)
+        dense_encoder = dense_index.manifest["encoder"]
+        if (
+            str(dense_encoder.get("model_name")) != contract.model_name
+            or str(dense_encoder.get("resolved_model_revision")) != contract.model_revision
+            or int(dense_index.manifest["vector_dim"]) != contract.vector_dim
+        ):
+            raise RuntimeError("Dense and coarse encoder lineage do not match")
+        advanced_config = AdvancedSearchConfig(
+            coarse_top_n=args.coarse_top_n,
+            dense_global_top_k=args.dense_global_top_k,
+            dense_rescue_clips=args.dense_rescue_clips,
+            max_total_clips=args.max_candidate_clips,
+            dense_frames_per_clip=args.dense_frames_per_clip,
+            rrf_k=args.rrf_k,
+            modality_hint_boost=args.modality_hint_boost,
+            similarity_threshold=args.cses_similarity_threshold,
+            temporal_window_seconds=args.cses_temporal_window_seconds,
+            max_event_gap_seconds=runtime.hybrid.max_gap_seconds,
+            query_plan_enabled=not args.no_query_plan,
+            rrf_enabled=not args.no_rrf,
+            dense_rescue_enabled=not args.no_dense_rescue,
+            cses_enabled=not args.no_cses,
+            deterministic_rerank_enabled=not args.no_deterministic_rerank,
+        )
+
     predictions: dict[str, list[str]] = {}
+    advanced_results: dict[str, list[AdvancedRankedFrame]] = {}
+    advanced_traces: dict[str, dict[str, object]] = {}
+    question_lookup = {question.query_id: question for question in questions}
+    predict_started = time.perf_counter()
+    if advanced_mode and resolved_device.startswith("cuda"):
+        try:
+            import torch
+
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
     for number, question in enumerate(questions, start=1):
         print(f"[{number}/{len(questions)}] {question.query_id} {question.task}")
+        if advanced_mode:
+            assert dense_index is not None and advanced_config is not None
+            if question.task == "TKIS":
+                response = advanced_text_search(
+                    question.text,
+                    hybrid_engine=hybrid_engine,
+                    text_encoder=text_encoder,
+                    dense_index=dense_index,
+                    profile=args.retrieval_profile,
+                    config=advanced_config,
+                )
+            else:
+                vector = vkis_vectors.get(question.query_id)
+                if vector is None:
+                    raise ValueError(f"Missing VKIS embedding for {question.query_id}")
+                coarse = _ranked_records(
+                    vector,
+                    searcher=searcher,
+                    metadata_store=metadata_store,
+                    top_k=args.search_depth,
+                )
+                coarse_results = [
+                    RetrievalResult(
+                        video_id=item.record.video_id,
+                        frame_id=item.record.frame_id,
+                        timestamp=item.record.timestamp,
+                        score=item.score,
+                        segment_id=item.record.segment_id,
+                        shot_id=item.record.shot_id,
+                        faiss_index=item.record.faiss_index,
+                        frame_index=item.record.frame_index,
+                        keyframe_path=item.record.keyframe_path,
+                    )
+                    for item in coarse
+                ]
+                response = advanced_vector_search(
+                    vector,
+                    coarse_results=coarse_results,
+                    dense_index=dense_index,
+                    config=advanced_config,
+                )
+            advanced_results[question.query_id] = list(response.results)
+            advanced_traces[question.query_id] = response.trace()
+            continue
         if question.task == "TKIS":
             events = decompose_temporal_query(question.text)
             if args.tkis_routing == "auto-temporal" and len(events) > 1:
@@ -3497,12 +4022,156 @@ def predict_command(args: argparse.Namespace) -> None:
                 refine_radius_frames=args.vkis_refine_radius_frames,
             )
 
+    vlm_reports: dict[str, dict[str, object]] = {}
+    if advanced_mode:
+        assert run_root is not None and dense_index is not None
+        vlm_runner = None
+        vlm_initialization_error = ""
+        if args.vlm_mode != "off":
+            # All SigLIP queries have been encoded.  Release the shared model
+            # before allocating a local VLM on the 6 GB target GPU.
+            del hybrid_engine, text_engine, text_encoder, model, processor
+            gc.collect()
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                vlm_runner = build_local_vlm_runner(
+                    args.vlm_model_name,
+                    args.vlm_model_revision,
+                )
+            except Exception as exc:
+                vlm_initialization_error = f"{type(exc).__name__}: {exc}"
+                if args.vlm_mode == "required":
+                    raise RuntimeError(
+                        f"Required VLM initialization failed: {vlm_initialization_error}"
+                    ) from exc
+
+        trace_rows: list[dict[str, object]] = []
+        for question in questions:
+            ranked = advanced_results[question.query_id]
+            if args.vlm_mode != "off" and vlm_runner is not None:
+                ranked, vlm_report = rerank_with_vlm(
+                    ranked,
+                    query=question.text or "visual query image",
+                    mode=args.vlm_mode,
+                    cache_root=run_root / "cache" / "vlm",
+                    image_resolver=lambda item: resolve_run_reference(
+                        dense_run_root,
+                        str(item.record.get("candidate_image") or ""),
+                    ),
+                    runner=vlm_runner,
+                    model_name=args.vlm_model_name,
+                    model_revision=args.vlm_model_revision,
+                    top_m=args.vlm_top_m,
+                    timeout_seconds=args.vlm_timeout_seconds,
+                )
+                vlm_reports[question.query_id] = asdict(vlm_report)
+            elif args.vlm_mode != "off":
+                vlm_reports[question.query_id] = {
+                    "mode": args.vlm_mode,
+                    "status": "fallback",
+                    "fallback_reason": vlm_initialization_error,
+                }
+            else:
+                vlm_reports[question.query_id] = {
+                    "mode": "off",
+                    "status": "disabled",
+                }
+            advanced_results[question.query_id] = ranked
+            query_image = (
+                public_root / question.query_image
+                if question.task == "VKIS"
+                else None
+            )
+            predictions[question.query_id] = answers_from_advanced(
+                ranked,
+                corpus=corpus,
+                public_root=public_root,
+                run_root=dense_run_root,
+                query_image=query_image,
+                refine_top_k=(args.vkis_refine_top_k if query_image is not None else 0),
+                refine_radius_frames=args.vkis_refine_radius_frames,
+            )
+            trace = dict(advanced_traces[question.query_id])
+            trace["query_id"] = question.query_id
+            trace["task"] = question.task
+            trace["vlm"] = vlm_reports[question.query_id]
+            trace["final_results"] = [item.to_dict() for item in ranked]
+            trace_rows.append(trace)
+        atomic_write_jsonl(run_root / "results" / "query_traces.jsonl", trace_rows)
+
     write_submission(
         submission_path,
         columns=columns,
         questions=questions,
         predictions=predictions,
     )
+    validation = validate_submission(submission_path, public_root)
+    if advanced_mode:
+        assert run_root is not None and advanced_config is not None
+        elapsed = round(time.perf_counter() - predict_started, 3)
+        peak_vram_mib: float | None = None
+        if resolved_device.startswith("cuda"):
+            try:
+                import torch
+
+                peak_vram_mib = round(torch.cuda.max_memory_allocated() / (1024**2), 3)
+            except Exception:
+                peak_vram_mib = None
+        dense_manifest_path = dense_run_root / "dense" / "dense_manifest.json"
+        artifact_ledger = {
+            "coarse_index": {
+                "path": Path(os.path.relpath(paths["index"], run_root)).as_posix(),
+                "sha256": _sha256_file(paths["index"]),
+            },
+            "coarse_manifest": {
+                "path": Path(os.path.relpath(paths["manifest"], run_root)).as_posix(),
+                "sha256": _sha256_file(paths["manifest"]),
+            },
+            "text_index": {
+                "path": Path(os.path.relpath(paths["text_index"], run_root)).as_posix(),
+                "sha256": _sha256_file(paths["text_index"]),
+            },
+            "dense_manifest": {
+                "path": Path(os.path.relpath(dense_manifest_path, run_root)).as_posix(),
+                "sha256": _sha256_file(dense_manifest_path),
+            },
+        }
+        record_submission(
+            run_root,
+            submission_path,
+            query_count=int(validation["query_count"]),
+            answers_per_query=int(validation["answers_per_query"]),
+        )
+        update_run_manifest(
+            run_root,
+            git=git_fingerprint(Path(__file__).resolve().parents[1]),
+            artifacts=artifact_ledger,
+            retrieval={
+                "mode": "advanced",
+                "config": asdict(advanced_config),
+                "profile": args.retrieval_profile,
+                "vlm_mode": args.vlm_mode,
+                "vlm_model": args.vlm_model_name,
+                "vlm_model_revision": args.vlm_model_revision,
+            },
+            stages={
+                "predict": {
+                    "status": "passed",
+                    "elapsed_seconds": elapsed,
+                    "vlm_fallback_queries": sum(
+                        report.get("status") == "fallback"
+                        for report in vlm_reports.values()
+                    ),
+                    "device": resolved_device,
+                    "peak_vram_mib": peak_vram_mib,
+                    "oom": False,
+                }
+            },
+            status="submission_validated",
+        )
     print(f"Submission written: {submission_path}")
 
 
@@ -3582,12 +4251,29 @@ def _add_phase3_keyframe_arguments(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=DEFAULT_TINY_SHOT_MAX_SEC,
     )
-    parser.add_argument("--max-gap-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--max-gap-seconds",
+        type=float,
+        default=DEFAULT_MAX_GAP_SECONDS,
+    )
     parser.add_argument("--gap-tolerance-seconds", type=float, default=0.0)
     parser.add_argument("--target-keyframes", type=int, default=None)
+    parser.add_argument(
+        "--target-density-per-second",
+        type=float,
+        default=0.5,
+        help="Soft MMR target used when --target-keyframes is omitted.",
+    )
     parser.add_argument("--hard-max-keyframes", type=int, default=None)
     parser.add_argument("--importance-weight", type=float, default=0.65)
     parser.add_argument("--novelty-weight", type=float, default=0.35)
+    parser.add_argument(
+        "--endpoint-protection",
+        choices=("on", "off"),
+        default="off",
+    )
+    parser.add_argument("--dedup-similarity-threshold", type=float, default=0.92)
+    parser.add_argument("--dedup-temporal-window-seconds", type=float, default=12.0)
 
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--model-revision", default=None)
@@ -3640,6 +4326,7 @@ def _add_phase3_keyframe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--object-event-min-confidence", type=float, default=0.65)
     parser.add_argument("--transition-absolute-floor", type=float, default=0.18)
     parser.add_argument("--transition-mad-multiplier", type=float, default=2.5)
+    parser.add_argument("--asr-protection-threshold", type=float, default=0.80)
     parser.add_argument(
         "--allow-partial-features",
         action="store_true",
@@ -3654,6 +4341,62 @@ def _add_phase3_keyframe_arguments(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init_run_parser = subparsers.add_parser(
+        "init-run",
+        description="Create an immutable experiment manifest or register the 5s baseline.",
+    )
+    init_run_parser.add_argument("--run-root", type=Path, required=True)
+    init_run_parser.add_argument("--public-root", type=Path, default=DEFAULT_PUBLIC_ROOT)
+    init_run_parser.add_argument("--baseline-source-root", type=Path, default=None)
+    init_run_parser.add_argument("--baseline-submission", type=Path, default=None)
+    init_run_parser.add_argument("--baseline-score", type=float, default=None)
+    init_run_parser.add_argument("--baseline-max-gap-seconds", type=float, default=5.0)
+
+    dense_index_parser = subparsers.add_parser(
+        "dense-index",
+        description="Publish the cached Phase-3 dense candidates as a global safety index.",
+    )
+    dense_index_parser.add_argument("--run-root", type=Path, required=True)
+    dense_index_parser.add_argument(
+        "--source-workspace",
+        type=Path,
+        default=Path("competition/work/keyframe_v3"),
+    )
+    dense_index_parser.add_argument(
+        "--source-output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+    )
+    dense_index_parser.add_argument("--public-root", type=Path, default=DEFAULT_PUBLIC_ROOT)
+
+    validate_dense_parser = subparsers.add_parser(
+        "validate-dense-index",
+        description="Fail closed on dense row, checksum, encoder or offline lineage drift.",
+    )
+    validate_dense_parser.add_argument("--run-root", type=Path, required=True)
+    validate_dense_parser.add_argument("--skip-source-validation", action="store_true")
+
+    record_score_parser = subparsers.add_parser(
+        "record-score",
+        description="Bind one leaderboard score to the current submission checksum.",
+    )
+    record_score_parser.add_argument("--run-root", type=Path, required=True)
+    record_score_parser.add_argument("--score", type=float, required=True)
+    record_score_parser.add_argument("--split", default="public")
+    record_score_parser.add_argument("--source", default="user_reported")
+
+    promote_run_parser = subparsers.add_parser(
+        "promote-run",
+        description="Atomically update active_run.json after the score gate passes.",
+    )
+    promote_run_parser.add_argument("--run-root", type=Path, required=True)
+    promote_run_parser.add_argument(
+        "--runs-root",
+        type=Path,
+        default=Path("competition/runs"),
+    )
+    promote_run_parser.add_argument("--minimum-score", type=float, default=0.818)
 
     validate_input_parser = subparsers.add_parser(
         "validate-input",
@@ -3673,6 +4416,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_phase3_keyframe_arguments(keyframes_parser)
+
+    reselect_parser = subparsers.add_parser(
+        "reselect-keyframes",
+        description=(
+            "Run offline selector ablations from the validated Phase-3 feature "
+            "cache and publish into an isolated run root without model inference."
+        ),
+    )
+    _add_phase3_keyframe_arguments(reselect_parser)
+    reselect_parser.add_argument("--run-root", type=Path, required=True)
+    reselect_parser.add_argument(
+        "--source-output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+    )
 
     extract_parser = subparsers.add_parser(
         "extract",
@@ -3711,7 +4469,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_TINY_SHOT_MAX_SEC,
     )
-    extract_parser.add_argument("--max-gap-seconds", type=float, default=5.0)
+    extract_parser.add_argument(
+        "--max-gap-seconds",
+        type=float,
+        default=DEFAULT_MAX_GAP_SECONDS,
+    )
     extract_parser.add_argument("--gap-tolerance-seconds", type=float, default=0.0)
     extract_parser.add_argument("--target-keyframes", type=int, default=None)
     extract_parser.add_argument("--hard-max-keyframes", type=int, default=None)
@@ -3829,6 +4591,11 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--num-workers", type=int, default=0)
     predict_parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     predict_parser.add_argument("--no-autocast", action="store_true")
+    predict_parser.add_argument(
+        "--offline-model-cache",
+        action="store_true",
+        help="Refuse network access and load the resolved SigLIP2 revision from cache.",
+    )
     predict_parser.add_argument("--search-depth", type=int, default=200)
     predict_parser.add_argument(
         "--tkis-routing",
@@ -3880,6 +4647,51 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
     )
+    predict_parser.add_argument(
+        "--retrieval-mode",
+        choices=("legacy", "advanced"),
+        default="legacy",
+    )
+    predict_parser.add_argument(
+        "--run-root",
+        type=Path,
+        default=None,
+        help="Required in advanced mode; holds dense artifacts, traces and submission.",
+    )
+    predict_parser.add_argument(
+        "--dense-run-root",
+        type=Path,
+        default=None,
+        help="Reuse a validated dense index from another immutable run.",
+    )
+    predict_parser.add_argument(
+        "--retrieval-profile",
+        choices=("auto", "kis", "avs", "qa", "temporal"),
+        default="auto",
+    )
+    predict_parser.add_argument("--coarse-top-n", type=int, default=50)
+    predict_parser.add_argument("--dense-global-top-k", type=int, default=300)
+    predict_parser.add_argument("--dense-rescue-clips", type=int, default=10)
+    predict_parser.add_argument("--max-candidate-clips", type=int, default=60)
+    predict_parser.add_argument("--dense-frames-per-clip", type=int, default=12)
+    predict_parser.add_argument("--rrf-k", type=int, default=60)
+    predict_parser.add_argument("--modality-hint-boost", type=float, default=1.5)
+    predict_parser.add_argument("--cses-similarity-threshold", type=float, default=0.92)
+    predict_parser.add_argument(
+        "--cses-temporal-window-seconds",
+        type=float,
+        default=2.0,
+    )
+    predict_parser.add_argument("--vlm-mode", choices=VLM_MODES, default="off")
+    predict_parser.add_argument("--vlm-model-name", default=DEFAULT_VLM_MODEL)
+    predict_parser.add_argument("--vlm-model-revision", default="main")
+    predict_parser.add_argument("--vlm-top-m", type=int, default=20)
+    predict_parser.add_argument("--vlm-timeout-seconds", type=float, default=120.0)
+    predict_parser.add_argument("--no-query-plan", action="store_true")
+    predict_parser.add_argument("--no-rrf", action="store_true")
+    predict_parser.add_argument("--no-dense-rescue", action="store_true")
+    predict_parser.add_argument("--no-cses", action="store_true")
+    predict_parser.add_argument("--no-deterministic-rerank", action="store_true")
     phase5_evaluate_parser.add_argument(
         "--retrieval-evidence",
         type=Path,
@@ -3914,7 +4726,19 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    if args.command == "validate-input":
+    if args.command == "init-run":
+        if args.baseline_score is not None and args.baseline_submission is None:
+            parser.error("--baseline-score requires --baseline-submission")
+        init_run_command(args)
+    elif args.command == "dense-index":
+        dense_index_command(args)
+    elif args.command == "validate-dense-index":
+        validate_dense_index_command(args)
+    elif args.command == "record-score":
+        record_score_command(args)
+    elif args.command == "promote-run":
+        promote_run_command(args)
+    elif args.command == "validate-input":
         print(json.dumps(validate_input(args.public_root), ensure_ascii=False, indent=2))
     elif args.command == "keyframes":
         adapter_config = _phase3_adapter_config(args)
@@ -3929,6 +4753,15 @@ def main() -> None:
         if args.asr_retries < 0:
             parser.error("--asr-retries must be non-negative")
         keyframes_command(args)
+    elif args.command == "reselect-keyframes":
+        adapter_config = _phase3_adapter_config(args)
+        if args.candidate_interval_sec > adapter_config.transition_max_pair_gap_seconds:
+            parser.error(
+                "--candidate-interval-sec must not exceed the semantic transition "
+                f"pair gap ({adapter_config.transition_max_pair_gap_seconds}s)"
+            )
+        _phase3_selection_config(args)
+        reselect_keyframes_command(args)
     elif args.command == "extract":
         extract_command(args)
     elif args.command == "embed":
@@ -3948,6 +4781,26 @@ def main() -> None:
             parser.error("--search-depth must be at least 100")
         if args.vkis_refine_top_k < 0 or args.vkis_refine_radius_frames < 0:
             parser.error("VKIS refinement parameters must be non-negative")
+        if args.retrieval_mode == "advanced":
+            positive = {
+                "--coarse-top-n": args.coarse_top_n,
+                "--dense-global-top-k": args.dense_global_top_k,
+                "--dense-rescue-clips": args.dense_rescue_clips,
+                "--max-candidate-clips": args.max_candidate_clips,
+                "--dense-frames-per-clip": args.dense_frames_per_clip,
+                "--rrf-k": args.rrf_k,
+                "--modality-hint-boost": args.modality_hint_boost,
+                "--cses-temporal-window-seconds": args.cses_temporal_window_seconds,
+                "--vlm-top-m": args.vlm_top_m,
+                "--vlm-timeout-seconds": args.vlm_timeout_seconds,
+            }
+            invalid = [name for name, value in positive.items() if value <= 0]
+            if invalid:
+                parser.error(f"Advanced retrieval values must be positive: {invalid}")
+            if not 0.0 <= args.cses_similarity_threshold <= 1.0:
+                parser.error("--cses-similarity-threshold must be within [0, 1]")
+            if args.max_candidate_clips < args.coarse_top_n:
+                parser.error("--max-candidate-clips must be >= --coarse-top-n")
         predict_command(args)
     elif args.command == "phase5-init":
         phase5_init_command(args)

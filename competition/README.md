@@ -91,7 +91,7 @@ validate-input -> keyframes -> index -> neighbors -> segments
                -> text-index -> predict -> validate-submission
 ```
 
-GPU, dùng cấu hình keyframe khuyến nghị `0.5s candidate / 5s max gap`:
+GPU, dùng cấu hình keyframe khuyến nghị `0.5s candidate / 2s max gap`:
 
 ```powershell
 .\.venv\Scripts\python.exe -m competition.run_end_to_end `
@@ -606,7 +606,7 @@ Chạy các lệnh từ thư mục gốc của repository bằng PowerShell.
   --batch-size auto `
   --num-workers 0 `
   --candidate-interval-sec 0.5 `
-  --max-gap-seconds 5.0 `
+  --max-gap-seconds 2.0 `
   --asr-timeout-seconds 90 `
   --asr-cpu-timeout-seconds 600 `
   --asr-retries 1 `
@@ -646,7 +646,7 @@ artifact hợp lệ và tiếp tục phần còn thiếu. Ví dụ tiếp tục 
   --batch-size auto `
   --num-workers 0 `
   --candidate-interval-sec 0.5 `
-  --max-gap-seconds 5.0 `
+  --max-gap-seconds 2.0 `
   --asr-timeout-seconds 90 `
   --asr-cpu-timeout-seconds 600 `
   --asr-retries 1 `
@@ -697,7 +697,7 @@ Khi đã có điểm leaderboard, cập nhật thêm một dòng bằng:
   --output-root ".\competition" `
   --public-score 0.818 `
   --private-score 0.818 `
-  --note "Baseline full multimodal, max_gap=5.0s"
+  --note "Baseline full multimodal, max_gap=2.0s"
 ```
 
 ### Kiểm tra riêng file submission
@@ -711,3 +711,138 @@ Khi đã có điểm leaderboard, cập nhật thêm một dòng bằng:
 Chỉ dùng submission khi validator trả về `status: passed`. Nếu cần chế độ giảm tải
 thiếu một số modality thì phải truyền rõ `--allow-partial-features`; không nên dùng
 chế độ này cho lần chạy full multimodal cuối cùng.
+
+## Retrieval/Leaderboard v2 (terminal-only)
+
+Nhánh v2 giữ artifact 5 giây hiện tại làm baseline bất biến. Mọi submission mới,
+query trace và manifest được ghi dưới `competition/runs/<run_id>`; API và frontend
+không nằm trong luồng này.
+
+### Runner kiến trúc v2 đầy đủ
+
+Để build mới toàn bộ offline + coarse index + dense safety index + advanced
+retrieval trong cùng một run root, dùng entrypoint sau. Đây là runner được dùng
+bởi notebook Colab và không chạy Phase 5/ground-truth metric:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m competition.run_retrieval_v2 `
+  --public-root ".\data\public" `
+  --run-root ".\competition\runs\retrieval-v2-full" `
+  --model-cache-root ".\data\model_cache" `
+  --device cuda `
+  --vlm-mode off
+```
+
+Runner chạy đúng chín stage:
+
+```text
+validate-input -> keyframes -> index -> neighbors -> segments -> text-index
+  -> dense-index -> predict (advanced) -> validate-submission
+```
+
+Run dừng giữa chừng có thể tiếp tục bằng cùng `run_root` và `--start-at`. Runner
+fail-closed nếu source code, public dataset hoặc offline config khác lineage đã
+lưu. `reports/Experiment.md` chỉ được append sau khi manifest xác nhận đủ cả chín
+stage; partial/failed/dry-run không được ghi thành một experiment hoàn tất.
+
+Notebook launcher cho Colab Pro nằm tại
+`notebooks/colab_retrieval_v2_launcher.ipynb`.
+
+Ensemble hai submission đã validate bằng weighted RRF (không cần ground truth):
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m competition.ensemble_submissions `
+  --submission ".\competition\runs\run-a\results\submission.csv" `
+  --weight 1.0 `
+  --submission ".\competition\runs\run-b\results\submission.csv" `
+  --weight 1.0 `
+  --output ".\competition\runs\ensemble-ab\results\submission.csv" `
+  --public-root ".\data\public"
+```
+
+Lệnh fail nếu union không đủ 100 answer duy nhất và ghi checksum/input lineage vào
+`submission.csv.manifest.json` sau atomic replace.
+
+Đăng ký baseline 5 giây và tạo `competition/runs/active_run.json` lần đầu:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m competition.pipeline init-run `
+  --run-root competition\runs\baseline-5s-0818 `
+  --baseline-source-root competition `
+  --baseline-submission competition\results\submission.csv `
+  --baseline-score 0.818 `
+  --baseline-max-gap-seconds 5
+```
+
+Đóng gói 9.621 dense candidate đã cache, không chạy lại SigLIP2:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m competition.pipeline dense-index `
+  --run-root competition\runs\retrieval-v2-baseline5s-dense `
+  --source-workspace competition\work\keyframe_v3
+
+& ".\.venv\Scripts\python.exe" -m competition.pipeline validate-dense-index `
+  --run-root competition\runs\retrieval-v2-baseline5s-dense
+```
+
+Chạy retrieval nâng cao. `--dense-run-root` cho phép nhiều ablation dùng chung một
+dense index bất biến, không nhân đôi vector/JPEG:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m competition.pipeline predict `
+  --run-root competition\runs\retrieval-v2-deterministic `
+  --dense-run-root competition\runs\retrieval-v2-baseline5s-dense `
+  --retrieval-mode advanced `
+  --coarse-top-n 50 `
+  --dense-global-top-k 300 `
+  --dense-frames-per-clip 12 `
+  --vlm-mode off
+```
+
+Advanced mode dùng QueryPlan, weighted RRF, dense rescue, CSES và deterministic
+multimodal rerank. Nó không padding bằng `video,frame 0`: nếu reserve không đủ 100
+answer duy nhất, lệnh dừng trước khi atomic replace submission.
+
+Chạy selector offline trên feature cache vào một run riêng, không ghi đè baseline
+và không load lại model:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m competition.pipeline reselect-keyframes `
+  --source-output-root competition `
+  --run-root competition\runs\offline-gap2-dedup092 `
+  --max-gap-seconds 2 `
+  --dedup-similarity-threshold 0.92 `
+  --asr-protection-threshold 0.80 `
+  --endpoint-protection off
+```
+
+`--endpoint-protection on` fail-closed trước khi publish nếu cache nguồn chưa có
+candidate first/last đã được encode. Khi đó phải tạo candidate cache có endpoint;
+lệnh reselect không giả lập embedding hoặc silently dùng frame gần nhất.
+
+Khởi tạo bộ 16 video để con người gán 80 event và 48 query:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m competition.optimize_retrieval `
+  --init-labeling --seed 42
+```
+
+Sau khi hoàn tất `competition/evaluation/retrieval_labels.jsonl`, chạy ablation dev:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m competition.optimize_retrieval `
+  --split dev `
+  --experiment-config configs\retrieval_v2.yaml
+```
+
+Gắn score thật vào đúng SHA256 rồi chỉ promote khi score lớn hơn baseline:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m competition.pipeline record-score `
+  --run-root competition\runs\retrieval-v2-deterministic `
+  --score 0.825 --split public
+
+& ".\.venv\Scripts\python.exe" -m competition.pipeline promote-run `
+  --run-root competition\runs\retrieval-v2-deterministic `
+  --minimum-score 0.818
+```

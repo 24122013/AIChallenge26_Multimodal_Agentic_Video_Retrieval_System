@@ -39,3 +39,5 @@ competition/evaluation/*
 !competition/evaluation/.gitkeep
 competition/work/*
 !competition/work/.gitkeep
+competition/runs/*
+!competition/runs/.gitkeep

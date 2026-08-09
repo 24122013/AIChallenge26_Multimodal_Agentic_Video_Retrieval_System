@@ -11,7 +11,7 @@ from __future__ import annotations
 import bisect
 import itertools
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from numbers import Integral, Real
 from typing import Iterable, Sequence
 
@@ -21,6 +21,8 @@ from .keyframe_candidates import (
     REASON_SHOT_BOUNDARY_END,
     REASON_SHOT_BOUNDARY_START,
     REASON_TINY_SHOT_MIDPOINT,
+    REASON_VIDEO_END,
+    REASON_VIDEO_START,
     KeyframeCandidate,
 )
 
@@ -28,6 +30,8 @@ from .keyframe_candidates import (
 PHASE_PROTECTED = "protected"
 PHASE_COVERAGE = "coverage_fill"
 PHASE_MMR = "mmr"
+PHASE_TEMPORAL_REPAIR = "temporal_repair"
+DEFAULT_MAX_GAP_SECONDS = 2.0
 
 
 def _finite_real(value: object, name: str) -> float:
@@ -197,6 +201,11 @@ class SelectionConfig:
     novelty_weight: float = 0.35
     exact_search_candidate_limit: int = 18
     protect_each_shot: bool = True
+    protect_video_endpoints: bool = False
+    enable_event_aware_dedup: bool = False
+    target_density_per_second: float | None = None
+    dedup_similarity_threshold: float = 0.92
+    dedup_temporal_window_seconds: float = 12.0
 
     def __post_init__(self) -> None:
         max_gap_seconds = _finite_real(self.max_gap_seconds, "max_gap_seconds")
@@ -227,10 +236,49 @@ class SelectionConfig:
             raise ValueError("exact_search_candidate_limit must be between 0 and 18")
         if not isinstance(self.protect_each_shot, bool):
             raise TypeError("protect_each_shot must be a boolean")
+        if not isinstance(self.protect_video_endpoints, bool):
+            raise TypeError("protect_video_endpoints must be a boolean")
+        if not isinstance(self.enable_event_aware_dedup, bool):
+            raise TypeError("enable_event_aware_dedup must be a boolean")
+        target_density_per_second = self.target_density_per_second
+        if target_density_per_second is not None:
+            target_density_per_second = _finite_real(
+                target_density_per_second,
+                "target_density_per_second",
+            )
+            if target_density_per_second <= 0:
+                raise ValueError("target_density_per_second must be > 0")
+        dedup_similarity_threshold = _finite_real(
+            self.dedup_similarity_threshold,
+            "dedup_similarity_threshold",
+        )
+        if not 0.0 <= dedup_similarity_threshold <= 1.0:
+            raise ValueError("dedup_similarity_threshold must be between 0 and 1")
+        dedup_temporal_window_seconds = _finite_real(
+            self.dedup_temporal_window_seconds,
+            "dedup_temporal_window_seconds",
+        )
+        if dedup_temporal_window_seconds < 0:
+            raise ValueError("dedup_temporal_window_seconds must be >= 0")
         object.__setattr__(self, "max_gap_seconds", max_gap_seconds)
         object.__setattr__(self, "gap_tolerance_seconds", gap_tolerance_seconds)
         object.__setattr__(self, "importance_weight", importance_weight)
         object.__setattr__(self, "novelty_weight", novelty_weight)
+        object.__setattr__(
+            self,
+            "dedup_similarity_threshold",
+            dedup_similarity_threshold,
+        )
+        object.__setattr__(
+            self,
+            "dedup_temporal_window_seconds",
+            dedup_temporal_window_seconds,
+        )
+        object.__setattr__(
+            self,
+            "target_density_per_second",
+            target_density_per_second,
+        )
 
 
 @dataclass(frozen=True)
@@ -282,6 +330,7 @@ class SelectionResult:
     selection_method: str
     target_keyframes: int | None
     hard_max_keyframes: int | None
+    dedup_removed: tuple[dict[str, object], ...] = ()
 
     def to_report(self) -> dict[str, object]:
         return {
@@ -302,6 +351,7 @@ class SelectionResult:
             "selection_method": self.selection_method,
             "target_keyframes": self.target_keyframes,
             "hard_max_keyframes": self.hard_max_keyframes,
+            "dedup_removed": list(self.dedup_removed),
         }
 
 
@@ -326,11 +376,18 @@ class _SelectionState:
             self.reasons[candidate_id].add(reason)
             return False
         self.selected[candidate_id] = candidate
-        self.rank[candidate_id] = len(self.rank) + 1
+        self.rank[candidate_id] = max(self.rank.values(), default=0) + 1
         self.phase[candidate_id] = phase
         self.reasons[candidate_id] = {reason}
         self.score[candidate_id] = score
         return True
+
+    def remove(self, candidate_id: str) -> None:
+        self.selected.pop(candidate_id, None)
+        self.rank.pop(candidate_id, None)
+        self.phase.pop(candidate_id, None)
+        self.reasons.pop(candidate_id, None)
+        self.score.pop(candidate_id, None)
 
 
 @dataclass(frozen=True)
@@ -386,6 +443,14 @@ def select_keyframes(
     video_duration = _finite_real(video_duration, "video_duration")
     if video_duration < 0:
         raise ValueError("video_duration must be >= 0")
+    if config.target_keyframes is None and config.target_density_per_second is not None:
+        config = replace(
+            config,
+            target_keyframes=max(
+                1 if video_duration > 0 else 0,
+                int(math.ceil(video_duration * config.target_density_per_second)),
+            ),
+        )
     ordered = _validate_and_order_candidates(candidates, video_duration)
     supplied_events = tuple(protected_events)
     if config.protect_each_shot and video_duration > 0 and not ordered:
@@ -422,8 +487,13 @@ def select_keyframes(
     automatic_shot_events = (
         build_shot_protection_events(ordered) if config.protect_each_shot else ()
     )
+    automatic_endpoint_events = (
+        build_endpoint_protection_events(ordered)
+        if config.protect_video_endpoints
+        else ()
+    )
     events = _validate_and_order_events(
-        (*supplied_events, *automatic_shot_events),
+        (*supplied_events, *automatic_shot_events, *automatic_endpoint_events),
         ordered,
     )
     by_id = {candidate.candidate_id: candidate for candidate in ordered}
@@ -431,12 +501,27 @@ def select_keyframes(
 
     _select_protected_events(state, ordered, events, video_duration, config)
     max_gap_before = _max_gap(state.selected.values(), video_duration)
-    coverage_exhausted = not _repair_temporal_coverage(
-        state,
-        ordered,
-        video_duration,
-        config,
-    )
+    dedup_removed: tuple[dict[str, object], ...] = ()
+    if config.enable_event_aware_dedup:
+        soft_stop_reason = _fill_mmr(state, ordered, config)
+        dedup_removed = _deduplicate_selected(state, ordered, events, config)
+        coverage_exhausted = not _repair_temporal_coverage(
+            state,
+            ordered,
+            video_duration,
+            config,
+            phase=PHASE_TEMPORAL_REPAIR,
+            reason="temporal_repair",
+        )
+        dedup_removed = _annotate_dedup_overrides(dedup_removed, state)
+    else:
+        coverage_exhausted = not _repair_temporal_coverage(
+            state,
+            ordered,
+            video_duration,
+            config,
+        )
+        soft_stop_reason = "hard_constraints_unsatisfied"
 
     unsatisfied = _unsatisfied_event_ids(state.selected, events)
     violations = _violating_gaps(
@@ -445,7 +530,11 @@ def select_keyframes(
         config.max_gap_seconds,
         config.gap_tolerance_seconds,
     )
-    selection_method = "greedy_event_cover+per_gap_minimal_fill"
+    selection_method = (
+        "protected+coverage_mmr+event_aware_dedup+final_temporal_repair"
+        if config.enable_event_aware_dedup
+        else "greedy_event_cover+per_gap_minimal_fill"
+    )
     exact_infeasible = False
 
     hard_cap_blocked = (
@@ -484,8 +573,7 @@ def select_keyframes(
             )
 
     hard_constraints_satisfied = not unsatisfied and not violations
-    soft_stop_reason = "hard_constraints_unsatisfied"
-    if hard_constraints_satisfied:
+    if hard_constraints_satisfied and not config.enable_event_aware_dedup:
         soft_stop_reason = _fill_mmr(state, ordered, config)
 
     unsatisfied = _unsatisfied_event_ids(state.selected, events)
@@ -540,6 +628,7 @@ def select_keyframes(
         selection_method=selection_method,
         target_keyframes=config.target_keyframes,
         hard_max_keyframes=config.hard_max_keyframes,
+        dedup_removed=dedup_removed,
     )
 
 
@@ -590,6 +679,36 @@ def build_shot_protection_events(
             )
         )
     return tuple(events)
+
+
+def build_endpoint_protection_events(
+    candidates: Iterable[SelectionCandidate],
+    *,
+    priority: int = 200,
+) -> tuple[ProtectedEvent, ...]:
+    """Protect exact decoded first/last frames added to the dense pool."""
+    values = tuple(candidates)
+    if not values:
+        return ()
+    start_ids = tuple(
+        candidate.candidate_id
+        for candidate in values
+        if REASON_VIDEO_START in candidate.source_reasons
+    )
+    end_ids = tuple(
+        candidate.candidate_id
+        for candidate in values
+        if REASON_VIDEO_END in candidate.source_reasons
+    )
+    if not start_ids or not end_ids:
+        raise ValueError(
+            "endpoint protection requires a candidate pool materialized with "
+            "include_video_endpoints=True"
+        )
+    return (
+        ProtectedEvent("__video__:start", "video_start", start_ids, priority),
+        ProtectedEvent("__video__:end", "video_end", end_ids, priority),
+    )
 
 
 def _validate_and_order_candidates(
@@ -721,6 +840,9 @@ def _repair_temporal_coverage(
     candidates: Sequence[SelectionCandidate],
     video_duration: float,
     config: SelectionConfig,
+    *,
+    phase: str = PHASE_COVERAGE,
+    reason: str = "temporal_coverage",
 ) -> bool:
     """Fill every mandatory-anchor interval with a minimum-cardinality chain.
 
@@ -743,8 +865,8 @@ def _repair_temporal_coverage(
             return False
         state.add(
             by_id[candidate_id],
-            phase=PHASE_COVERAGE,
-            reason="temporal_coverage",
+            phase=phase,
+            reason=reason,
         )
     return not _violating_gaps(
         state.selected.values(),
@@ -752,6 +874,144 @@ def _repair_temporal_coverage(
         config.max_gap_seconds,
         config.gap_tolerance_seconds,
     )
+
+
+def _deduplicate_selected(
+    state: _SelectionState,
+    candidates: Sequence[SelectionCandidate],
+    events: Sequence[ProtectedEvent],
+    config: SelectionConfig,
+) -> tuple[dict[str, object], ...]:
+    """Remove visual duplicates without losing the last event representative."""
+    selected = tuple(state.selected.values())
+    if len(selected) < 2:
+        return ()
+    parent = list(range(len(selected)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    normalized: dict[int, np.ndarray] = {}
+    for index, candidate in enumerate(selected):
+        if candidate.semantic_embedding:
+            vector = np.asarray(candidate.semantic_embedding, dtype=np.float64)
+            normalized[index] = vector / np.linalg.norm(vector)
+    for left in range(len(selected)):
+        for right in range(left + 1, len(selected)):
+            first = selected[left]
+            second = selected[right]
+            same_group = bool(
+                first.duplicate_group
+                and first.duplicate_group == second.duplicate_group
+            )
+            semantic_duplicate = False
+            if (
+                left in normalized
+                and right in normalized
+                and abs(first.timestamp - second.timestamp)
+                <= config.dedup_temporal_window_seconds
+            ):
+                semantic_duplicate = (
+                    float(np.dot(normalized[left], normalized[right]))
+                    >= config.dedup_similarity_threshold
+                )
+            if same_group or semantic_duplicate:
+                union(left, right)
+
+    components: dict[int, list[SelectionCandidate]] = {}
+    for index, candidate in enumerate(selected):
+        components.setdefault(find(index), []).append(candidate)
+    selected_ids = set(state.selected)
+    removed: list[dict[str, object]] = []
+    cluster_number = 0
+    for component in components.values():
+        if len(component) < 2:
+            continue
+        cluster_number += 1
+        cluster_id = f"DEDUP_{cluster_number:04d}"
+        component_ids = {candidate.candidate_id for candidate in component}
+        median_timestamp = float(np.median([candidate.timestamp for candidate in component]))
+
+        def quality(candidate: SelectionCandidate) -> tuple[object, ...]:
+            event_count = sum(
+                candidate.candidate_id in event.candidate_ids for event in events
+            )
+            return (
+                -event_count,
+                -candidate.importance_score,
+                abs(candidate.timestamp - median_timestamp),
+                candidate.timestamp,
+                candidate.frame_index,
+                candidate.candidate_id,
+            )
+
+        keep: set[str] = {min(component, key=quality).candidate_id}
+        for event in events:
+            currently_covering = selected_ids.intersection(event.candidate_ids)
+            if not currently_covering or not currently_covering.issubset(component_ids):
+                continue
+            if keep.intersection(event.candidate_ids):
+                continue
+            eligible = [
+                candidate
+                for candidate in component
+                if candidate.candidate_id in event.candidate_ids
+            ]
+            if eligible:
+                protected = min(eligible, key=quality)
+                keep.add(protected.candidate_id)
+                state.reasons[protected.candidate_id].add("protected_override")
+
+        representative = min(
+            (candidate for candidate in component if candidate.candidate_id in keep),
+            key=quality,
+        )
+        for candidate in component:
+            if candidate.candidate_id in keep:
+                state.reasons[candidate.candidate_id].add(
+                    f"dedup_cluster:{cluster_id}"
+                )
+                continue
+            removed.append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "dedup_cluster_id": cluster_id,
+                    "representative_candidate_id": representative.candidate_id,
+                    "reason": "near_duplicate",
+                    "override_reason": None,
+                    "retained_after_repair": False,
+                }
+            )
+            state.remove(candidate.candidate_id)
+            selected_ids.discard(candidate.candidate_id)
+    return tuple(removed)
+
+
+def _annotate_dedup_overrides(
+    removed: Sequence[dict[str, object]],
+    state: _SelectionState,
+) -> tuple[dict[str, object], ...]:
+    values: list[dict[str, object]] = []
+    for record in removed:
+        value = dict(record)
+        candidate_id = str(value["candidate_id"])
+        if candidate_id in state.selected:
+            value["retained_after_repair"] = True
+            value["override_reason"] = "temporal_repair"
+            state.reasons[candidate_id].add(
+                f"dedup_cluster:{value['dedup_cluster_id']}"
+            )
+        values.append(value)
+    return tuple(values)
 
 
 def _minimal_coverage_additions(
@@ -1116,6 +1376,7 @@ def _selected_output(
 
 
 __all__ = [
+    "DEFAULT_MAX_GAP_SECONDS",
     "PHASE_COVERAGE",
     "PHASE_MMR",
     "PHASE_PROTECTED",
@@ -1126,5 +1387,7 @@ __all__ = [
     "SelectionResult",
     "TemporalGap",
     "build_shot_protection_events",
+    "build_endpoint_protection_events",
+    "PHASE_TEMPORAL_REPAIR",
     "select_keyframes",
 ]

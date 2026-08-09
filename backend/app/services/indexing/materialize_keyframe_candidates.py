@@ -234,6 +234,7 @@ def _materialize_candidates(
     candidate_interval_sec: float,
     boundary_guard_sec: float,
     tiny_shot_max_sec: float,
+    include_video_endpoints: bool,
 ) -> dict[str, object]:
     video_output_dir = output_dir / info.video_id
     video_output_dir.mkdir(parents=True, exist_ok=True)
@@ -245,6 +246,7 @@ def _materialize_candidates(
         boundary_guard_sec=boundary_guard_sec,
         tiny_shot_max_sec=tiny_shot_max_sec,
         frame_count=info.frame_count,
+        include_video_endpoints=include_video_endpoints,
     )
     shot_by_index = {shot.shot_index: shot for shot in shots}
     kept_phashes: deque[tuple[int, str, float]] = deque()
@@ -410,6 +412,8 @@ def _materialize_candidates(
         "boundary_guard_sec": boundary_guard_sec,
         "tiny_shot_max_sec": tiny_shot_max_sec,
     }
+    if include_video_endpoints:
+        candidate_config["include_video_endpoints"] = True
     materialized_count_by_shot = Counter(
         int(record["shot_index"]) for record in records
     )
@@ -442,6 +446,7 @@ def _materialize_candidates(
         "candidate_interval_sec": candidate_interval_sec,
         "boundary_guard_sec": boundary_guard_sec,
         "tiny_shot_max_sec": tiny_shot_max_sec,
+        "include_video_endpoints": include_video_endpoints,
         "candidate_config": candidate_config,
         "deduplication_mode": "annotate_only",
         "duplicate_retained_count": len(duplicate_retained),
@@ -487,6 +492,7 @@ def materialize_keyframe_candidates_for_video(
     candidate_interval_sec: float = DEFAULT_INTERVAL_SEC,
     boundary_guard_sec: float = DEFAULT_BOUNDARY_GUARD_SEC,
     tiny_shot_max_sec: float = DEFAULT_TINY_SHOT_MAX_SEC,
+    include_video_endpoints: bool = False,
 ) -> dict[str, object]:
     """Decode and verify all deterministic dense candidates for one video.
 
@@ -532,6 +538,7 @@ def materialize_keyframe_candidates_for_video(
         candidate_interval_sec=candidate_interval_sec,
         boundary_guard_sec=boundary_guard_sec,
         tiny_shot_max_sec=tiny_shot_max_sec,
+        include_video_endpoints=include_video_endpoints,
     )
 
 

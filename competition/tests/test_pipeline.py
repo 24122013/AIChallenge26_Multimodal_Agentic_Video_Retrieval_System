@@ -117,7 +117,7 @@ class CompetitionPipelineTest(unittest.TestCase):
 
         self.assertEqual(args.keyframe_strategy, "dense_coverage")
         self.assertEqual(args.candidate_interval_sec, 0.5)
-        self.assertEqual(args.max_gap_seconds, 5.0)
+        self.assertEqual(args.max_gap_seconds, 2.0)
         self.assertIsNone(args.target_keyframes)
         self.assertIsNone(args.hard_max_keyframes)
 

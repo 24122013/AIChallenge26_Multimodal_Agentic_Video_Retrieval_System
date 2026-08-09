@@ -106,6 +106,7 @@ def load_siglip2_model_processor(
     device: str,
     model_cache_dir: Path | None,
     use_autocast: bool = True,
+    local_files_only: bool = False,
 ):
     try:
         from transformers import AutoModel, AutoProcessor
@@ -121,6 +122,8 @@ def load_siglip2_model_processor(
     if model_cache_dir:
         model_cache_dir.mkdir(parents=True, exist_ok=True)
         common_kwargs["cache_dir"] = model_cache_dir.as_posix()
+    if local_files_only:
+        common_kwargs["local_files_only"] = True
 
     model_kwargs = dict(common_kwargs)
     compute_dtype = compute_dtype_for(device, use_autocast)

@@ -25,6 +25,8 @@ from .keyframe_candidates import (
     REASON_SHOT_BOUNDARY_END,
     REASON_SHOT_BOUNDARY_START,
     REASON_TINY_SHOT_MIDPOINT,
+    REASON_VIDEO_END,
+    REASON_VIDEO_START,
 )
 from .keyframe_feature_adapter import (
     CandidateComponentScore,
@@ -40,6 +42,7 @@ from .keyframe_selection import (
     SelectionResult,
     TemporalGap,
     build_shot_protection_events,
+    build_endpoint_protection_events,
     select_keyframes,
 )
 
@@ -50,6 +53,8 @@ _DENSE_REASONS = {
     REASON_SHOT_BOUNDARY_START,
     REASON_SHOT_BOUNDARY_END,
     REASON_TINY_SHOT_MIDPOINT,
+    REASON_VIDEO_START,
+    REASON_VIDEO_END,
 }
 
 
@@ -229,9 +234,15 @@ def run_multimodal_keyframe_pipeline(
         video_duration=duration,
         config=selection_config,
     )
+    audit_events = adapter_result.protected_events
+    if selection_config.protect_video_endpoints:
+        audit_events = (
+            *audit_events,
+            *build_endpoint_protection_events(adapter_result.selection_candidates),
+        )
     guarantee_report = _audit_hard_guarantees(
         identities,
-        adapter_result.protected_events,
+        audit_events,
         selection_result,
         video_duration=duration,
         config=selection_config,
@@ -297,10 +308,12 @@ def run_multimodal_keyframe_pipeline(
         scores_by_id,
         selected_by_id,
         semantic_novelty_by_id,
+        selection_result,
     )
     event_ledger = _build_event_ledger(
         adapter_result,
         selection_result,
+        selection_config,
     )
 
     return MultimodalKeyframePipelineResult(
@@ -800,6 +813,23 @@ def _build_final_record(
     record = dict(candidate_record)
     component_scores = dict(score.component_scores)
     protected_event_ids = list(selected.covered_event_ids)
+    dedup_cluster_id = next(
+        (
+            reason.split(":", 1)[1]
+            for reason in selected.selection_reasons
+            if reason.startswith("dedup_cluster:")
+        ),
+        None,
+    )
+    duplicate_override_reason = (
+        "protected_override"
+        if "protected_override" in selected.selection_reasons
+        else (
+            "temporal_repair"
+            if "temporal_repair" in selected.selection_reasons
+            else None
+        )
+    )
     provenance = {
         "strategy": KEYFRAME_STRATEGY_MULTIMODAL_COVERAGE,
         "selection_rank": selected.selection_rank,
@@ -828,6 +858,8 @@ def _build_final_record(
             "component_scores": component_scores,
             "available_modalities": list(score.available_modalities),
             "protected_event_ids": protected_event_ids,
+            "dedup_cluster_id": dedup_cluster_id,
+            "duplicate_override_reason": duplicate_override_reason,
             "selection_provenance": provenance,
         }
     )
@@ -860,6 +892,8 @@ def _build_final_embedding_record(
         "component_scores",
         "available_modalities",
         "protected_event_ids",
+        "dedup_cluster_id",
+        "duplicate_override_reason",
         "selection_provenance",
     ):
         record[field] = final_record[field]
@@ -882,11 +916,17 @@ def _build_candidate_ledger(
     scores_by_id: Mapping[str, CandidateComponentScore],
     selected_by_id: Mapping[str, Any],
     semantic_novelty_by_id: Mapping[str, float],
+    selection_result: SelectionResult,
 ) -> tuple[dict[str, Any], ...]:
+    removed_by_id = {
+        str(record["candidate_id"]): record
+        for record in selection_result.dedup_removed
+    }
     values: list[dict[str, Any]] = []
     for identity in identities:
         score = scores_by_id[identity.candidate_id]
         selected = selected_by_id.get(identity.candidate_id)
+        removed = removed_by_id.get(identity.candidate_id, {})
         values.append(
             {
                 "candidate_id": identity.candidate_id,
@@ -906,6 +946,13 @@ def _build_candidate_ledger(
                 "selection_phase": selected.selection_phase if selected else None,
                 "selection_reasons": list(selected.selection_reasons) if selected else [],
                 "covered_event_ids": list(selected.covered_event_ids) if selected else [],
+                "dedup_cluster_id": removed.get("dedup_cluster_id"),
+                "dedup_removed_reason": (
+                    removed.get("reason")
+                    if not removed.get("retained_after_repair")
+                    else None
+                ),
+                "dedup_override_reason": removed.get("override_reason"),
             }
         )
     return tuple(values)
@@ -914,6 +961,7 @@ def _build_candidate_ledger(
 def _build_event_ledger(
     adapter_result: FeatureAdapterResult,
     selection_result: SelectionResult,
+    selection_config: SelectionConfig,
 ) -> tuple[dict[str, Any], ...]:
     selected_ids = {
         item.candidate.candidate_id for item in selection_result.selected
@@ -927,6 +975,13 @@ def _build_event_ledger(
             adapter_result.selection_candidates
         )
     )
+    if selection_config.protect_video_endpoints:
+        events.extend(
+            ("endpoint_coverage", event)
+            for event in build_endpoint_protection_events(
+                adapter_result.selection_candidates
+            )
+        )
     return tuple(
         {
             "event_id": event.event_id,

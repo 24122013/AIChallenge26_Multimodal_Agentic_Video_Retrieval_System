@@ -16,6 +16,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from backend.app.services.indexing.keyframe_selection import DEFAULT_MAX_GAP_SECONDS
 from competition.experiment_tracker import (
     DEFAULT_REPORT_PATH,
     append_experiment,
@@ -87,7 +88,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=_batch_size, default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--candidate-interval-sec", type=float, default=0.5)
-    parser.add_argument("--max-gap-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--max-gap-seconds",
+        type=float,
+        default=DEFAULT_MAX_GAP_SECONDS,
+    )
     parser.add_argument("--asr-timeout-seconds", type=float, default=90.0)
     parser.add_argument("--asr-cpu-timeout-seconds", type=float, default=600.0)
     parser.add_argument("--asr-retries", type=int, default=1)

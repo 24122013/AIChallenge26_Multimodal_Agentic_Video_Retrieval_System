@@ -26,7 +26,7 @@ from backend.app.services.indexing.materialize_keyframe_candidates import (
 
 PHASE3_CANDIDATE_CONTRACT_VERSION = 2
 PHASE3_FEATURE_CONTRACT_VERSION = 2
-PHASE3_SELECTION_CONTRACT_VERSION = 1
+PHASE3_SELECTION_CONTRACT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -41,9 +41,15 @@ class CandidatePoolConfig:
     candidate_interval_sec: float = 0.5
     boundary_guard_sec: float = 0.2
     tiny_shot_max_sec: float = 0.5
+    include_video_endpoints: bool = False
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        value = asdict(self)
+        # Preserve the v2 cache key for the baseline candidate pool.  The key
+        # changes only for the endpoint-on ablation that truly adds frames.
+        if not self.include_video_endpoints:
+            value.pop("include_video_endpoints")
+        return value
 
 
 @dataclass(frozen=True)
@@ -362,6 +368,7 @@ def materialize_candidate_pool(
         candidate_interval_sec=config.candidate_interval_sec,
         boundary_guard_sec=config.boundary_guard_sec,
         tiny_shot_max_sec=config.tiny_shot_max_sec,
+        include_video_endpoints=config.include_video_endpoints,
     )
     records = read_jsonl(paths.candidate_metadata)
     records = [
