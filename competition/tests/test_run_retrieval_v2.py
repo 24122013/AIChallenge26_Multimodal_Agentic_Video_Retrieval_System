@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import json
 import tempfile
 import unittest
 import shutil
@@ -61,6 +63,33 @@ class RetrievalV2RunnerTest(unittest.TestCase):
         )
         self.assertEqual(predict[predict.index("--vlm-mode") + 1], "off")
         self.assertTrue(predict[predict.index("--retrieval-config") + 1].endswith("retrieval.yaml"))
+
+    def test_colab_launcher_is_valid_and_only_uses_supported_runner_flags(self) -> None:
+        notebook_path = (
+            Path(__file__).resolve().parents[2]
+            / "notebooks"
+            / "colab_retrieval_v2_launcher.ipynb"
+        )
+        notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+        code_cells = [
+            cell for cell in notebook["cells"] if cell["cell_type"] == "code"
+        ]
+        for cell in code_cells:
+            compile("".join(cell["source"]), f"cell:{cell['id']}", "exec")
+
+        launch = next(cell for cell in code_cells if cell["id"] == "launch-e2e")
+        tree = ast.parse("".join(launch["source"]))
+        notebook_flags = {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith("--")
+        }
+        supported_flags = set(build_parser()._option_string_actions)
+        self.assertFalse(notebook_flags - supported_flags)
+        self.assertIn("--fusion-mode", notebook_flags)
+        self.assertIn("--retrieval-modalities", notebook_flags)
 
     def test_stage_range_is_ordered(self) -> None:
         self.assertEqual(
