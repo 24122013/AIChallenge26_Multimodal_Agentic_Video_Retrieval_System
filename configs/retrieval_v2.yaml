@@ -3,41 +3,92 @@ baseline_score: 0.818
 base_run_root: competition/runs/retrieval-v2-baseline5s-dense
 labels: competition/evaluation/retrieval_labels.jsonl
 
+retrieval:
+  visual:
+    top_k: 300
+  caption:
+    top_k: 300
+  ocr:
+    top_k: 200
+  objects:
+    top_k: 200
+  asr:
+    top_k: 100
+
+rrf:
+  k: 60
+  candidate_top_n: 100
+  query_adaptive_weights: true
+
+dense_recovery:
+  enabled: true
+  frames_per_segment: 12
+  expansion_before_sec: 1.0
+  expansion_after_sec: 1.0
+
+rerank:
+  top_n: 300
+  # Submission contract requires 100 answers; leaderboard precision is still
+  # reported at 20 through nDCG@20/Hit@20.
+  final_top_k: 100
+
 gates:
   min_ndcg20_delta: 0.0
   max_recall100_drop_by_task: 0.01
   min_vlm_ndcg20_delta: 0.01
 
 experiments:
-  - id: legacy_5s
-    retrieval_mode: legacy
-    submission: competition/results/submission.csv
-
-  - id: dense_rescue
+  - id: siglip_only
     retrieval_mode: advanced
+    fusion_mode: standard_rrf
+    retrieval_modalities: visual
     flags:
       no_query_plan: true
-      no_rrf: true
+      no_dense_rescue: true
       no_cses: true
       no_deterministic_rerank: true
 
-  - id: queryplan_rrf
+  - id: current_weighted_fusion
     retrieval_mode: advanced
+    fusion_mode: legacy
     flags:
+      no_dense_rescue: true
       no_cses: true
       no_deterministic_rerank: true
 
-  - id: cses
+  - id: standard_rrf
     retrieval_mode: advanced
+    fusion_mode: standard_rrf
+    flags:
+      no_dense_rescue: true
+      no_cses: true
+      no_deterministic_rerank: true
+
+  - id: weighted_rrf
+    retrieval_mode: advanced
+    fusion_mode: weighted_rrf
+    flags:
+      no_dense_rescue: true
+      no_cses: true
+      no_deterministic_rerank: true
+
+  - id: query_adaptive_weighted_rrf
+    retrieval_mode: advanced
+    fusion_mode: adaptive_rrf
+    flags:
+      no_dense_rescue: true
+      no_cses: true
+      no_deterministic_rerank: true
+
+  - id: rrf_dense_safety_net
+    retrieval_mode: advanced
+    fusion_mode: adaptive_rrf
     flags:
       no_deterministic_rerank: true
 
-  - id: deterministic_reranker
+  - id: rrf_dense_final_reranker
     retrieval_mode: advanced
-
-  - id: optional_vlm
-    retrieval_mode: advanced
-    vlm_mode: optional
+    fusion_mode: adaptive_rrf
 
 offline_grid:
   max_gap_seconds: [2, 3, 5]

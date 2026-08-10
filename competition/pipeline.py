@@ -116,6 +116,7 @@ from backend.app.services.retrieval.advanced_search import (
     advanced_vector_search,
 )
 from backend.app.services.retrieval.advanced_rerank import AdvancedRankedFrame
+from backend.app.services.retrieval.query_modality_weights import FUSION_MODES
 from backend.app.services.retrieval.vlm_reranker import (
     DEFAULT_VLM_MODEL,
     VLM_MODES,
@@ -3907,12 +3908,27 @@ def predict_command(args: argparse.Namespace) -> None:
             raise RuntimeError("Dense and coarse encoder lineage do not match")
         advanced_config = AdvancedSearchConfig(
             coarse_top_n=args.coarse_top_n,
+            visual_top_k=args.visual_top_k,
+            caption_top_k=args.caption_top_k,
+            ocr_top_k=args.ocr_top_k,
+            objects_top_k=args.object_top_k,
+            asr_top_k=args.asr_top_k,
+            enabled_modalities=tuple(
+                value.strip()
+                for value in args.retrieval_modalities.split(",")
+                if value.strip()
+            ),
             dense_global_top_k=args.dense_global_top_k,
             dense_rescue_clips=args.dense_rescue_clips,
             max_total_clips=args.max_candidate_clips,
             dense_frames_per_clip=args.dense_frames_per_clip,
+            rerank_top_n=args.rerank_top_n,
+            final_top_k=args.final_top_k,
+            dense_expansion_before_sec=args.dense_expansion_before_sec,
+            dense_expansion_after_sec=args.dense_expansion_after_sec,
             rrf_k=args.rrf_k,
             modality_hint_boost=args.modality_hint_boost,
+            fusion_mode=("legacy" if args.no_rrf else args.fusion_mode),
             similarity_threshold=args.cses_similarity_threshold,
             temporal_window_seconds=args.cses_temporal_window_seconds,
             max_event_gap_seconds=runtime.hybrid.max_gap_seconds,
@@ -4669,12 +4685,31 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "kis", "avs", "qa", "temporal"),
         default="auto",
     )
-    predict_parser.add_argument("--coarse-top-n", type=int, default=50)
+    predict_parser.add_argument("--coarse-top-n", type=int, default=100)
+    predict_parser.add_argument("--visual-top-k", type=int, default=300)
+    predict_parser.add_argument("--caption-top-k", type=int, default=300)
+    predict_parser.add_argument("--ocr-top-k", type=int, default=200)
+    predict_parser.add_argument("--object-top-k", type=int, default=200)
+    predict_parser.add_argument("--asr-top-k", type=int, default=100)
+    predict_parser.add_argument(
+        "--retrieval-modalities",
+        default="visual,caption,ocr,objects,asr",
+        help="Comma-separated subset of visual,caption,ocr,objects,asr.",
+    )
     predict_parser.add_argument("--dense-global-top-k", type=int, default=300)
     predict_parser.add_argument("--dense-rescue-clips", type=int, default=10)
-    predict_parser.add_argument("--max-candidate-clips", type=int, default=60)
+    predict_parser.add_argument("--max-candidate-clips", type=int, default=120)
     predict_parser.add_argument("--dense-frames-per-clip", type=int, default=12)
+    predict_parser.add_argument("--rerank-top-n", type=int, default=300)
+    predict_parser.add_argument("--final-top-k", type=int, default=100)
+    predict_parser.add_argument("--dense-expansion-before-sec", type=float, default=1.0)
+    predict_parser.add_argument("--dense-expansion-after-sec", type=float, default=1.0)
     predict_parser.add_argument("--rrf-k", type=int, default=60)
+    predict_parser.add_argument(
+        "--fusion-mode",
+        choices=FUSION_MODES,
+        default="adaptive_rrf",
+    )
     predict_parser.add_argument("--modality-hint-boost", type=float, default=1.5)
     predict_parser.add_argument("--cses-similarity-threshold", type=float, default=0.92)
     predict_parser.add_argument(
@@ -4782,12 +4817,28 @@ def main() -> None:
         if args.vkis_refine_top_k < 0 or args.vkis_refine_radius_frames < 0:
             parser.error("VKIS refinement parameters must be non-negative")
         if args.retrieval_mode == "advanced":
+            modalities = {
+                value.strip() for value in args.retrieval_modalities.split(",") if value.strip()
+            }
+            supported_modalities = {"visual", "caption", "ocr", "objects", "asr"}
+            if not modalities or not modalities <= supported_modalities:
+                parser.error(
+                    "--retrieval-modalities must be a non-empty comma-separated subset of "
+                    "visual,caption,ocr,objects,asr"
+                )
             positive = {
                 "--coarse-top-n": args.coarse_top_n,
+                "--visual-top-k": args.visual_top_k,
+                "--caption-top-k": args.caption_top_k,
+                "--ocr-top-k": args.ocr_top_k,
+                "--object-top-k": args.object_top_k,
+                "--asr-top-k": args.asr_top_k,
                 "--dense-global-top-k": args.dense_global_top_k,
                 "--dense-rescue-clips": args.dense_rescue_clips,
                 "--max-candidate-clips": args.max_candidate_clips,
                 "--dense-frames-per-clip": args.dense_frames_per_clip,
+                "--rerank-top-n": args.rerank_top_n,
+                "--final-top-k": args.final_top_k,
                 "--rrf-k": args.rrf_k,
                 "--modality-hint-boost": args.modality_hint_boost,
                 "--cses-temporal-window-seconds": args.cses_temporal_window_seconds,
@@ -4799,8 +4850,12 @@ def main() -> None:
                 parser.error(f"Advanced retrieval values must be positive: {invalid}")
             if not 0.0 <= args.cses_similarity_threshold <= 1.0:
                 parser.error("--cses-similarity-threshold must be within [0, 1]")
+            if args.dense_expansion_before_sec < 0 or args.dense_expansion_after_sec < 0:
+                parser.error("Dense expansion seconds must be non-negative")
             if args.max_candidate_clips < args.coarse_top_n:
                 parser.error("--max-candidate-clips must be >= --coarse-top-n")
+            if args.final_top_k < ANSWER_COUNT:
+                parser.error("--final-top-k must be at least 100 for submission output")
         predict_command(args)
     elif args.command == "phase5-init":
         phase5_init_command(args)

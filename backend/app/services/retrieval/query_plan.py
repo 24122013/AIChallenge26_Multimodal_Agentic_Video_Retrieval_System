@@ -22,7 +22,7 @@ _BEFORE = re.compile(r"\b(?:before|trước\s+khi)\b", re.IGNORECASE)
 _AFTER = re.compile(r"\b(?:after|sau\s+khi)\b", re.IGNORECASE)
 _QUOTED = re.compile(r'''["'“”‘’]([^"'“”‘’]+)["'“”‘’]''')
 _OCR = re.compile(
-    r"\b(?:text|written|read|subtitle|sign|signboard|plate|menu|logo|qr)\b"
+    r"\b(?:text|word|written|read|subtitle|sign|signboard|plate|menu|logo|qr)\b"
     r"|\b(?:chữ|văn\s+bản|ghi\s+gì|viết\s+gì|phụ\s+đề|biển\s+hiệu|biển\s+báo|biển\s+số|thực\s+đơn|mã\s+qr)\b",
     re.IGNORECASE,
 )
@@ -34,6 +34,24 @@ _ASR = re.compile(
 _OBJECT = re.compile(
     r"\b(?:holding|hold|wearing|object|person|people|car|vehicle)\b"
     r"|\b(?:cầm|mặc|vật|đồ\s+vật|người|xe)\b",
+    re.IGNORECASE,
+)
+_ACTION = re.compile(
+    r"\b(?:jump(?:ing|ed)?|run(?:ning)?|walk(?:ing|ed)?|swim(?:ming)?|"
+    r"dance|dancing|cook(?:ing)?|drive|driving|enter(?:ing)?|leave|leaving|"
+    r"open(?:ing)?|close|closing|pick(?:ing)?\s+up|sit(?:ting)?|stand(?:ing)?)\b"
+    r"|\b(?:nhảy|chạy|đi\s+bộ|bơi|múa|nấu|lái|đi\s+vào|rời|mở|đóng|"
+    r"nhặt|ngồi|đứng)\b",
+    re.IGNORECASE,
+)
+_VISUAL = re.compile(
+    r"\b(?:color|colour|appearance|visually|image|landscape|close-up|aerial)\b"
+    r"|\b(?:màu|hình\s+ảnh|ngoại\s+hình|phong\s+cảnh|cận\s+cảnh|trên\s+cao)\b",
+    re.IGNORECASE,
+)
+_CAPTION = re.compile(
+    r"\b(?:scene|depicts?|description|situation|activity|event)\b"
+    r"|\b(?:cảnh|mô\s+tả|tình\s+huống|hoạt\s+động|sự\s+kiện)\b",
     re.IGNORECASE,
 )
 _AVS = re.compile(
@@ -131,6 +149,18 @@ def build_query_plan(query: str, profile: str = "auto") -> QueryPlan:
     if _OBJECT.search(classification):
         hints.append("objects")
         reasons.append("object cue")
+    if _ACTION.search(classification):
+        hints.extend(("action", "visual", "caption"))
+        reasons.append("action/motion cue")
+    if _VISUAL.search(classification):
+        hints.append("visual")
+        reasons.append("visual appearance cue")
+    if _CAPTION.search(classification):
+        hints.append("caption")
+        reasons.append("semantic description cue")
+    if not hints:
+        hints.extend(("visual", "caption"))
+        reasons.append("general visual-semantic query")
 
     if requested != "auto":
         resolved = requested

@@ -91,12 +91,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--offline-model-cache", action="store_true")
     parser.add_argument("--retrieval-config", type=Path, default=DEFAULT_RETRIEVAL_CONFIG)
     parser.add_argument("--search-depth", type=int, default=300)
-    parser.add_argument("--coarse-top-n", type=int, default=50)
+    parser.add_argument("--coarse-top-n", type=int, default=100)
+    parser.add_argument("--visual-top-k", type=int, default=300)
+    parser.add_argument("--caption-top-k", type=int, default=300)
+    parser.add_argument("--ocr-top-k", type=int, default=200)
+    parser.add_argument("--object-top-k", type=int, default=200)
+    parser.add_argument("--asr-top-k", type=int, default=100)
+    parser.add_argument(
+        "--retrieval-modalities",
+        default="visual,caption,ocr,objects,asr",
+    )
     parser.add_argument("--dense-global-top-k", type=int, default=300)
     parser.add_argument("--dense-rescue-clips", type=int, default=10)
-    parser.add_argument("--max-candidate-clips", type=int, default=60)
+    parser.add_argument("--max-candidate-clips", type=int, default=120)
     parser.add_argument("--dense-frames-per-clip", type=int, default=12)
+    parser.add_argument("--rerank-top-n", type=int, default=300)
+    parser.add_argument("--final-top-k", type=int, default=100)
+    parser.add_argument("--dense-expansion-before-sec", type=float, default=1.0)
+    parser.add_argument("--dense-expansion-after-sec", type=float, default=1.0)
     parser.add_argument("--rrf-k", type=int, default=60)
+    parser.add_argument(
+        "--fusion-mode",
+        choices=("legacy", "standard_rrf", "weighted_rrf", "adaptive_rrf"),
+        default="adaptive_rrf",
+    )
     parser.add_argument("--modality-hint-boost", type=float, default=1.5)
     parser.add_argument("--cses-similarity-threshold", type=float, default=0.92)
     parser.add_argument("--cses-temporal-window-seconds", type=float, default=2.0)
@@ -220,6 +238,18 @@ def build_stage_commands(
         "auto-temporal",
         "--coarse-top-n",
         str(args.coarse_top_n),
+        "--visual-top-k",
+        str(args.visual_top_k),
+        "--caption-top-k",
+        str(args.caption_top_k),
+        "--ocr-top-k",
+        str(args.ocr_top_k),
+        "--object-top-k",
+        str(args.object_top_k),
+        "--asr-top-k",
+        str(args.asr_top_k),
+        "--retrieval-modalities",
+        args.retrieval_modalities,
         "--dense-global-top-k",
         str(args.dense_global_top_k),
         "--dense-rescue-clips",
@@ -228,8 +258,18 @@ def build_stage_commands(
         str(args.max_candidate_clips),
         "--dense-frames-per-clip",
         str(args.dense_frames_per_clip),
+        "--rerank-top-n",
+        str(args.rerank_top_n),
+        "--final-top-k",
+        str(args.final_top_k),
+        "--dense-expansion-before-sec",
+        str(args.dense_expansion_before_sec),
+        "--dense-expansion-after-sec",
+        str(args.dense_expansion_after_sec),
         "--rrf-k",
         str(args.rrf_k),
+        "--fusion-mode",
+        args.fusion_mode,
         "--modality-hint-boost",
         str(args.modality_hint_boost),
         "--cses-similarity-threshold",
@@ -321,15 +361,33 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("search depth must be at least 100")
     counts = (
         args.coarse_top_n,
+        args.visual_top_k,
+        args.caption_top_k,
+        args.ocr_top_k,
+        args.object_top_k,
+        args.asr_top_k,
         args.dense_global_top_k,
         args.dense_rescue_clips,
         args.max_candidate_clips,
         args.dense_frames_per_clip,
+        args.rerank_top_n,
+        args.final_top_k,
         args.rrf_k,
         args.vlm_top_m,
     )
     if any(value < 0 for value in counts):
         raise ValueError("retrieval cardinalities must be non-negative")
+    modalities = {
+        value.strip() for value in args.retrieval_modalities.split(",") if value.strip()
+    }
+    if not modalities or not modalities <= {"visual", "caption", "ocr", "objects", "asr"}:
+        raise ValueError("retrieval modalities contain an unsupported value")
+    if args.max_candidate_clips < args.coarse_top_n:
+        raise ValueError("max candidate clips must be >= coarse top N")
+    if args.final_top_k < 100:
+        raise ValueError("final top K must be at least 100 for submission output")
+    if args.dense_expansion_before_sec < 0 or args.dense_expansion_after_sec < 0:
+        raise ValueError("dense expansion seconds must be non-negative")
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:

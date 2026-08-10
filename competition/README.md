@@ -793,15 +793,39 @@ dense index bất biến, không nhân đôi vector/JPEG:
   --run-root competition\runs\retrieval-v2-deterministic `
   --dense-run-root competition\runs\retrieval-v2-baseline5s-dense `
   --retrieval-mode advanced `
-  --coarse-top-n 50 `
-  --dense-global-top-k 300 `
+  --fusion-mode adaptive_rrf `
+  --coarse-top-n 100 `
   --dense-frames-per-clip 12 `
+  --dense-expansion-before-sec 1 `
+  --dense-expansion-after-sec 1 `
+  --rerank-top-n 300 `
   --vlm-mode off
 ```
 
-Advanced mode dùng QueryPlan, weighted RRF, dense rescue, CSES và deterministic
-multimodal rerank. Nó không padding bằng `video,frame 0`: nếu reserve không đủ 100
-answer duy nhất, lệnh dừng trước khi atomic replace submission.
+Advanced mode chạy theo thứ tự: QueryPlan và nhận diện modality; visual/caption/OCR/
+objects/ASR retrieval độc lập; aggregate frame theo segment; RRF ở segment-level;
+Dense Safety Net chỉ mở frame trong hoặc sát Top-N segment; CSES; deterministic
+multimodal rerank; cuối cùng là VLM tùy chọn. Raw score khác scale không được cộng ở
+RRF. Candidate vắng ở một modality chỉ không nhận contribution của modality đó.
+
+Các mode tương thích ngược được chọn bằng `--fusion-mode`:
+
+- `legacy`: weighted score fusion cũ (`--no-rrf` vẫn là alias tương thích);
+- `standard_rrf`: mọi branch có weight bằng nhau;
+- `weighted_rrf`: weight cố định;
+- `adaptive_rrf`: weight thay đổi theo visual, caption, OCR, speech, object và action
+  cue trong query.
+
+Top-k từng branch, `rrf.k`, Top-N segment, khoảng dense expansion và giới hạn
+candidate final rerank nằm trong `configs/retrieval_v2.yaml`. `dense-global-top-k`
+và `dense-rescue-clips` vẫn được CLI chấp nhận cho manifest/command cũ nhưng Dense
+Safety Net mới không global-search clip ngoài coarse pool.
+
+Mỗi query được ghi vào `results/query_traces.jsonl`, gồm query, modality phát hiện,
+weight cuối, top result/rank/raw score từng branch, RRF contribution, candidate
+segment sau fusion, dense frame recover, latency và breakdown final reranker. Pipeline
+không padding bằng `video,frame 0`: nếu reserve không đủ 100 answer duy nhất, lệnh
+dừng trước khi atomic replace submission.
 
 Chạy selector offline trên feature cache vào một run riêng, không ghi đè baseline
 và không load lại model:
@@ -834,6 +858,12 @@ Sau khi hoàn tất `competition/evaluation/retrieval_labels.jsonl`, chạy abla
   --split dev `
   --experiment-config configs\retrieval_v2.yaml
 ```
+
+Config mặc định chạy đủ bảy benchmark: SigLIP-only, weighted fusion cũ, standard
+RRF, weighted RRF, query-adaptive weighted RRF, RRF + Dense Safety Net, và RRF +
+Dense Safety Net + final reranker. Báo cáo gồm Recall@10/50/100, MRR, latency/query,
+số candidate rerank và dense recovery hit rate. Chỉ số dense recovery tính một hit
+khi ground-truth xuất hiện trong dense frame chưa được chọn làm offline keyframe.
 
 Gắn score thật vào đúng SHA256 rồi chỉ promote khi score lớn hơn baseline:
 

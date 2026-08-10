@@ -60,6 +60,7 @@ def evaluate_submission(
     submission_path: Path,
     labels_path: Path,
     allowed_video_ids: set[str] | None = None,
+    trace_path: Path | None = None,
 ) -> dict[str, Any]:
     answers = load_submission_answers(submission_path)
     labels = load_retrieval_labels(labels_path)
@@ -84,10 +85,14 @@ def evaluate_submission(
     missing = sorted(set(labels) - set(answers))
     if missing:
         raise ValueError(f"Submission is missing labelled queries: {missing}")
-    rows = [
-        _query_metrics(answers[query_id], labels[query_id])
-        for query_id in sorted(labels)
-    ]
+    traces = _load_query_traces(trace_path) if trace_path is not None else {}
+    rows = []
+    for query_id in sorted(labels):
+        row = _query_metrics(answers[query_id], labels[query_id])
+        trace = traces.get(query_id)
+        if trace is not None:
+            row.update(_trace_metrics(trace, labels[query_id]))
+        rows.append(row)
     return {
         "status": "passed",
         "query_count": len(rows),
@@ -134,7 +139,7 @@ def _query_metrics(
         "nDCG@20": dcg / ideal_dcg if ideal_dcg else 0.0,
         "MRR": 1.0 / first_rank if first_rank else 0.0,
     }
-    for k in (1, 5, 10, 20, 100):
+    for k in (1, 5, 10, 20, 50, 100):
         matched = {value for value in matches[:k] if value is not None}
         metrics[f"Hit@{k}"] = float(bool(matched))
         metrics[f"Recall@{k}"] = len(matched) / len(relevant)
@@ -146,6 +151,58 @@ def _query_metrics(
     if label["task"] == "VKIS":
         metrics["VKIS_Hit@100"] = metrics["Hit@100"]
     return metrics
+
+
+def _load_query_traces(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.is_file():
+        return {}
+    traces: dict[str, dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict) or not value.get("query_id"):
+                raise ValueError(f"Invalid query trace at {path}:{line_number}")
+            traces[str(value["query_id"])] = value
+    return traces
+
+
+def _trace_metrics(
+    trace: Mapping[str, Any],
+    label: Mapping[str, Any],
+) -> dict[str, float]:
+    dense = trace.get("dense_recovery") or {}
+    recovered = (
+        dense.get("recovered_frames") or [] if isinstance(dense, Mapping) else []
+    )
+    hit = any(
+        _trace_frame_matches_target(frame, target, task=str(label["task"]))
+        for frame in recovered
+        if isinstance(frame, Mapping)
+        for target in label["relevant"]
+    )
+    return {
+        "latency_ms": float(trace.get("latency_ms", 0.0)),
+        "candidates_to_rerank": float(trace.get("candidates_to_rerank", 0.0)),
+        "dense_recovery_hit_rate": float(hit),
+    }
+
+
+def _trace_frame_matches_target(
+    frame: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    task: str,
+) -> bool:
+    frame_index = frame.get("frame_index")
+    if frame_index is None:
+        return False
+    tolerance = int(target.get("tolerance", 12 if task == "VKIS" else 0))
+    return (
+        Path(str(frame.get("video_id") or "")).stem == Path(str(target["video"])).stem
+        and abs(int(frame_index) - int(target["frame"])) <= tolerance
+    )
 
 
 def _temporal_hit(

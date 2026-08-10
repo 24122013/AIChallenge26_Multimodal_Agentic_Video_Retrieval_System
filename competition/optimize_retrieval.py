@@ -170,6 +170,7 @@ def run_optimization(args: argparse.Namespace) -> dict[str, Any]:
         )
         command = _experiment_command(
             experiment,
+            defaults=config,
             python=args.python,
             public_root=args.public_root,
             output_root=args.output_root,
@@ -188,6 +189,11 @@ def run_optimization(args: argparse.Namespace) -> dict[str, Any]:
             submission_path=submission,
             labels_path=labels_path,
             allowed_video_ids=allowed_video_ids,
+            trace_path=(
+                run_root / "results" / "query_traces.jsonl"
+                if (run_root / "results" / "query_traces.jsonl").is_file()
+                else None
+            ),
         )
         reports.append(
             {
@@ -228,6 +234,7 @@ def run_optimization(args: argparse.Namespace) -> dict[str, Any]:
 def _experiment_command(
     experiment: Mapping[str, Any],
     *,
+    defaults: Mapping[str, Any] | None = None,
     python: Path,
     public_root: Path,
     output_root: Path,
@@ -258,6 +265,11 @@ def _experiment_command(
         "--vlm-mode",
         str(experiment.get("vlm_mode", "off")),
     ]
+    defaults = defaults or {}
+    retrieval_defaults = defaults.get("retrieval") or {}
+    rrf_defaults = defaults.get("rrf") or {}
+    dense_defaults = defaults.get("dense_recovery") or {}
+    rerank_defaults = defaults.get("rerank") or {}
     flag_map = {
         "no_query_plan": "--no-query-plan",
         "no_rrf": "--no-rrf",
@@ -279,6 +291,38 @@ def _experiment_command(
     }.items():
         if experiment.get(name) is not None:
             command.extend([cli_flag, str(experiment[name])])
+    nested_options = {
+        "--visual-top-k": (retrieval_defaults.get("visual") or {}).get("top_k"),
+        "--caption-top-k": (retrieval_defaults.get("caption") or {}).get("top_k"),
+        "--ocr-top-k": (retrieval_defaults.get("ocr") or {}).get("top_k"),
+        "--object-top-k": (retrieval_defaults.get("objects") or {}).get("top_k"),
+        "--asr-top-k": (retrieval_defaults.get("asr") or {}).get("top_k"),
+        "--coarse-top-n": rrf_defaults.get("candidate_top_n"),
+        "--rrf-k": rrf_defaults.get("k"),
+        "--dense-frames-per-clip": dense_defaults.get("frames_per_segment"),
+        "--dense-expansion-before-sec": dense_defaults.get("expansion_before_sec"),
+        "--dense-expansion-after-sec": dense_defaults.get("expansion_after_sec"),
+        "--rerank-top-n": rerank_defaults.get("top_n"),
+    }
+    for cli_flag, value in nested_options.items():
+        if value is not None and cli_flag not in command:
+            command.extend([cli_flag, str(value)])
+    fusion_mode = experiment.get("fusion_mode")
+    if fusion_mode is None:
+        fusion_mode = (
+            "adaptive_rrf"
+            if bool(rrf_defaults.get("query_adaptive_weights", True))
+            else "weighted_rrf"
+        )
+    command.extend(["--fusion-mode", str(fusion_mode)])
+    if dense_defaults.get("enabled") is False and "--no-dense-rescue" not in command:
+        command.append("--no-dense-rescue")
+    if rerank_defaults.get("final_top_k") is not None:
+        command.extend(["--final-top-k", str(rerank_defaults["final_top_k"])])
+    if experiment.get("retrieval_modalities") is not None:
+        command.extend(
+            ["--retrieval-modalities", str(experiment["retrieval_modalities"])]
+        )
     return command
 
 
@@ -296,7 +340,11 @@ def _promotion_summary(
     max_recall_drop = float(gates.get("max_recall100_drop_by_task", 0.01))
     minimum_delta = float(gates.get("min_ndcg20_delta", 0.0))
     deterministic = next(
-        (report for report in measured if report.get("id") == "deterministic_reranker"),
+        (
+            report
+            for report in measured
+            if report.get("id") == "rrf_dense_final_reranker"
+        ),
         None,
     )
     decisions: list[dict[str, Any]] = []

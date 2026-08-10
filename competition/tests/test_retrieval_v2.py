@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -29,8 +30,14 @@ from backend.app.services.indexing.keyframe_selection import (
 )
 from backend.app.services.retrieval.advanced_rerank import AdvancedRankedFrame
 from backend.app.services.retrieval.cses import CSESConfig, CSESSelection, select_cses
+from backend.app.services.retrieval.dense_recovery import (
+    DenseRecoveryConfig,
+    recover_dense_frames,
+)
 from backend.app.services.retrieval.query_plan import build_query_plan
+from backend.app.services.retrieval.query_modality_weights import resolve_modality_weights
 from backend.app.services.retrieval.rank_fusion import weighted_rrf
+from backend.app.services.retrieval.segment_aggregation import aggregate_segments
 from backend.app.services.retrieval.vlm_reranker import rerank_with_vlm
 from competition.dense_index import build_dense_index, validate_dense_index
 from competition.ensemble_submissions import ensemble_submissions
@@ -94,6 +101,66 @@ class RankFusionAndCSESTest(unittest.TestCase):
         )
         self.assertEqual({item.result.frame_id for item in fused}, {"f1", "f2"})
         self.assertAlmostEqual(fused[0].rrf_score, fused[1].rrf_score)
+
+    def test_frames_are_aggregated_per_segment_before_rrf(self) -> None:
+        visual = [
+            RetrievalResult("v", "f1", 1.0, 0.99, shot_id="s1"),
+            RetrievalResult("v", "f2", 1.2, 0.98, shot_id="s1"),
+            RetrievalResult("v", "f3", 3.0, 0.50, shot_id="s2"),
+        ]
+        caption = [
+            RetrievalResult("v", "f3", 3.0, 1000.0, shot_id="s2"),
+            RetrievalResult("v", "f2", 1.2, 0.001, shot_id="s1"),
+        ]
+        groups = aggregate_segments({"visual": visual, "caption": caption})
+        self.assertEqual([item.segment_id for item in groups["visual"]], ["s1", "s2"])
+        self.assertEqual(groups["visual"][0].evidence_frame_ids, ("f1", "f2"))
+        fused = weighted_rrf(
+            {"visual": visual, "caption": caption},
+            plan=build_query_plan("a generic view"),
+            weights={"visual": 1.0, "caption": 1.0},
+            hint_boost=1.0,
+        )
+        self.assertEqual(len(fused), 2)
+        self.assertAlmostEqual(fused[0].rrf_score, fused[1].rrf_score)
+
+    def test_query_adaptive_weights_detect_ocr_speech_and_action(self) -> None:
+        ocr = resolve_modality_weights(
+            build_query_plan("scene containing the word Starbucks"),
+            fusion_mode="adaptive_rrf",
+        )
+        self.assertGreater(ocr.weights["ocr"], ocr.weights["asr"])
+        speech = resolve_modality_weights(
+            build_query_plan('someone says "welcome to Vietnam"'),
+            fusion_mode="adaptive_rrf",
+        )
+        self.assertGreater(speech.weights["asr"], speech.weights["ocr"])
+        action = resolve_modality_weights(
+            build_query_plan("person jumping into swimming pool"),
+            fusion_mode="adaptive_rrf",
+        )
+        self.assertIn("action", action.detected_modalities)
+        self.assertGreater(action.weights["caption"], action.weights["ocr"])
+
+    def test_dense_recovery_never_introduces_unrelated_global_clip(self) -> None:
+        records = [
+            {"candidate_id": "a", "video_id": "v", "segment_id": "s1", "timestamp": 100.0, "shot_start": 100.0, "shot_end": 101.0, "selected_offline": True},
+            {"candidate_id": "b", "video_id": "v", "segment_id": "s1", "timestamp": 101.0, "shot_start": 100.0, "shot_end": 101.0, "selected_offline": False},
+            {"candidate_id": "c", "video_id": "v", "segment_id": "s2", "timestamp": 102.0, "shot_start": 102.0, "shot_end": 103.0, "selected_offline": False},
+            {"candidate_id": "global-best", "video_id": "v", "segment_id": "s3", "timestamp": 300.0, "shot_start": 300.0, "shot_end": 301.0, "selected_offline": False},
+        ]
+        index = SimpleNamespace(
+            records=records,
+            rows_by_clip={("v", "s1"): [0, 1], ("v", "s2"): [2], ("v", "s3"): [3]},
+        )
+        recovered = recover_dense_frames(
+            dense_index=index,
+            coarse_clip_keys=[("v", "s1")],
+            coarse_clip_scores={("v", "s1"): 1.0},
+            config=DenseRecoveryConfig(expansion_after_sec=1.0),
+        )
+        self.assertEqual(set(recovered.rows_by_clip), {("v", "s1"), ("v", "s2")})
+        self.assertNotIn("global-best", {item["candidate_id"] for item in recovered.recovered_frames})
 
     def test_cses_is_deterministic_bounded_and_preserves_events(self) -> None:
         records = [
@@ -414,6 +481,21 @@ class DenseIndexContractTest(unittest.TestCase):
 
 
 class EvaluationContractTest(unittest.TestCase):
+    def test_default_config_declares_all_required_rrf_ablations(self) -> None:
+        config = load_experiment_config(Path("configs/retrieval_v2.yaml"))
+        self.assertEqual(
+            [item["id"] for item in config["experiments"]],
+            [
+                "siglip_only",
+                "current_weighted_fusion",
+                "standard_rrf",
+                "weighted_rrf",
+                "query_adaptive_weighted_rrf",
+                "rrf_dense_safety_net",
+                "rrf_dense_final_reranker",
+            ],
+        )
+
     def test_vkis_tolerance_and_temporal_chain_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -451,9 +533,42 @@ class EvaluationContractTest(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            report = evaluate_submission(submission_path=submission, labels_path=labels)
+            traces = root / "query_traces.jsonl"
+            traces.write_text(
+                json.dumps(
+                    {
+                        "query_id": "q1",
+                        "latency_ms": 12.5,
+                        "candidates_to_rerank": 8,
+                        "dense_recovery": {
+                            "recovered_frames": [
+                                {"video_id": "v", "frame_index": 20}
+                            ]
+                        },
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "query_id": "q2",
+                        "latency_ms": 7.5,
+                        "candidates_to_rerank": 4,
+                        "dense_recovery": {"recovered_frames": []},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = evaluate_submission(
+                submission_path=submission,
+                labels_path=labels,
+                trace_path=traces,
+            )
             self.assertEqual(report["by_task"]["VKIS"]["VKIS_Hit@100"], 1.0)
             self.assertEqual(report["by_task"]["TKIS"]["temporal_Hit@20"], 1.0)
+            self.assertIn("Recall@50", report["macro"])
+            self.assertEqual(report["macro"]["dense_recovery_hit_rate"], 0.5)
+            self.assertEqual(report["macro"]["candidates_to_rerank"], 6.0)
 
     def test_experiment_yaml_rejects_duplicate_keys(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
