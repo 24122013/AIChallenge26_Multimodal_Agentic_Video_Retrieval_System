@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from typing import Generic, TypeVar
 
+T = TypeVar("T")
 
 @dataclass(frozen=True)
 class NeighborFrame:
@@ -56,7 +58,6 @@ class VisualSearchRequest:
     query: str
     top_k: int = 20
 
-
 @dataclass(frozen=True)
 class VisualSearchResponse:
     query: str
@@ -70,4 +71,17 @@ class VisualSearchResponse:
             "top_k": self.top_k,
             "latency_ms": self.latency_ms,
             "results": [result.to_dict() for result in self.results],
+        }
+
+@dataclass(frozen=True)
+class APIResponse(Generic[T]):
+    data: T
+    success: bool = True
+    message: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "success": self.success,
+            "message": self.message,
+            "data": self.data,
         }
