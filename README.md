@@ -351,6 +351,19 @@ kết quả và tool từ chối ghi đè trực tiếp bất kỳ artifact ngu�
 benchmark và các trade-off chi tiết nằm trong
 `reports/index_size_latency.md`.
 
+### Build Frontend
+
+Để chạy GUI cho ứng dụng, ta cần `Node JS` và `NPM` (phiên bản được sử dụng: `Node v22.15.0` và `npm@10.9.2`).
+
+Để khởi chạy Web App, ta đi vào thư mục `frontend/` và chạy lệnh:
+
+```powershell
+npm install # Tải về các thư viện cần thiết
+npm run dev # Khởi chạy Web App
+```
+
+Truy cập Web App frontend ở `http://localhost:5173/`.
+
 ## Retrieval Phase 2-3: text, hybrid and temporal
 
 Chỉ build text index sau khi đã sinh caption/OCR/ASR/object và build
