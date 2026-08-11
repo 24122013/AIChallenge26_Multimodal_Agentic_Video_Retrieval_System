@@ -6,16 +6,26 @@ Pipeline chính thức nên chạy theo thứ tự:
 
 1. Detect shot bằng TransNetV2.
 2. Chọn keyframe theo độ dài shot:
-   - Shot < 4 giây: lấy 1 frame ở midpoint.
-   - Shot 4-8 giây: lấy 2 frame tại khoảng 1/3 và 2/3 shot.
-   - Shot > 8 giây: lấy frame mỗi 4 giây, bắt đầu gần giây thứ 2 của shot.
-3. Tránh frame sát biên shot bằng margin nhỏ để giảm blur/chuyển cảnh.
-4. Dedup trong cùng video bằng pHash, mặc định bỏ frame có Hamming distance <= 6.
-5. Nếu có thời gian hoặc GPU, bật CLIP dedup gần nhau theo thời gian để bỏ các frame giống ngữ nghĩa.
+   - Shot `duration <= 1s`: lấy 1 frame ở midpoint.
+   - Shot `1s < duration <= 4s`: lấy 2 frame tại 1/3 và 2/3 shot.
+   - Shot `duration > 4s`: lấy 1 frame mỗi 2 giây theo centered sampling (`start+1s`, `+3s`, ...).
+3. Conservative dedup chỉ so sánh các frame cùng shot và gần nhau tối đa 2 giây.
+4. pHash mặc định chỉ bỏ frame có Hamming distance <= 6; không dedup cross-shot.
+5. Nếu bật CLIP dedup, điều kiện cùng shot và cửa sổ thời gian vẫn được giữ nguyên.
 6. Lưu timestamp từ `frame_index / fps`, kèm `shot_start`, `shot_end`, `shot_id`.
 7. Khi search, mỗi kết quả trả thêm các keyframe lân cận cùng `shot_id`.
 
-Đây là cấu hình cân bằng tốt cho bài thi retrieval: không lấy quá thưa làm mất recall, cũng không lấy quá dày làm FAISS/index phình và nhiều kết quả trùng.
+Đây là cấu hình ưu tiên recall: chấp nhận giữ nhiều keyframe hơn để giảm nguy cơ bỏ sót moment trước bước retrieval.
+
+## Tham số ablation
+
+- `--short-shot-max-sec`: ngưỡng shot ngắn, mặc định `1.0`.
+- `--regular-shot-max-sec`: ngưỡng shot thường, mặc định `4.0`.
+- `--long-shot-interval-sec`: chu kỳ centered sampling, mặc định `2.0`.
+- `--phash-threshold`: Hamming distance tối đa để coi là gần như trùng, mặc định `6`.
+- `--phash-window-sec`: cửa sổ thời gian within-shot, mặc định `2.0`.
+- `--clip-similarity-threshold`: ngưỡng CLIP tùy chọn, mặc định `0.985`.
+- `--clip-window-sec`: cửa sổ thời gian CLIP within-shot, mặc định `2.0`.
 
 ## Lệnh chạy một video
 
@@ -53,7 +63,7 @@ Output mặc định:
   --video-dir data\raw\video `
   --enable-clip-dedup `
   --clip-similarity-threshold 0.985 `
-  --clip-window-sec 12
+  --clip-window-sec 2
 ```
 
 Chỉ nên bật sau khi đã có bản pHash chạy ổn, vì CLIP dedup tốn thời gian hơn. Nếu dataset nhiều cảnh tĩnh hoặc camera ít đổi, CLIP dedup giúp giảm nhiễu kết quả.
@@ -66,6 +76,6 @@ Mỗi dòng JSONL có các field cần cho retrieval và UI:
 - `timestamp`, `timestamp_source`, `timestamp_confidence`
 - `frame_index`, `shot_start`, `shot_end`, `shot_index`
 - `keyframe_path`, `frame_path`, `thumbnail_path`
-- `selection_reason`, `phash`, `shot_detector`
+- `keyframe_strategy`, `selection_reason`, `phash`, `shot_detector`
 
 Sau khi build FAISS/frame_map từ metadata này, search response sẽ có thêm `neighbors`: các frame cùng shot để UI hiển thị ngữ cảnh trước/sau kết quả chính.

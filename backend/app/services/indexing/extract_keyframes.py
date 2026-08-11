@@ -10,6 +10,15 @@ import cv2
 import numpy as np
 
 
+KEYFRAME_STRATEGY = "adaptive_shot_sampling_v3"
+DEFAULT_SHORT_SHOT_MAX_SEC = 1.0
+DEFAULT_REGULAR_SHOT_MAX_SEC = 4.0
+DEFAULT_LONG_SHOT_INTERVAL_SEC = 2.0
+DEFAULT_PHASH_THRESHOLD = 6
+DEFAULT_DEDUP_TEMPORAL_WINDOW_SEC = 2.0
+DEFAULT_CLIP_SIMILARITY_THRESHOLD = 0.985
+
+
 @dataclass(frozen=True)
 class VideoInfo:
     video_id: str
@@ -50,8 +59,38 @@ class KeyframeCandidate:
     selection_reason: str
 
 
+class PerceptualHashDeduper:
+    """Conservative pHash dedup restricted to nearby frames in one shot."""
+
+    def __init__(self, hamming_threshold: int, temporal_window_sec: float) -> None:
+        self.hamming_threshold = hamming_threshold
+        self.temporal_window_sec = temporal_window_sec
+        self._kept_by_shot: dict[int, list[tuple[int, str, float]]] = {}
+
+    def find_duplicate(
+        self,
+        phash: int,
+        shot_index: int,
+        timestamp: float,
+    ) -> tuple[str, int] | None:
+        for kept_hash, kept_frame_id, kept_timestamp in self._kept_by_shot.get(
+            shot_index, []
+        ):
+            if abs(timestamp - kept_timestamp) > self.temporal_window_sec:
+                continue
+            distance = hamming_distance(phash, kept_hash)
+            if distance <= self.hamming_threshold:
+                return kept_frame_id, distance
+        return None
+
+    def add(self, phash: int, frame_id: str, shot_index: int, timestamp: float) -> None:
+        self._kept_by_shot.setdefault(shot_index, []).append(
+            (phash, frame_id, timestamp)
+        )
+
+
 class ClipDeduper:
-    """Optional near-duplicate filter using OpenCLIP image embeddings."""
+    """Optional conservative OpenCLIP dedup within a shot and time window."""
 
     def __init__(
         self,
@@ -85,7 +124,7 @@ class ClipDeduper:
         self._device = device
         self.similarity_threshold = similarity_threshold
         self.temporal_window_sec = temporal_window_sec
-        self._kept: list[tuple[np.ndarray, str, float]] = []
+        self._kept_by_shot: dict[int, list[tuple[np.ndarray, str, float]]] = {}
 
     def encode(self, frame_bgr: np.ndarray) -> np.ndarray:
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -100,10 +139,13 @@ class ClipDeduper:
         self,
         embedding: np.ndarray,
         timestamp: float,
+        shot_index: int = 0,
     ) -> tuple[str, float] | None:
         best_frame_id = ""
         best_similarity = -1.0
-        for kept_embedding, kept_frame_id, kept_timestamp in self._kept:
+        for kept_embedding, kept_frame_id, kept_timestamp in self._kept_by_shot.get(
+            shot_index, []
+        ):
             if abs(timestamp - kept_timestamp) > self.temporal_window_sec:
                 continue
             similarity = float(np.dot(embedding, kept_embedding))
@@ -114,8 +156,16 @@ class ClipDeduper:
             return best_frame_id, best_similarity
         return None
 
-    def add(self, embedding: np.ndarray, frame_id: str, timestamp: float) -> None:
-        self._kept.append((embedding, frame_id, timestamp))
+    def add(
+        self,
+        embedding: np.ndarray,
+        frame_id: str,
+        timestamp: float,
+        shot_index: int = 0,
+    ) -> None:
+        self._kept_by_shot.setdefault(shot_index, []).append(
+            (embedding, frame_id, timestamp)
+        )
 
 
 def read_video_info(video_path: Path) -> VideoInfo:
@@ -194,43 +244,106 @@ def scenes_to_shots(scenes: object, info: VideoInfo) -> list[Shot]:
     return shots
 
 
-def select_frame_indices(shot: Shot, min_boundary_margin_sec: float = 0.2) -> list[tuple[int, str]]:
+def select_frame_indices(
+    shot: Shot,
+    short_shot_max_sec: float = DEFAULT_SHORT_SHOT_MAX_SEC,
+    regular_shot_max_sec: float = DEFAULT_REGULAR_SHOT_MAX_SEC,
+    long_shot_interval_sec: float = DEFAULT_LONG_SHOT_INTERVAL_SEC,
+) -> list[tuple[int, str]]:
+    """Select in-shot frames with the high-recall adaptive strategy.
+
+    Shot frame bounds are inclusive. Fractional locations are computed from
+    the exact shot duration in frames, while long-shot offsets are measured
+    from the shot start timestamp.
+    Every computed index is clamped to the shot as a final safety invariant.
+    """
+    validate_sampling_parameters(
+        short_shot_max_sec=short_shot_max_sec,
+        regular_shot_max_sec=regular_shot_max_sec,
+        long_shot_interval_sec=long_shot_interval_sec,
+    )
     duration = shot.duration
-    if duration < 4.0:
-        offsets = [(duration / 2.0, "midpoint_lt_4s")]
-    elif duration <= 8.0:
-        offsets = [
-            (duration / 3.0, "two_frames_4_to_8s"),
-            (2.0 * duration / 3.0, "two_frames_4_to_8s"),
+    if duration <= short_shot_max_sec:
+        positions = [(0.5, "short_shot_midpoint")]
+        selected = [
+            (
+                shot.start_frame
+                + int(round((shot.end_frame - shot.start_frame + 1) * fraction)),
+                reason,
+            )
+            for fraction, reason in positions
+        ]
+    elif duration <= regular_shot_max_sec:
+        selected = [
+            (
+                shot.start_frame
+                + int(round((shot.end_frame - shot.start_frame + 1) * fraction)),
+                "regular_shot_one_third_two_thirds",
+            )
+            for fraction in (1.0 / 3.0, 2.0 / 3.0)
         ]
     else:
-        first = min(2.0, duration / 2.0)
-        offsets = []
-        current = first
-        while current < duration:
-            offsets.append((current, "every_4s_gt_8s"))
-            current += 4.0
-        if not offsets:
-            offsets = [(duration / 2.0, "midpoint_gt_8s")]
+        selected = []
+        offset_sec = long_shot_interval_sec / 2.0
+        while offset_sec < duration:
+            selected.append(
+                (
+                    shot.start_frame + int(round(offset_sec * shot.fps)),
+                    "long_shot_centered_interval",
+                )
+            )
+            offset_sec += long_shot_interval_sec
+        if not selected:
+            selected = [
+                (
+                    shot.start_frame
+                    + int(round((shot.end_frame - shot.start_frame + 1) * 0.5)),
+                    "long_shot_centered_interval",
+                )
+            ]
 
-    margin_frames = max(0, int(round(min_boundary_margin_sec * shot.fps)))
-    lo = min(shot.end_frame, shot.start_frame + margin_frames)
-    hi = max(lo, shot.end_frame - margin_frames)
-    selected: list[tuple[int, str]] = []
+    bounded: list[tuple[int, str]] = []
     seen: set[int] = set()
-    for offset, reason in offsets:
-        frame_index = int(round((shot.start_sec + offset) * shot.fps))
-        frame_index = max(lo, min(frame_index, hi))
+    for frame_index, reason in selected:
+        frame_index = max(shot.start_frame, min(frame_index, shot.end_frame))
         if frame_index not in seen:
-            selected.append((frame_index, reason))
+            bounded.append((frame_index, reason))
             seen.add(frame_index)
-    return selected
+    return bounded
 
 
-def build_keyframe_candidates(shots: list[Shot], fps: float) -> list[KeyframeCandidate]:
+def validate_sampling_parameters(
+    short_shot_max_sec: float,
+    regular_shot_max_sec: float,
+    long_shot_interval_sec: float,
+) -> None:
+    if short_shot_max_sec <= 0:
+        raise ValueError("short_shot_max_sec must be > 0")
+    if regular_shot_max_sec < short_shot_max_sec:
+        raise ValueError("regular_shot_max_sec must be >= short_shot_max_sec")
+    if long_shot_interval_sec <= 0:
+        raise ValueError("long_shot_interval_sec must be > 0")
+
+
+def build_keyframe_candidates(
+    shots: list[Shot],
+    fps: float,
+    short_shot_max_sec: float = DEFAULT_SHORT_SHOT_MAX_SEC,
+    regular_shot_max_sec: float = DEFAULT_REGULAR_SHOT_MAX_SEC,
+    long_shot_interval_sec: float = DEFAULT_LONG_SHOT_INTERVAL_SEC,
+) -> list[KeyframeCandidate]:
     candidates: list[KeyframeCandidate] = []
+    seen_frame_indices: set[int] = set()
     for shot in shots:
-        for frame_index, reason in select_frame_indices(shot):
+        selected = select_frame_indices(
+            shot,
+            short_shot_max_sec=short_shot_max_sec,
+            regular_shot_max_sec=regular_shot_max_sec,
+            long_shot_interval_sec=long_shot_interval_sec,
+        )
+        for frame_index, reason in selected:
+            if frame_index in seen_frame_indices:
+                continue
             candidates.append(
                 KeyframeCandidate(
                     candidate_index=len(candidates) + 1,
@@ -240,6 +353,7 @@ def build_keyframe_candidates(shots: list[Shot], fps: float) -> list[KeyframeCan
                     selection_reason=reason,
                 )
             )
+            seen_frame_indices.add(frame_index)
     return candidates
 
 
@@ -347,18 +461,33 @@ def extract_keyframes_for_video(
     output_dir: Path,
     metadata_path: Path,
     report_path: Path,
-    phash_threshold: int = 6,
-    phash_window_sec: float = 12.0,
+    phash_threshold: int = DEFAULT_PHASH_THRESHOLD,
+    phash_window_sec: float = DEFAULT_DEDUP_TEMPORAL_WINDOW_SEC,
     jpeg_quality: int = 95,
     shot_threshold: float = 0.5,
     shot_device: str = "auto",
     enable_clip_dedup: bool = False,
-    clip_similarity_threshold: float = 0.985,
-    clip_window_sec: float = 12.0,
+    clip_similarity_threshold: float = DEFAULT_CLIP_SIMILARITY_THRESHOLD,
+    clip_window_sec: float = DEFAULT_DEDUP_TEMPORAL_WINDOW_SEC,
     clip_model_name: str = "ViT-B-16",
     clip_pretrained: str = "laion2b_s34b_b88k",
     clip_device: str = "auto",
+    short_shot_max_sec: float = DEFAULT_SHORT_SHOT_MAX_SEC,
+    regular_shot_max_sec: float = DEFAULT_REGULAR_SHOT_MAX_SEC,
+    long_shot_interval_sec: float = DEFAULT_LONG_SHOT_INTERVAL_SEC,
 ) -> dict:
+    validate_sampling_parameters(
+        short_shot_max_sec=short_shot_max_sec,
+        regular_shot_max_sec=regular_shot_max_sec,
+        long_shot_interval_sec=long_shot_interval_sec,
+    )
+    if not 0 <= phash_threshold <= 64:
+        raise ValueError("phash_threshold must be between 0 and 64")
+    if phash_window_sec < 0:
+        raise ValueError("phash_window_sec must be >= 0")
+    if clip_window_sec < 0:
+        raise ValueError("clip_window_sec must be >= 0")
+
     info = read_video_info(video_path)
     try:
         shots, detector_name = detect_shots_transnetv2(
@@ -375,8 +504,17 @@ def extract_keyframes_for_video(
 
     video_output_dir = output_dir / info.video_id
     video_output_dir.mkdir(parents=True, exist_ok=True)
-    candidates = build_keyframe_candidates(shots, info.fps)
-    kept_phashes: list[tuple[int, str, float]] = []
+    candidates = build_keyframe_candidates(
+        shots,
+        info.fps,
+        short_shot_max_sec=short_shot_max_sec,
+        regular_shot_max_sec=regular_shot_max_sec,
+        long_shot_interval_sec=long_shot_interval_sec,
+    )
+    phash_deduper = PerceptualHashDeduper(
+        hamming_threshold=phash_threshold,
+        temporal_window_sec=phash_window_sec,
+    )
     records: list[dict] = []
     skipped: list[dict] = []
     clip_deduper = (
@@ -425,14 +563,10 @@ def extract_keyframes_for_video(
             continue
 
         phash = perceptual_hash(frame)
-        duplicate = next(
-            (
-                (existing_hash, existing_frame_id)
-                for existing_hash, existing_frame_id, existing_timestamp in kept_phashes
-                if abs(timestamp - existing_timestamp) <= phash_window_sec
-                if hamming_distance(phash, existing_hash) <= phash_threshold
-            ),
-            None,
+        duplicate = phash_deduper.find_duplicate(
+            phash=phash,
+            shot_index=shot.shot_index,
+            timestamp=timestamp,
         )
         if duplicate is not None:
             remove_file_if_exists(output_path)
@@ -444,8 +578,8 @@ def extract_keyframes_for_video(
                     "frame_index": frame_index,
                     "timestamp": round(timestamp, 3),
                     "reason": "phash_duplicate",
-                    "duplicate_of": duplicate[1],
-                    "hamming_distance": hamming_distance(phash, duplicate[0]),
+                    "duplicate_of": duplicate[0],
+                    "hamming_distance": duplicate[1],
                 }
             )
             continue
@@ -453,7 +587,11 @@ def extract_keyframes_for_video(
         clip_embedding = None
         if clip_deduper is not None:
             clip_embedding = clip_deduper.encode(frame)
-            clip_duplicate = clip_deduper.find_duplicate(clip_embedding, timestamp)
+            clip_duplicate = clip_deduper.find_duplicate(
+                clip_embedding,
+                shot_index=shot.shot_index,
+                timestamp=timestamp,
+            )
             if clip_duplicate is not None:
                 duplicate_frame_id, similarity = clip_duplicate
                 remove_file_if_exists(output_path)
@@ -471,9 +609,14 @@ def extract_keyframes_for_video(
                 )
                 continue
 
-        kept_phashes.append((phash, frame_id, timestamp))
+        phash_deduper.add(phash, frame_id, shot.shot_index, timestamp)
         if clip_deduper is not None and clip_embedding is not None:
-            clip_deduper.add(clip_embedding, frame_id, timestamp)
+            clip_deduper.add(
+                clip_embedding,
+                frame_id,
+                shot_index=shot.shot_index,
+                timestamp=timestamp,
+            )
         normalized_path = output_path.as_posix()
         records.append(
             {
@@ -495,6 +638,7 @@ def extract_keyframes_for_video(
                 "thumbnail_path": normalized_path,
                 "source_video_path": video_path.as_posix(),
                 "video_path": video_path.as_posix(),
+                "keyframe_strategy": KEYFRAME_STRATEGY,
                 "selection_reason": reason,
                 "phash": f"{phash:016x}",
                 "shot_detector": detector_name,
@@ -511,10 +655,16 @@ def extract_keyframes_for_video(
         "shot_threshold": shot_threshold,
         "shot_device": shot_device,
         "shot_count": len(shots),
+        "candidate_count": len(candidates),
         "keyframe_count": len(records),
         "skipped_count": len(skipped),
+        "keyframe_strategy": KEYFRAME_STRATEGY,
+        "short_shot_max_sec": short_shot_max_sec,
+        "regular_shot_max_sec": regular_shot_max_sec,
+        "long_shot_interval_sec": long_shot_interval_sec,
         "phash_threshold": phash_threshold,
         "phash_window_sec": phash_window_sec,
+        "dedup_scope": "within_shot",
         "frame_extractor": "ffmpeg",
         "clip_dedup_enabled": enable_clip_dedup,
         "clip_similarity_threshold": clip_similarity_threshold if enable_clip_dedup else None,
@@ -539,8 +689,16 @@ def extract_keyframes_for_video(
                 "start_sec": round(shot.start_sec, 3),
                 "end_sec": round(shot.end_sec, 3),
                 "duration": round(shot.duration, 3),
+                "candidate_frame_count": sum(
+                    1
+                    for candidate in candidates
+                    if candidate.shot.shot_index == shot.shot_index
+                ),
                 "selected_frame_count": sum(
                     1 for record in records if record["shot_index"] == shot.shot_index
+                ),
+                "skipped_frame_count": sum(
+                    1 for item in skipped if item["shot_index"] == shot.shot_index
                 ),
             }
             for shot in shots
@@ -553,7 +711,10 @@ def extract_keyframes_for_video(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract TransNetV2 shot-aware keyframes with pHash dedup."
+        description=(
+            "Extract TransNetV2 shot-aware keyframes with adaptive sampling "
+            "and conservative within-shot dedup."
+        )
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--video-path", type=Path)
@@ -562,14 +723,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("data/keyframes"))
     parser.add_argument("--metadata-path", type=Path, default=None)
     parser.add_argument("--report-path", type=Path, default=None)
-    parser.add_argument("--phash-threshold", type=int, default=6)
-    parser.add_argument("--phash-window-sec", type=float, default=12.0)
+    parser.add_argument("--phash-threshold", type=int, default=DEFAULT_PHASH_THRESHOLD)
+    parser.add_argument(
+        "--phash-window-sec",
+        type=float,
+        default=DEFAULT_DEDUP_TEMPORAL_WINDOW_SEC,
+    )
     parser.add_argument("--jpeg-quality", type=int, default=95)
     parser.add_argument("--shot-threshold", type=float, default=0.5)
     parser.add_argument("--shot-device", default="auto")
+    parser.add_argument(
+        "--short-shot-max-sec", type=float, default=DEFAULT_SHORT_SHOT_MAX_SEC
+    )
+    parser.add_argument(
+        "--regular-shot-max-sec", type=float, default=DEFAULT_REGULAR_SHOT_MAX_SEC
+    )
+    parser.add_argument(
+        "--long-shot-interval-sec", type=float, default=DEFAULT_LONG_SHOT_INTERVAL_SEC
+    )
     parser.add_argument("--enable-clip-dedup", action="store_true")
-    parser.add_argument("--clip-similarity-threshold", type=float, default=0.985)
-    parser.add_argument("--clip-window-sec", type=float, default=12.0)
+    parser.add_argument(
+        "--clip-similarity-threshold",
+        type=float,
+        default=DEFAULT_CLIP_SIMILARITY_THRESHOLD,
+    )
+    parser.add_argument(
+        "--clip-window-sec",
+        type=float,
+        default=DEFAULT_DEDUP_TEMPORAL_WINDOW_SEC,
+    )
     parser.add_argument("--clip-model-name", default="ViT-B-16")
     parser.add_argument("--clip-pretrained", default="laion2b_s34b_b88k")
     parser.add_argument("--clip-device", default="auto")
@@ -607,6 +789,9 @@ def main() -> None:
             jpeg_quality=args.jpeg_quality,
             shot_threshold=args.shot_threshold,
             shot_device=args.shot_device,
+            short_shot_max_sec=args.short_shot_max_sec,
+            regular_shot_max_sec=args.regular_shot_max_sec,
+            long_shot_interval_sec=args.long_shot_interval_sec,
             enable_clip_dedup=args.enable_clip_dedup,
             clip_similarity_threshold=args.clip_similarity_threshold,
             clip_window_sec=args.clip_window_sec,

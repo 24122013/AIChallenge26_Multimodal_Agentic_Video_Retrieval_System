@@ -4,6 +4,11 @@
 __pycache__/
 *.py[cod]
 .env
+
+# Local/public competition datasets and generated submissions.
+data/public/
+data/competition/
+
 data/raw/video/
 data/raw/*.zip
 data/**/*.jpg
@@ -18,3 +23,15 @@ data/keyframes/*
 data/keyframes_*/
 data/metadata/*
 !data/metadata/.gitkeep
+
+# Generated artifacts from the public competition adapter.
+competition/keyframes/*
+!competition/keyframes/.gitkeep
+competition/metadata/*
+!competition/metadata/.gitkeep
+competition/embeddings/*
+!competition/embeddings/.gitkeep
+competition/indexes/*
+!competition/indexes/.gitkeep
+competition/results/*
+!competition/results/.gitkeep

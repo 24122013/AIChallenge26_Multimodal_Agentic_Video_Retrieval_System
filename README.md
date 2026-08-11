@@ -60,7 +60,7 @@ Folder dữ liệu lớn đã nằm trong `.gitignore`, không commit video/keyf
 Chạy toàn bộ video:
 
 ```powershell
-.\.venv\Scripts\python.exe -B backend\app\services\indexing\extract_keyframes.py --video-dir data\raw\video --video-glob *.mp4 --output-dir data\keyframes --shot-device auto --shot-threshold 0.5 --phash-window-sec 12
+.\.venv\Scripts\python.exe -B backend\app\services\indexing\extract_keyframes.py --video-dir data\raw\video --video-glob *.mp4 --output-dir data\keyframes --shot-device auto --shot-threshold 0.5
 ```
 
 Output cho mỗi video:
@@ -73,17 +73,17 @@ data/metadata/keyframes_<video_id>_extract_report.json
 
 Rule keyframe:
 
-- Shot < 4s: lấy midpoint.
-- Shot 4-8s: lấy 2 frame tại 1/3 và 2/3 shot.
-- Shot > 8s: lấy mỗi 4s một frame.
+- Shot `duration <= 1s`: lấy midpoint.
+- Shot `1s < duration <= 4s`: lấy 2 frame tại 1/3 và 2/3 shot.
+- Shot `duration > 4s`: lấy một frame mỗi 2s theo centered sampling (`start+1s`, `+3s`, ...).
 - Extract frame bằng FFmpeg theo timestamp đã chọn.
-- Dedup trong cùng video bằng pHash trong cửa sổ thời gian gần, mặc định 12s.
-- Metadata lưu `timestamp`, `frame_index`, `shot_start`, `shot_end`, `shot_id`, `source_video_path`.
+- Conservative dedup chỉ so sánh frame cùng shot và cách nhau tối đa 2s; pHash mặc định dùng Hamming distance <= 6.
+- Metadata lưu `timestamp`, `frame_index`, `shot_start`, `shot_end`, `shot_id`, `source_video_path`, `keyframe_strategy`.
 
 Nếu muốn bật CLIP dedup gần nhau:
 
 ```powershell
-.\.venv\Scripts\python.exe -B backend\app\services\indexing\extract_keyframes.py --video-dir data\raw\video --enable-clip-dedup --phash-window-sec 12 --clip-similarity-threshold 0.985 --clip-window-sec 12
+.\.venv\Scripts\python.exe -B backend\app\services\indexing\extract_keyframes.py --video-dir data\raw\video --enable-clip-dedup --clip-similarity-threshold 0.985
 ```
 
 ## Bước 2: Encode keyframes bằng SigLIP2
@@ -531,3 +531,12 @@ QA evidence:
   backend.tests.test_retrieval_phase2 `
   backend.tests.test_retrieval_phase3
 ```
+
+## Public TKIS/VKIS competition
+
+Pipeline dành riêng cho `data/public/` (250 video, TKIS, VKIS và xuất submission
+100 đáp án/query) nằm tại [competition/README.md](competition/README.md). Adapter
+này tái sử dụng toàn bộ pipeline đã triển khai: SigLIP2/FAISS, caption, OCR,
+objects, ASR, segment/text index và hybrid reranking. Toàn bộ artifact sinh mới
+được ghi trong `competition/`; pipeline dữ liệu mặc định ở `data/` không bị thay
+đổi.

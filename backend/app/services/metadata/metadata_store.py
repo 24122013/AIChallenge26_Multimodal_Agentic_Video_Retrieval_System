@@ -48,6 +48,8 @@ class FrameRecord:
     model_name: str = ""
     model_revision: str = ""
     vector_dim: int | None = None
+    keyframe_strategy: str = ""
+    selection_reason: str = ""
 
     # Timestamp provenance — bổ sung v1.1
     timestamp_source: str = "unknown"
@@ -85,6 +87,8 @@ class FrameRecord:
             model_name=data.get("model_name") or "",
             model_revision=data.get("model_revision") or "",
             vector_dim=_optional_int(data.get("vector_dim")),
+            keyframe_strategy=data.get("keyframe_strategy") or "",
+            selection_reason=data.get("selection_reason") or "",
             timestamp_source=data.get("timestamp_source") or _infer_timestamp_source(data),
             timestamp_confidence=float(
                 data.get("timestamp_confidence") if data.get("timestamp_confidence") is not None
@@ -121,6 +125,8 @@ class FrameRecord:
             "model_name": self.model_name,
             "model_revision": self.model_revision,
             "vector_dim": self.vector_dim,
+            "keyframe_strategy": self.keyframe_strategy,
+            "selection_reason": self.selection_reason,
             "caption": self.caption,
             "ocr_text": self.ocr_text,
             "asr_text": self.asr_text,
