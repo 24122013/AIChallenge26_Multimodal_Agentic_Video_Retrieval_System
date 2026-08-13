@@ -12,12 +12,42 @@ lý âm thanh.
 | Caption | `Qwen/Qwen3.5-9B` @ `c202236` | `captions.jsonl` |
 | OCR | `PP-OCRv5_server_det` + `latin_PP-OCRv5_mobile_rec` | `ocr.jsonl` |
 | Objects | `yoloe-26l-seg.pt` | `objects.jsonl` |
+| Dense text | `BAAI/bge-m3` | `bge_m3_flat_ip.faiss` + map + manifest |
+| Text rerank | `BAAI/bge-reranker-v2-m3` | query trace/report |
 
 Caption, OCR và object evidence được join theo `candidate_id`/`frame_id`. Object
 evidence không phải điều kiện loại candidate. Feature manifest fingerprint đầy
 đủ model, revision và tham số để resume fail closed khi cấu hình thay đổi.
 
 ## Chạy end-to-end
+
+Runner v2 dưới đây giữ output submission cũ nhưng thêm stage BGE text index và
+BGE rerank. Dùng `required` khi mục tiêu là kiểm tra model mới thật sự chạy:
+
+```powershell
+.\.venv\Scripts\python.exe -m competition.run_retrieval_v2 `
+  --public-root data\public `
+  --run-root competition\artifacts\new-model-run `
+  --device cuda `
+  --bge-dense-mode required `
+  --bge-reranker-mode required `
+  --bge-m3-model-revision main `
+  --bge-reranker-model-revision main
+```
+
+Runner có 10 stage:
+
+```text
+validate-input -> keyframes -> index -> neighbors -> segments -> text-index
+-> bge-text-index -> dense-index -> predict -> validate-submission
+```
+
+`bge-text-index` chỉ đọc metadata đã có, không extract video lại. BGE-M3 và
+reranker chỉ áp dụng cho TKIS trong submission; VKIS vẫn đi qua visual query.
+Kết quả vẫn là 100 query x 100 answer. Với benchmark chính thức, thay revision
+`main` bằng commit hash đã khóa.
+
+Runner cũ vẫn khả dụng nếu chỉ cần pipeline metadata/offline:
 
 ```powershell
 .\.venv\Scripts\python.exe -m competition.run_end_to_end `
@@ -104,6 +134,22 @@ Ví dụ chỉ tạo lại metadata hiện hành:
 Text index v3 chỉ gồm `caption`, `ocr`, `objects`. Hybrid retrieval kết hợp các
 modality này với visual SigLIP2; temporal retrieval vẫn giữ cùng kiến trúc
 same-video ordered matching.
+
+Query parser/router/evidence và grounded QA là online task path riêng. Có thể
+kiểm tra từng task bằng:
+
+```powershell
+python -m backend.app.services.retrieval.run_task_smoke --task kis
+python -m backend.app.services.retrieval.run_task_smoke --task avs
+$env:QA_ANSWER_MODE = "required"
+python -m backend.app.services.retrieval.run_task_smoke --task qa
+```
+
+Các lệnh này cần `RETRIEVAL_*` và `QA_BGE_*` trỏ tới artifacts của run; xem
+biến môi trường đầy đủ ở README gốc. KIS/AVS không gọi Qwen answerer. QA dùng
+Top-3 evidence và trả `answered` hoặc `insufficient_evidence`. Không có ASR,
+query expansion chỉ được nhận qua input ngoài, temporal chỉ được parser đánh
+dấu handoff.
 
 Object labels là prompt-dependent evidence. Khi đổi vocabulary phải rebuild
 object artifacts, segment metadata và text index để lineage nhất quán.

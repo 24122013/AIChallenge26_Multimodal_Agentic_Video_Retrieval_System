@@ -65,6 +65,7 @@ def advanced_text_search(
     hybrid_engine: object,
     text_encoder: object,
     dense_index: DenseCandidateIndex,
+    dense_text_engine: object | None = None,
     profile: str = "auto",
     config: AdvancedSearchConfig | None = None,
 ) -> AdvancedSearchResponse:
@@ -94,6 +95,12 @@ def advanced_text_search(
     for modality, engine in sorted(text_engines.items()):
         groups[modality] = engine.search_results(
             plan.query_for(modality),
+            top_k=max(config.coarse_top_n * 2, 100),
+        )
+    if dense_text_engine is not None:
+        search = getattr(dense_text_engine, "search")
+        groups["dense_text"] = search(
+            plan.retrieval_query,
             top_k=max(config.coarse_top_n * 2, 100),
         )
     if config.rrf_enabled:

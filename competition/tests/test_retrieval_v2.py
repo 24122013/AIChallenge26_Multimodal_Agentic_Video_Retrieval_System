@@ -91,6 +91,29 @@ class RankFusionAndCSESTest(unittest.TestCase):
         self.assertEqual({item.result.frame_id for item in fused}, {"f1", "f2"})
         self.assertAlmostEqual(fused[0].rrf_score, fused[1].rrf_score)
 
+    def test_rrf_accepts_bge_dense_text_as_an_additional_modality(self) -> None:
+        visual = RetrievalResult("v", "visual", 1.0, 0.9, shot_id="s1")
+        semantic = RetrievalResult(
+            "v",
+            "semantic",
+            2.0,
+            0.8,
+            shot_id="s2",
+            modality_scores={"dense_text": 0.8},
+        )
+
+        fused = weighted_rrf(
+            {"visual": [visual], "dense_text": [semantic]},
+            plan=build_query_plan("người đang cầm điện thoại"),
+        )
+
+        by_frame = {item.result.frame_id: item for item in fused}
+        self.assertIn("dense_text", by_frame["semantic"].modality_ranks)
+        self.assertGreater(
+            by_frame["semantic"].modality_contributions["dense_text"],
+            0.0,
+        )
+
     def test_cses_is_deterministic_bounded_and_preserves_events(self) -> None:
         records = [
             {"candidate_id": "a", "timestamp": 0.0, "protected_event_ids": ["e1"]},

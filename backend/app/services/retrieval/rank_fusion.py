@@ -14,6 +14,7 @@ DEFAULT_RRF_WEIGHTS: dict[str, float] = {
     "caption": 0.20,
     "ocr": 0.10,
     "objects": 0.10,
+    "dense_text": 0.20,
 }
 
 

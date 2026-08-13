@@ -119,6 +119,11 @@ from backend.app.services.retrieval.advanced_search import (
     advanced_vector_search,
 )
 from backend.app.services.retrieval.advanced_rerank import AdvancedRankedFrame
+from backend.app.services.retrieval.bge_dense import BgeM3DenseSearchEngine
+from backend.app.services.retrieval.bge_reranker import (
+    LazyBgeReranker,
+    rerank_with_bge,
+)
 from backend.app.services.retrieval.vlm_reranker import (
     DEFAULT_VLM_MODEL,
     VLM_MODES,
@@ -3509,7 +3514,104 @@ def promote_run_command(args: argparse.Namespace) -> None:
     print(json.dumps(active, ensure_ascii=False, indent=2))
 
 
+def _advanced_as_retrieval_result(item: AdvancedRankedFrame) -> RetrievalResult:
+    """Project one advanced candidate onto the shared BGE reranker contract."""
+
+    record = item.record
+    raw_objects = record.get("objects") or []
+    objects = (
+        [str(value) for value in raw_objects if str(value).strip()]
+        if isinstance(raw_objects, (list, tuple))
+        else []
+    )
+    return RetrievalResult(
+        video_id=str(record.get("video_id") or ""),
+        frame_id=str(
+            record.get("frame_id")
+            or record.get("candidate_id")
+            or f"DENSE_ROW_{item.dense_row:08d}"
+        ),
+        timestamp=float(record.get("timestamp") or 0.0),
+        score=float(item.score),
+        segment_id=str(record.get("segment_id") or ""),
+        shot_id=str(record.get("shot_id") or record.get("segment_id") or ""),
+        frame_index=(
+            int(record["frame_index"])
+            if record.get("frame_index") is not None
+            else None
+        ),
+        keyframe_path=str(
+            record.get("keyframe_path") or record.get("candidate_image") or ""
+        ),
+        thumbnail_path=str(record.get("thumbnail_path") or ""),
+        caption=str(record.get("caption") or ""),
+        ocr_text=str(record.get("ocr_text") or ""),
+        objects=objects,
+        modality_scores={"advanced_retrieval": float(item.score)},
+    )
+
+
+def _rerank_advanced_with_bge(
+    query: str,
+    ranked: Sequence[AdvancedRankedFrame],
+    *,
+    runner: object,
+    model_revision: str,
+    retrieval_alpha: float,
+    cache_dir: Path,
+) -> tuple[list[AdvancedRankedFrame], dict[str, object]]:
+    """Rerank Top-20 while preserving the remaining candidates for Top-100 output."""
+
+    candidates = [_advanced_as_retrieval_result(item) for item in ranked]
+    reranked, report = rerank_with_bge(
+        candidates,
+        query=query,
+        runner=runner,  # type: ignore[arg-type]
+        model_revision=model_revision,
+        candidate_limit=100,
+        output_k=20,
+        retrieval_alpha=retrieval_alpha,
+        cache_dir=cache_dir,
+    )
+    lookup = {
+        (candidate.video_id, candidate.frame_id): item
+        for candidate, item in zip(candidates, ranked)
+    }
+    promoted: list[AdvancedRankedFrame] = []
+    promoted_keys: set[tuple[str, str]] = set()
+    for candidate in reranked:
+        key = (candidate.video_id, candidate.frame_id)
+        item = lookup.get(key)
+        if item is None or key in promoted_keys:
+            continue
+        promoted_keys.add(key)
+        promoted.append(
+            replace(
+                item,
+                score=float(candidate.score),
+                breakdown={
+                    **dict(item.breakdown),
+                    "bge_blended": float(candidate.score),
+                    **(
+                        {"bge_reranker": float(candidate.modality_scores["bge_reranker"])}
+                        if "bge_reranker" in candidate.modality_scores
+                        else {}
+                    ),
+                },
+            )
+        )
+    for candidate, item in zip(candidates, ranked):
+        key = (candidate.video_id, candidate.frame_id)
+        if key not in promoted_keys:
+            promoted.append(item)
+    return promoted, report.to_dict()
+
+
 def predict_command(args: argparse.Namespace) -> None:
+    if args.bge_batch_size < 1:
+        raise ValueError("--bge-batch-size must be positive")
+    if not 0.0 <= float(args.bge_reranker_alpha) <= 1.0:
+        raise ValueError("--bge-reranker-alpha must be within [0, 1]")
     public_root = args.public_root.resolve()
     output_root = args.output_root.resolve()
     advanced_mode = args.retrieval_mode == "advanced"
@@ -3642,9 +3744,42 @@ def predict_command(args: argparse.Namespace) -> None:
             deterministic_rerank_enabled=not args.no_deterministic_rerank,
         )
 
+    bge_dense_engine: BgeM3DenseSearchEngine | None = None
+    bge_dense_initialization_error = ""
+    if advanced_mode and args.bge_dense_mode != "off":
+        try:
+            bge_dense_engine = BgeM3DenseSearchEngine(
+                args.bge_text_index_root,
+                model_name=args.bge_m3_model_name,
+                model_revision=args.bge_m3_model_revision or None,
+                batch_size=args.bge_batch_size,
+                device=resolved_device,
+                cache_dir=args.bge_model_cache_dir,
+                local_files_only=args.offline_model_cache,
+            )
+        except Exception as exc:
+            bge_dense_initialization_error = f"{type(exc).__name__}: {exc}"
+            if args.bge_dense_mode == "required":
+                raise RuntimeError(
+                    "Required BGE-M3 dense retrieval initialization failed: "
+                    + bge_dense_initialization_error
+                ) from exc
+
+    bge_reranker_runner: LazyBgeReranker | None = None
+    if advanced_mode and args.bge_reranker_mode != "off":
+        bge_reranker_runner = LazyBgeReranker(
+            model_name=args.bge_reranker_model_name,
+            model_revision=args.bge_reranker_model_revision,
+            batch_size=args.bge_batch_size,
+            device=resolved_device,
+            cache_dir=args.bge_model_cache_dir,
+            local_files_only=args.offline_model_cache,
+        )
+
     predictions: dict[str, list[str]] = {}
     advanced_results: dict[str, list[AdvancedRankedFrame]] = {}
     advanced_traces: dict[str, dict[str, object]] = {}
+    bge_reports: dict[str, dict[str, object]] = {}
     question_lookup = {question.query_id: question for question in questions}
     predict_started = time.perf_counter()
     if advanced_mode and resolved_device.startswith("cuda"):
@@ -3659,14 +3794,32 @@ def predict_command(args: argparse.Namespace) -> None:
         if advanced_mode:
             assert dense_index is not None and advanced_config is not None
             if question.task == "TKIS":
-                response = advanced_text_search(
-                    question.text,
-                    hybrid_engine=hybrid_engine,
-                    text_encoder=text_encoder,
-                    dense_index=dense_index,
-                    profile=args.retrieval_profile,
-                    config=advanced_config,
-                )
+                try:
+                    response = advanced_text_search(
+                        question.text,
+                        hybrid_engine=hybrid_engine,
+                        text_encoder=text_encoder,
+                        dense_index=dense_index,
+                        dense_text_engine=bge_dense_engine,
+                        profile=args.retrieval_profile,
+                        config=advanced_config,
+                    )
+                except Exception as exc:
+                    if bge_dense_engine is None or args.bge_dense_mode == "required":
+                        raise
+                    bge_reports[question.query_id] = {
+                        "dense_status": "fallback",
+                        "dense_fallback_reason": f"{type(exc).__name__}: {exc}",
+                    }
+                    response = advanced_text_search(
+                        question.text,
+                        hybrid_engine=hybrid_engine,
+                        text_encoder=text_encoder,
+                        dense_index=dense_index,
+                        dense_text_engine=None,
+                        profile=args.retrieval_profile,
+                        config=advanced_config,
+                    )
             else:
                 vector = vkis_vectors.get(question.query_id)
                 if vector is None:
@@ -3697,7 +3850,53 @@ def predict_command(args: argparse.Namespace) -> None:
                     dense_index=dense_index,
                     config=advanced_config,
                 )
-            advanced_results[question.query_id] = list(response.results)
+            ranked_results = list(response.results)
+            if question.task == "TKIS" and bge_reranker_runner is not None:
+                ranked_results, reranker_report = _rerank_advanced_with_bge(
+                    question.text,
+                    ranked_results,
+                    runner=bge_reranker_runner,
+                    model_revision=args.bge_reranker_model_revision,
+                    retrieval_alpha=args.bge_reranker_alpha,
+                    cache_dir=args.bge_model_cache_dir,
+                )
+                if (
+                    reranker_report.get("status") == "fallback"
+                    and args.bge_reranker_mode == "required"
+                ):
+                    raise RuntimeError(
+                        "Required BGE reranker failed: "
+                        + str(reranker_report.get("fallback_reason") or "unknown error")
+                    )
+                existing_bge_report = bge_reports.setdefault(question.query_id, {})
+                existing_bge_report.update(
+                    {
+                        "dense_status": (
+                            existing_bge_report.get("dense_status")
+                            or ("passed" if bge_dense_engine is not None else "fallback")
+                        ),
+                        "dense_fallback_reason": (
+                            existing_bge_report.get("dense_fallback_reason")
+                            or bge_dense_initialization_error
+                        ),
+                        "reranker": reranker_report,
+                    }
+                )
+            elif question.task == "TKIS":
+                bge_reports.setdefault(question.query_id, {}).update(
+                    {
+                        "dense_status": (
+                            "passed"
+                            if bge_dense_engine is not None
+                            else ("disabled" if args.bge_dense_mode == "off" else "fallback")
+                        ),
+                        "dense_fallback_reason": bge_dense_initialization_error,
+                        "reranker": {"status": "disabled"},
+                    }
+                )
+            else:
+                bge_reports[question.query_id] = {"status": "not_applicable_to_vkis"}
+            advanced_results[question.query_id] = ranked_results
             advanced_traces[question.query_id] = response.trace()
             continue
         if question.task == "TKIS":
@@ -3816,6 +4015,7 @@ def predict_command(args: argparse.Namespace) -> None:
             trace = dict(advanced_traces[question.query_id])
             trace["query_id"] = question.query_id
             trace["task"] = question.task
+            trace["bge"] = bge_reports.get(question.query_id, {"status": "disabled"})
             trace["vlm"] = vlm_reports[question.query_id]
             trace["final_results"] = [item.to_dict() for item in ranked]
             trace_rows.append(trace)
@@ -3858,6 +4058,12 @@ def predict_command(args: argparse.Namespace) -> None:
                 "sha256": _sha256_file(dense_manifest_path),
             },
         }
+        bge_manifest_path = args.bge_text_index_root / "bge_m3_manifest.json"
+        if bge_manifest_path.is_file():
+            artifact_ledger["bge_m3_manifest"] = {
+                "path": Path(os.path.relpath(bge_manifest_path, run_root)).as_posix(),
+                "sha256": _sha256_file(bge_manifest_path),
+            }
         record_submission(
             run_root,
             submission_path,
@@ -3875,6 +4081,13 @@ def predict_command(args: argparse.Namespace) -> None:
                 "vlm_mode": args.vlm_mode,
                 "vlm_model": args.vlm_model_name,
                 "vlm_model_revision": args.vlm_model_revision,
+                "bge_dense_mode": args.bge_dense_mode,
+                "bge_m3_model": args.bge_m3_model_name,
+                "bge_m3_model_revision": args.bge_m3_model_revision,
+                "bge_reranker_mode": args.bge_reranker_mode,
+                "bge_reranker_model": args.bge_reranker_model_name,
+                "bge_reranker_model_revision": args.bge_reranker_model_revision,
+                "bge_reranker_alpha": args.bge_reranker_alpha,
             },
             stages={
                 "predict": {
@@ -3883,6 +4096,14 @@ def predict_command(args: argparse.Namespace) -> None:
                     "vlm_fallback_queries": sum(
                         report.get("status") == "fallback"
                         for report in vlm_reports.values()
+                    ),
+                    "bge_fallback_queries": sum(
+                        report.get("dense_status") == "fallback"
+                        or (
+                            isinstance(report.get("reranker"), Mapping)
+                            and report["reranker"].get("status") == "fallback"
+                        )
+                        for report in bge_reports.values()
                     ),
                     "device": resolved_device,
                     "peak_vram_mib": peak_vram_mib,
@@ -4442,6 +4663,35 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--vlm-model-revision", default="main")
     predict_parser.add_argument("--vlm-top-m", type=int, default=20)
     predict_parser.add_argument("--vlm-timeout-seconds", type=float, default=120.0)
+    predict_parser.add_argument(
+        "--bge-dense-mode",
+        choices=("off", "optional", "required"),
+        default="off",
+    )
+    predict_parser.add_argument(
+        "--bge-text-index-root",
+        type=Path,
+        default=Path("data/indexes/bge_m3"),
+    )
+    predict_parser.add_argument("--bge-m3-model-name", default="BAAI/bge-m3")
+    predict_parser.add_argument("--bge-m3-model-revision", default="main")
+    predict_parser.add_argument(
+        "--bge-reranker-mode",
+        choices=("off", "optional", "required"),
+        default="off",
+    )
+    predict_parser.add_argument(
+        "--bge-reranker-model-name",
+        default="BAAI/bge-reranker-v2-m3",
+    )
+    predict_parser.add_argument("--bge-reranker-model-revision", default="main")
+    predict_parser.add_argument("--bge-reranker-alpha", type=float, default=0.5)
+    predict_parser.add_argument("--bge-batch-size", type=int, default=16)
+    predict_parser.add_argument(
+        "--bge-model-cache-dir",
+        type=Path,
+        default=Path("data/model_cache/bge_m3"),
+    )
     predict_parser.add_argument("--no-query-plan", action="store_true")
     predict_parser.add_argument("--no-rrf", action="store_true")
     predict_parser.add_argument("--no-dense-rescue", action="store_true")

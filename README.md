@@ -13,6 +13,7 @@ video -> dense keyframes -> SigLIP2 embeddings -> FAISS
                          -> YOLOE open-vocabulary evidence
                          -> segment metadata -> BM25 text index
 query -> visual/text/temporal retrieval -> hybrid rerank -> evidence
+      -> BGE-M3 dense text -> BGE cross-encoder -> grounded QA (Qwen3.5)
 ```
 
 - Visual: SigLIP2, giữ nguyên embedding/index contract hiện có.
@@ -23,6 +24,10 @@ query -> visual/text/temporal retrieval -> hybrid rerank -> evidence
 - Object evidence: `yoloe-26l-seg.pt`, vocabulary cấu hình được. Kết quả chỉ là
   bằng chứng mềm; không dùng làm hard filter loại candidate.
 - Text retrieval: caption, OCR và objects.
+- Dense text: `BAAI/bge-m3` (1024 chiều, FAISS IP); BM25 vẫn được giữ để bắt
+  exact keyword/OCR.
+- QA rerank: `BAAI/bge-reranker-v2-m3`; grounded answer dùng
+  `Qwen/Qwen3.5-9B@c202236`, mặc định tắt và chỉ load khi chạy QA.
 
 ## Cài đặt
 
@@ -112,6 +117,71 @@ xóa dữ liệu lịch sử khác.
 
 Xem đầy đủ workflow và tùy chọn model trong
 [`competition/README.md`](competition/README.md).
+
+## Colab end-to-end và contract submission
+
+Notebook [`notebooks/colab_retrieval_v2_launcher.ipynb`](notebooks/colab_retrieval_v2_launcher.ipynb)
+chạy đủ 10 stage, build BGE-M3 index, dùng BGE reranker cho TKIS rồi tạo
+`results/submission.csv`. Output public **không đổi**: đúng 100 query trong
+`questions.csv` (50 TKIS + 50 VKIS), mỗi query 100 answer theo đúng thứ tự và
+header của `sample_submission.csv`.
+
+Public dataset hiện không có QA. Vì vậy notebook chạy KIS/AVS/QA smoke riêng
+sau submission và ghi `results/task_smoke.json`; QA không được thêm vào
+`submission.csv`. Trong notebook, hai BGE mode và Qwen QA mode được đặt
+`required`: model lỗi thì cell fail thay vì âm thầm fallback sang pipeline cũ.
+
+## Test riêng KIS, AVS và QA
+
+Trước khi chạy, trỏ service vào artifacts của một `run_root` đã hoàn tất. Ví dụ
+PowerShell (đổi `$runRoot` theo máy):
+
+```powershell
+$runRoot = "E:\runs\new-model-001"
+$env:RETRIEVAL_INDEX_PATH = "$runRoot\indexes\siglip2_so400m_patch16_384_flat_ip.faiss"
+$env:RETRIEVAL_FRAME_MAP_PATH = "$runRoot\metadata\siglip2_so400m_patch16_384_frame_map.json"
+$env:RETRIEVAL_MANIFEST_PATH = "$runRoot\metadata\siglip2_so400m_patch16_384_faiss_manifest.json"
+$env:RETRIEVAL_TEXT_INDEX_PATH = "$runRoot\indexes\retrieval_text_index.json"
+$env:QA_BGE_DENSE_ENABLED = "true"
+$env:QA_BGE_RERANKER_ENABLED = "true"
+$env:QA_BGE_INDEX_ROOT = "$runRoot\indexes\bge_m3"
+$env:QA_BGE_DEVICE = "cuda"
+$env:QA_BGE_MODEL_CACHE_DIR = "data\model_cache\bge_m3"
+$env:QA_ANSWER_MODEL_CACHE_DIR = "data\model_cache\qa_answer"
+```
+
+KIS và AVS dừng ở evidence, không load Qwen:
+
+```powershell
+python -m backend.app.services.retrieval.run_task_smoke --task kis --top-k 5
+python -m backend.app.services.retrieval.run_task_smoke --task avs --top-k 5
+```
+
+QA end-to-end có grounded answer:
+
+```powershell
+$env:QA_ANSWER_MODE = "required"
+$env:QA_ANSWER_DEVICE = "cuda"
+$env:QA_ANSWER_QUANTIZATION = "4bit"
+python -m backend.app.services.retrieval.run_task_smoke `
+  --task qa --top-k 5 `
+  --qa-query "Người phụ nữ áo đỏ đang cầm gì?" `
+  --output "$runRoot\results\qa_smoke.json"
+```
+
+Chạy cả ba task:
+
+```powershell
+python -m backend.app.services.retrieval.run_task_smoke `
+  --task all --top-k 5 `
+  --output "$runRoot\results\task_smoke.json"
+```
+
+`QA_ANSWER_MODE=off|optional|required` chỉ điều khiển answerer. Parser, router,
+evidence bundle, BGE dense và BGE reranker có feature flag riêng. Smoke chỉ xác
+nhận checkpoint/artifact/contract chạy được; muốn so chất lượng phải dùng dev
+labels, và locked test chỉ được mở một lần theo policy trong
+`competition/evaluation/`.
 
 ## Schema metadata chính
 

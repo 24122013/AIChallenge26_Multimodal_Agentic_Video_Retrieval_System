@@ -43,14 +43,18 @@ class BgeCandidateReranker:
     def __init__(
         self,
         *,
+        model_name: str = "BAAI/bge-reranker-v2-m3",
         model_revision: str = "main",
         retrieval_alpha: float = 0.5,
+        batch_size: int = 16,
         device: str = "auto",
         cache_dir: str | None = None,
         local_files_only: bool = False,
     ) -> None:
+        self.model_name = model_name
         self.model_revision = model_revision
         self.retrieval_alpha = float(retrieval_alpha)
+        self.batch_size = int(batch_size)
         self.device = device
         self.cache_dir = cache_dir
         self.local_files_only = bool(local_files_only)
@@ -67,9 +71,11 @@ class BgeCandidateReranker:
         results, report = rerank_with_bge(
             candidates,
             query=query,
+            model_name=self.model_name,
             model_revision=self.model_revision,
             output_k=20 if top_k is None else int(top_k),
             retrieval_alpha=self.retrieval_alpha,
+            batch_size=self.batch_size,
             device=self.device,
             cache_dir=self.cache_dir,
             local_files_only=self.local_files_only,

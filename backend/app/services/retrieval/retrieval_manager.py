@@ -171,8 +171,13 @@ def get_qa_evidence_search_engine() -> QaEvidenceSearchEngine:
     reranker = None
     if _bool_from_env("QA_BGE_RERANKER_ENABLED", False):
         reranker = BgeCandidateReranker(
+            model_name=os.getenv(
+                "QA_BGE_RERANKER_MODEL",
+                "BAAI/bge-reranker-v2-m3",
+            ),
             model_revision=os.getenv("QA_BGE_RERANKER_REVISION", "main"),
             retrieval_alpha=float(os.getenv("QA_BGE_RERANKER_ALPHA", "0.5")),
+            batch_size=int(os.getenv("QA_BGE_BATCH_SIZE", "16")),
             device=os.getenv("QA_BGE_DEVICE", "auto"),
             cache_dir=str(
                 _path_from_env(
@@ -202,14 +207,29 @@ def get_qa_evidence_search_engine() -> QaEvidenceSearchEngine:
 
 @lru_cache(maxsize=1)
 def get_qa_search_pipeline() -> QaSearchPipeline:
+    answer_mode = _choice_from_env(
+        "QA_ANSWER_MODE",
+        "off",
+        ("off", "optional", "required"),
+    )
+    answer_runner = None
+    if answer_mode != "off":
+        from backend.app.services.retrieval.qa_answerer import build_local_qwen_runner
+
+        answer_runner = build_local_qwen_runner(
+            model_name=os.getenv("QA_ANSWER_MODEL", "Qwen/Qwen3.5-9B"),
+            model_revision=os.getenv("QA_ANSWER_MODEL_REVISION", "c202236"),
+            device=os.getenv("QA_ANSWER_DEVICE") or None,
+            quantization=os.getenv("QA_ANSWER_QUANTIZATION", "auto"),
+            cache_dir=_path_from_env(
+                "QA_ANSWER_MODEL_CACHE_DIR",
+                Path("data/model_cache/qa_answer"),
+            ),
+        )
     return QaSearchPipeline(
         get_qa_evidence_search_engine(),
         config=QaPipelineConfig(
-            answer_mode=_choice_from_env(
-                "QA_ANSWER_MODE",
-                "off",
-                ("off", "optional", "required"),
-            ),
+            answer_mode=answer_mode,
             model_name=os.getenv("QA_ANSWER_MODEL", "Qwen/Qwen3.5-9B"),
             model_revision=os.getenv("QA_ANSWER_MODEL_REVISION", "c202236"),
             answer_cache_root=_path_from_env(
@@ -224,6 +244,7 @@ def get_qa_search_pipeline() -> QaSearchPipeline:
                 "qa-parser-router-evidence-v1",
             ),
         ),
+        answer_runner=answer_runner,
     )
 
 
