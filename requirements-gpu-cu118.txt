@@ -1,0 +1,3 @@
+# Official PaddlePaddle GPU wheel index for driver/CUDA 11.8 environments.
+--index-url https://www.paddlepaddle.org.cn/packages/stable/cu118/
+paddlepaddle-gpu==3.2.0

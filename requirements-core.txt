@@ -1,0 +1,27 @@
+numpy>=1.26
+opencv-python>=4.9.0
+open-clip-torch>=2.24.0
+faiss-cpu>=1.8.0
+pillow>=10.0.0
+PyYAML>=6.0
+torch>=2.2.0
+torchvision>=0.17.0
+
+# Qwen3.5 multimodal captioning and optional 4/8-bit loading.
+transformers>=5.2.0
+accelerate>=1.2.0
+bitsandbytes>=0.45.0
+
+transnetv2-pytorch>=1.0.5
+ffmpeg-python>=0.2.0
+tqdm>=4.66.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+
+# PP-OCRv5 frontend. Its CPU/GPU inference runtime is selected by the
+# top-level requirements file used for installation.
+paddleocr>=3.3.0,<4
+
+# YOLOE-26 open-vocabulary object evidence.
+ultralytics>=8.4.0

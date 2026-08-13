@@ -73,17 +73,10 @@ class QaEvidenceTest(unittest.TestCase):
 
         self.assertEqual(plan.answer_target, "held_object")
         self.assertIn("cầm một vật", plan.retrieval_queries[0])
-        self.assertTrue(
-            any(
-                "a woman" in query
-                and "red shirt" in query
-                and "holding an object" in query
-                for query in plan.retrieval_queries
-            )
-        )
-        self.assertTrue(
-            any("on a table" in query for query in plan.retrieval_queries)
-        )
+        self.assertEqual(plan.answer_type, "object")
+        self.assertIn("người phụ nữ", plan.constraints["subject"])
+        self.assertIn("áo đỏ", plan.constraints["attributes"])
+        self.assertEqual(plan.expansions, ())
 
     def test_qa_evidence_fuses_queries_and_returns_image_paths(self) -> None:
         hybrid = FakeHybridEngine()
@@ -92,11 +85,16 @@ class QaEvidenceTest(unittest.TestCase):
         response = engine.search(
             "Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm cái gì?",
             top_k=2,
+            expanded_queries=["a woman in a red shirt holding an object"],
         )
 
         self.assertEqual(response["answer_mode"], "manual_visual_inspection")
         self.assertEqual(response["answer_target"], "held_object")
-        self.assertGreaterEqual(len(hybrid.queries), 2)
+        self.assertEqual(len(hybrid.queries), 2)
+        self.assertEqual(
+            response["routing_trace"]["queries"][1]["source"],
+            "external_expansion",
+        )
         self.assertEqual(response["results"][0]["frame_id"], "woman_red")
         self.assertTrue(response["results"][0]["keyframe_path"].endswith(".jpg"))
         self.assertGreater(
@@ -111,7 +109,7 @@ class QaEvidenceTest(unittest.TestCase):
 
         response = engine.search("Biển hiệu trong cảnh ghi nội dung gì?", top_k=1)
 
-        self.assertEqual(response["answer_target"], "unknown")
+        self.assertEqual(response["answer_target"], "ocr")
         self.assertEqual(response["evidence_count"], 1)
         self.assertEqual(len(response["results"]), 1)
 

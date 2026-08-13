@@ -30,18 +30,32 @@ query -> visual/text/temporal retrieval -> hybrid rerank -> evidence
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-PaddlePaddle phải được cài riêng theo nền tảng. Ví dụ CPU:
+Lệnh trên cài đầy đủ runtime CPU, bao gồm PaddlePaddle cho PP-OCRv5. Với NVIDIA
+GPU, không cài `requirements.txt`; cài dependency chung trước rồi chọn đúng một
+PaddlePaddle profile theo driver/runtime:
 
 ```powershell
-pip install paddlepaddle
+python -m pip install -r requirements-core.txt
+python -m pip install -r requirements-gpu-cu118.txt
+# hoặc
+python -m pip install -r requirements-core.txt
+python -m pip install -r requirements-gpu-cu126.txt
 ```
 
-Với CUDA, chọn đúng wheel `paddlepaddle-gpu` theo phiên bản CUDA từ hướng dẫn
-PaddlePaddle; không cài đồng thời wheel CPU và GPU. Quantization caption 4/8-bit
-cần CUDA và `bitsandbytes` tương thích.
+Không cài đồng thời `paddlepaddle` và `paddlepaddle-gpu`. Máy NVIDIA 50-series
+trên Windows có thể cần wheel chuyên biệt theo Python/driver từ hướng dẫn chính
+thức của PaddlePaddle thay vì hai profile trên. PyTorch/CUDA vẫn phải tương thích
+với driver của máy. Quantization caption 4/8-bit cần CUDA và `bitsandbytes`
+tương thích.
+
+Kiểm tra các runtime model sau khi cài:
+
+```powershell
+python -c "import torch, transformers, accelerate, paddle, paddleocr, ultralytics; print({'torch': torch.__version__, 'cuda': torch.cuda.is_available(), 'transformers': transformers.__version__, 'accelerate': accelerate.__version__, 'paddle': paddle.__version__, 'paddle_cuda': paddle.is_compiled_with_cuda(), 'paddleocr': paddleocr.__version__, 'ultralytics': ultralytics.__version__})"
+```
 
 Model được lazy-load và cache dưới `data/model_cache/`. Lần chạy đầu cần mạng để
 tải checkpoint nếu cache chưa có.
