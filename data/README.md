@@ -30,7 +30,6 @@ Bao gồm:
 
 - caption
 - OCR
-- ASR
 - objects
 
 ---

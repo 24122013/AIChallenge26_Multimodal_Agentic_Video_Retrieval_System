@@ -435,7 +435,6 @@ def frame_record_to_result(
         thumbnail_path=record.thumbnail_path,
         caption=record.caption,
         ocr_text=record.ocr_text,
-        asr_text=record.asr_text,
         objects=list(record.objects),
         modality_scores={"visual": round(score, 6)},
         neighbors=[frame_record_to_neighbor(neighbor) for neighbor in neighbors or []],

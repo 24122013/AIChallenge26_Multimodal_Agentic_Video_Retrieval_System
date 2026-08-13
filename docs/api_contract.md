@@ -469,7 +469,7 @@ Missing fields are not allowed.
 | Keyframe Extraction | P2    |
 | Embedding           | P2    |
 | Vector DB           | P2    |
-| Caption/OCR/ASR     | P3    |
+| Caption/OCR/Objects | P3    |
 | Metadata            | P3    |
 | Retrieval           | P4    |
 | Re-ranking          | P4    |

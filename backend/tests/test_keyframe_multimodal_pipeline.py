@@ -149,27 +149,6 @@ def caption_records() -> list[dict[str, object]]:
     ]
 
 
-def asr_records() -> list[dict[str, object]]:
-    return [
-        {
-            "video_id": VIDEO_ID,
-            "status": "success",
-            "start": 0.0,
-            "end": 2.0,
-            "text": "opening title",
-            "confidence": 0.9,
-        },
-        {
-            "video_id": VIDEO_ID,
-            "status": "success",
-            "start": 2.0,
-            "end": 4.0,
-            "text": "a bicycle appears",
-            "confidence": 0.9,
-        },
-    ]
-
-
 def adapter_config() -> FeatureAdapterConfig:
     return FeatureAdapterConfig(
         ocr_common_frame_fraction=1.0,
@@ -188,7 +167,6 @@ def run_pipeline(
     ocr: list[dict[str, object]] | None = None,
     objects: list[dict[str, object]] | None = None,
     captions: list[dict[str, object]] | None = None,
-    asr: list[dict[str, object]] | None = None,
     config: SelectionConfig | None = None,
     allow_partial_features: bool = False,
 ):
@@ -204,7 +182,6 @@ def run_pipeline(
         ocr_records=ocr if ocr is not None else ocr_records(),
         object_records=objects if objects is not None else object_records(),
         caption_records=captions if captions is not None else caption_records(),
-        asr_records=asr if asr is not None else asr_records(),
         video_duration=4.0,
         selection_config=config
         or SelectionConfig(max_gap_seconds=1.25, target_keyframes=None),
@@ -293,7 +270,6 @@ class MultimodalKeyframePipelineTest(unittest.TestCase):
             [record["candidate_id"] for record in result.final_caption_records],
             [candidate_id for candidate_id in selected_ids if candidate_id in {"C1", "C6"}],
         )
-        self.assertEqual(len(result.final_asr_records), 2)
         for record in result.final_records:
             provenance = record["selection_provenance"]
             self.assertEqual(provenance["selection_rank"], record["selection_rank"])
@@ -365,7 +341,6 @@ class MultimodalKeyframePipelineTest(unittest.TestCase):
         ocr = list(reversed(ocr_records()))
         objects = list(reversed(object_records()))
         captions = list(reversed(caption_records()))
-        asr = list(reversed(asr_records()))
         matrix, metadata = embedding_artifacts()
         order = list(range(len(metadata)))
         random.Random(42).shuffle(order)
@@ -383,7 +358,6 @@ class MultimodalKeyframePipelineTest(unittest.TestCase):
             ocr=ocr,
             objects=objects,
             captions=captions,
-            asr=asr,
         )
 
         self.assertEqual(first.final_records, second.final_records)
@@ -391,7 +365,6 @@ class MultimodalKeyframePipelineTest(unittest.TestCase):
         self.assertEqual(first.final_ocr_records, second.final_ocr_records)
         self.assertEqual(first.final_object_records, second.final_object_records)
         self.assertEqual(first.final_caption_records, second.final_caption_records)
-        self.assertEqual(first.final_asr_records, second.final_asr_records)
         self.assertEqual(first.candidate_ledger, second.candidate_ledger)
         self.assertEqual(first.event_ledger, second.event_ledger)
         self.assertEqual(first.guarantee_report, second.guarantee_report)

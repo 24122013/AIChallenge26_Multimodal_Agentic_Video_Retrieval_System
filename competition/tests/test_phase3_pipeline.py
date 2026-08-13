@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import json
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,14 +27,12 @@ from competition.pipeline import (
     ARTIFACT_TAG,
     CorpusVideo,
     _load_valid_extraction_report,
-    _phase3_asr_artifacts_current,
     _phase3_candidate_config,
     _phase3_feature_config,
     _phase3_frame_modality_artifacts_current,
     _phase3_load_and_validate_features,
     _phase3_publish_video,
     _phase3_release_model_memory,
-    _phase3_run_asr_worker,
     _phase3_siglip_artifacts_current,
     _phase3_selection_config,
     _require_current_canonical_publish,
@@ -244,24 +241,6 @@ class Phase3PipelineIntegrationTest(unittest.TestCase):
                     ),
                 }
             )
-        asr_records = [
-            {
-                "video_id": VIDEO_ID,
-                "status": "success",
-                "start": 0.0,
-                "end": 2.5,
-                "text": "opening title",
-                "confidence": 0.9,
-            },
-            {
-                "video_id": VIDEO_ID,
-                "status": "success",
-                "start": 2.5,
-                "end": 5.0,
-                "text": "a bicycle appears",
-                "confidence": 0.9,
-            },
-        ]
         feature_config = _phase3_feature_config(
             self.args,
             resolved_device=RESOLVED_DEVICE,
@@ -272,8 +251,6 @@ class Phase3PipelineIntegrationTest(unittest.TestCase):
         atomic_write_jsonl(paths.captions, caption_records)
         atomic_write_jsonl(paths.ocr, ocr_records)
         atomic_write_jsonl(paths.objects, object_records)
-        atomic_write_jsonl(paths.asr, asr_records)
-        atomic_write_jsonl(paths.asr_segments, [])
         atomic_write_json(
             paths.caption_report,
             {
@@ -281,30 +258,15 @@ class Phase3PipelineIntegrationTest(unittest.TestCase):
                 "input_record_count": len(candidates),
                 "error_count": 0,
                 "model_name": self.args.caption_model_name,
+                "requested_model_revision": self.args.caption_model_revision,
                 "device": RESOLVED_DEVICE,
                 "batch_size": self.args.caption_batch_size,
+                "max_new_tokens": self.args.caption_max_new_tokens,
+                "dtype": self.args.caption_dtype,
+                "quantization": self.args.caption_quantization,
                 "segment_caption_enabled": not self.args.no_segment_caption,
                 "input_path": str(paths.candidate_metadata),
                 "output_path": str(paths.captions),
-            },
-        )
-        atomic_write_json(
-            paths.asr_report,
-            {
-                "pipeline": "asr",
-                "input_record_count": 1,
-                "success_count": len(asr_records),
-                "skipped_count": 0,
-                "error_count": 0,
-                "model_size": self.args.asr_model_size,
-                "backend": self.args.asr_backend,
-                "vad_filter": not self.args.no_vad,
-                "device": RESOLVED_DEVICE,
-                "input_path": str(self.video_path),
-                "output_path": str(paths.asr),
-                "segments_output_path": str(paths.asr_segments),
-                "metadata_path": str(paths.candidate_metadata),
-                "phase3_asr_policy": feature_config["asr"],
             },
         )
         features = _phase3_load_and_validate_features(
@@ -372,7 +334,7 @@ class Phase3PipelineIntegrationTest(unittest.TestCase):
         self.assertIsNone(backend._model)
         self.assertIsNone(backend._processor)
 
-    def test_modality_checkpoints_require_exact_reports_and_successful_asr(self) -> None:
+    def test_modality_checkpoints_require_exact_reports(self) -> None:
         (
             paths,
             _candidate_report,
@@ -392,56 +354,17 @@ class Phase3PipelineIntegrationTest(unittest.TestCase):
                 pipeline="caption",
                 expected_report={
                     "model_name": self.args.caption_model_name,
+                    "requested_model_revision": self.args.caption_model_revision,
                     "device": RESOLVED_DEVICE,
                     "batch_size": self.args.caption_batch_size,
+                    "max_new_tokens": self.args.caption_max_new_tokens,
+                    "dtype": self.args.caption_dtype,
+                    "quantization": self.args.caption_quantization,
                     "segment_caption_enabled": not self.args.no_segment_caption,
                 },
                 require_success=False,
             )
         )
-        self.assertTrue(
-            _phase3_asr_artifacts_current(
-                video=self.video,
-                video_path=self.video_path,
-                paths=paths,
-                feature_config=feature_config,
-            )
-        )
-
-        failed_asr = read_jsonl(paths.asr)
-        failed_asr[0]["status"] = "error"
-        failed_asr[0]["error"] = "simulated CUDA failure"
-        atomic_write_jsonl(paths.asr, failed_asr)
-        self.assertFalse(
-            _phase3_asr_artifacts_current(
-                video=self.video,
-                video_path=self.video_path,
-                paths=paths,
-                feature_config=feature_config,
-            )
-        )
-
-    @mock.patch("competition.pipeline._phase3_terminate_worker")
-    @mock.patch("competition.pipeline.subprocess.Popen")
-    def test_asr_worker_timeout_terminates_only_spawned_worker(
-        self,
-        popen_mock: mock.Mock,
-        terminate_mock: mock.Mock,
-    ) -> None:
-        process = mock.Mock(pid=12345)
-        process.wait.side_effect = subprocess.TimeoutExpired(
-            cmd=["python-test", "-m", "competition.asr_worker"],
-            timeout=2.0,
-        )
-        popen_mock.return_value = process
-
-        result = _phase3_run_asr_worker(
-            ["python-test", "-m", "competition.asr_worker"],
-            timeout_seconds=2.0,
-        )
-
-        self.assertEqual(result, {"return_code": None, "timed_out": True})
-        terminate_mock.assert_called_once_with(process)
 
     def test_siglip_checkpoint_resume_requires_exact_config_and_candidates(self) -> None:
         (

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from backend.app.services.retrieval.retrieval_manager import (
-    search_asr,
     search_caption,
     search_hybrid,
     search_object,
@@ -62,8 +61,6 @@ def _dispatch_search(query: str, top_k: int, mode: str) -> dict:
         return search_caption(query=query, top_k=top_k).to_dict()
     if normalized in {"ocr", "ocr_text"}:
         return search_ocr(query=query, top_k=top_k).to_dict()
-    if normalized in {"asr", "transcript"}:
-        return search_asr(query=query, top_k=top_k).to_dict()
     if normalized in {"object", "objects"}:
         return search_object(query=query, top_k=top_k).to_dict()
     if normalized in {"qa", "qa_evidence", "question", "question_answering"}:
@@ -77,5 +74,5 @@ def _dispatch_search(query: str, top_k: int, mode: str) -> dict:
         }
     raise ValueError(
         "Unsupported search mode. Expected visual, hybrid, caption, OCR, "
-        "ASR, object, QA evidence, or temporal."
+        "object, QA evidence, or temporal."
     )

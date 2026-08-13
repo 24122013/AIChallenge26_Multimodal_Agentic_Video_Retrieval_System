@@ -194,34 +194,6 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     return result if np.isfinite(result) else default
 
 
-def _asr_evidence(
-    timestamp: float,
-    segments: Sequence[Mapping[str, Any]],
-) -> tuple[str, float]:
-    overlapping: list[Mapping[str, Any]] = []
-    for segment in segments:
-        start = float(segment.get("start", 0.0))
-        end = float(segment.get("end", start))
-        if start <= timestamp <= end:
-            overlapping.append(segment)
-    if not overlapping and segments:
-        overlapping = [
-            min(
-                segments,
-                key=lambda item: min(
-                    abs(timestamp - float(item.get("start", 0.0))),
-                    abs(timestamp - float(item.get("end", item.get("start", 0.0)))),
-                ),
-            )
-        ]
-    text = " ".join(str(item.get("text") or "").strip() for item in overlapping).strip()
-    confidence = max(
-        (float(item.get("confidence", 0.0)) for item in overlapping),
-        default=0.0,
-    )
-    return text, confidence
-
-
 def _select_phase3_manifests(source_output_root: Path) -> list[Path]:
     manifests = sorted(
         (source_output_root.resolve() / "metadata").glob(
@@ -342,10 +314,6 @@ def build_dense_index(
         if expected_event_sha and sha256_file(event_path) != expected_event_sha:
             raise ValueError(f"Protected-event lineage mismatch for {video_id}")
         scores, _ = _records_by_candidate(score_path)
-        _, asr_segments = _records_by_candidate(
-            workspace / "asr.jsonl",
-            allow_video_level=True,
-        )
         protected_events = _read_jsonl(event_path)
 
         previous_embedding_index = -1
@@ -361,7 +329,6 @@ def build_dense_index(
             seen_candidate_ids.add(candidate_id)
 
             timestamp = float(metadata_record.get("timestamp", 0.0))
-            asr_text, asr_confidence = _asr_evidence(timestamp, asr_segments)
             score_record = scores.get(candidate_id, {})
             keyframe_path = Path(str(metadata_record.get("keyframe_path") or ""))
             source_video_path = Path(str(metadata_record.get("source_video_path") or ""))
@@ -392,8 +359,6 @@ def build_dense_index(
                     "source_video": _relative_reference(source_video_path, run_root),
                     "caption": str(captions.get(candidate_id, {}).get("caption") or ""),
                     "ocr_text": str(ocr.get(candidate_id, {}).get("ocr_text") or ""),
-                    "asr_text": asr_text,
-                    "asr_confidence": asr_confidence,
                     "objects": _object_labels(objects.get(candidate_id, {})),
                     "importance_score": _safe_float(score_record.get("importance_score")),
                     "semantic_novelty": _safe_float(score_record.get("semantic_novelty")),

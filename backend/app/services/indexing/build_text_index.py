@@ -16,7 +16,7 @@ except ModuleNotFoundError:
     from backend.app.services.retrieval.text_index import build_text_index
 
 
-_ARTIFACT_PREFIXES = ("captions_", "ocr_", "asr_", "objects_", "segments_")
+_ARTIFACT_PREFIXES = ("captions_", "ocr_", "objects_", "segments_")
 
 
 def load_records(path: str | Path) -> list[dict[str, Any]]:
@@ -141,7 +141,7 @@ def _load_file(source: Path) -> list[dict[str, Any]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build Retrieval Phase 2 caption/OCR/ASR/object text index."
+        description="Build Retrieval Phase 2 caption/OCR/object text index."
     )
     parser.add_argument(
         "--metadata",

@@ -14,11 +14,10 @@ from backend.app.services.retrieval.query_terms import content_tokens, weighted_
 @dataclass(frozen=True)
 class AdvancedRerankWeights:
     coarse_rrf: float = 0.16
-    dense_visual: float = 0.38
-    caption: float = 0.10
-    ocr: float = 0.10
-    asr: float = 0.10
-    objects: float = 0.06
+    dense_visual: float = 0.43
+    caption: float = 0.12
+    ocr: float = 0.11
+    objects: float = 0.08
     cses_gain: float = 0.05
     temporal_consistency: float = 0.03
     modality_alignment: float = 0.02
@@ -94,7 +93,6 @@ def rerank_dense_candidates(
         modality = {
             "caption": _text_score(query_tokens, str(record.get("caption") or "")),
             "ocr": _text_score(query_tokens, str(record.get("ocr_text") or "")),
-            "asr": _text_score(query_tokens, str(record.get("asr_text") or "")),
             "objects": _text_score(
                 query_tokens,
                 " ".join(str(value) for value in record.get("objects", []) or []),

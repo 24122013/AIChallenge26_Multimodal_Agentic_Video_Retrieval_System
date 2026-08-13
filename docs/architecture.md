@@ -76,7 +76,6 @@ Metadata Extraction
     │
     ├── Caption
     ├── OCR
-    ├── ASR
     └── Objects
     │
     ▼
@@ -134,7 +133,6 @@ Nhiệm vụ:
 
 * Caption Generation
 * OCR Extraction
-* ASR Extraction
 * Object Detection
 
 Output:
@@ -316,7 +314,6 @@ Lưu:
 
 * captions
 * OCR
-* ASR
 * objects
 
 ---
@@ -398,8 +395,6 @@ Indexing
 Caption
 
 OCR
-
-ASR
 
 Metadata
 

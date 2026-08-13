@@ -93,9 +93,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MAX_GAP_SECONDS,
     )
-    parser.add_argument("--asr-timeout-seconds", type=float, default=90.0)
-    parser.add_argument("--asr-cpu-timeout-seconds", type=float, default=600.0)
-    parser.add_argument("--asr-retries", type=int, default=1)
     parser.add_argument("--neighbor-window-seconds", type=float, default=5.0)
     parser.add_argument("--search-depth", type=int, default=200)
     parser.add_argument(
@@ -276,12 +273,6 @@ def build_stage_commands(
         str(args.candidate_interval_sec),
         "--max-gap-seconds",
         str(args.max_gap_seconds),
-        "--asr-timeout-seconds",
-        str(args.asr_timeout_seconds),
-        "--asr-cpu-timeout-seconds",
-        str(args.asr_cpu_timeout_seconds),
-        "--asr-retries",
-        str(args.asr_retries),
     ]
     if not args.fresh:
         keyframes.append("--resume")
@@ -351,10 +342,6 @@ def run(args: argparse.Namespace) -> Path:
         raise ValueError("--num-workers must be non-negative")
     if args.candidate_interval_sec <= 0 or args.max_gap_seconds <= 0:
         raise ValueError("candidate interval and max gap must be positive")
-    if args.asr_timeout_seconds <= 0 or args.asr_cpu_timeout_seconds <= 0:
-        raise ValueError("ASR timeout values must be positive")
-    if args.asr_retries < 0:
-        raise ValueError("--asr-retries must be non-negative")
     if args.neighbor_window_seconds < 0:
         raise ValueError("--neighbor-window-seconds must be non-negative")
     if args.search_depth < 100:

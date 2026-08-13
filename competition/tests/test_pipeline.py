@@ -953,7 +953,6 @@ class CompetitionPipelineTest(unittest.TestCase):
                         "start_frame": 25,
                         "captions_aggregated": "a person playing guitar",
                         "ocr": [{"text": "live music"}],
-                        "asr": [{"text": "this is a song"}],
                         "objects": [{"class_name": "guitar"}],
                     }
                 ],
@@ -968,7 +967,7 @@ class CompetitionPipelineTest(unittest.TestCase):
 
             self.assertEqual(
                 engine.available_modalities,
-                ("visual", "asr", "caption", "objects", "ocr"),
+                ("visual", "caption", "objects", "ocr"),
             )
             response = engine.search("person playing guitar", top_k=5)
             self.assertTrue(response.results)

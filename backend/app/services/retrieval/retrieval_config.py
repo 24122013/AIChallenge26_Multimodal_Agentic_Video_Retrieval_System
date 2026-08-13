@@ -29,7 +29,6 @@ _CONFIG_SCHEMA = {
         "visual": "non-negative number",
         "caption": "non-negative number",
         "ocr": "non-negative number",
-        "asr": "non-negative number",
         "objects": "non-negative number",
         "temporal": "non-negative number",
     },
@@ -123,11 +122,6 @@ def load_retrieval_runtime_config(
             "RETRIEVAL_WEIGHT_OCR",
             weights_raw.get("ocr"),
             RerankWeights.ocr,
-        ),
-        asr=_float_env(
-            "RETRIEVAL_WEIGHT_ASR",
-            weights_raw.get("asr"),
-            RerankWeights.asr,
         ),
         objects=_float_env(
             "RETRIEVAL_WEIGHT_OBJECTS",

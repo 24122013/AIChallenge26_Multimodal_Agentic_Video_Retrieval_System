@@ -1,9 +1,4 @@
-"""Deterministic query planning for terminal retrieval experiments.
-
-This is a selective, dependency-light port of the tested task-aware planner
-from local commit ``26872dc3``.  It intentionally avoids an LLM so experiment
-results remain reproducible and callers can explicitly override every profile.
-"""
+"""Deterministic, dependency-light query planning."""
 from __future__ import annotations
 
 import re
@@ -13,7 +8,6 @@ from typing import Any
 
 
 SUPPORTED_PROFILES = ("auto", "kis", "avs", "qa", "temporal")
-
 _TEMPORAL_SPLIT = re.compile(
     r"\b(?:then|after\s+that|next|followed\s+by|sau\s+đó|tiếp\s+theo|rồi)\b",
     re.IGNORECASE,
@@ -24,11 +18,6 @@ _QUOTED = re.compile(r'''["'“”‘’]([^"'“”‘’]+)["'“”‘’]'''
 _OCR = re.compile(
     r"\b(?:text|written|read|subtitle|sign|signboard|plate|menu|logo|qr)\b"
     r"|\b(?:chữ|văn\s+bản|ghi\s+gì|viết\s+gì|phụ\s+đề|biển\s+hiệu|biển\s+báo|biển\s+số|thực\s+đơn|mã\s+qr)\b",
-    re.IGNORECASE,
-)
-_ASR = re.compile(
-    r"\b(?:said|says|speak|speech|announce|heard|voice|audio|lyrics)\b"
-    r"|\b(?:nói|phát\s+biểu|thông\s+báo|nghe|giọng|âm\s+thanh|lời\s+bài\s+hát)\b",
     re.IGNORECASE,
 )
 _OBJECT = re.compile(
@@ -46,7 +35,6 @@ _QUESTION = re.compile(
     r"|\b(?:gì|khi\s+nào|ở\s+đâu|là\s+ai|bao\s+nhiêu|màu\s+gì|làm\s+gì)\b",
     re.IGNORECASE,
 )
-
 _COMMON_TYPOS = {
     "resturant": "restaurant",
     "restaraunt": "restaurant",
@@ -125,32 +113,24 @@ def build_query_plan(query: str, profile: str = "auto") -> QueryPlan:
     if _OCR.search(classification):
         hints.append("ocr")
         reasons.append("OCR/text cue")
-    if _ASR.search(classification):
-        hints.append("asr")
-        reasons.append("speech/audio cue")
     if _OBJECT.search(classification):
         hints.append("objects")
         reasons.append("object cue")
 
     if requested != "auto":
-        resolved = requested
-        source = "explicit"
+        resolved, source = requested, "explicit"
         reasons.append(f"explicit profile: {resolved}")
     elif len(events) > 1:
-        resolved = "temporal"
-        source = "inferred"
+        resolved, source = "temporal", "inferred"
         reasons.append("ordered temporal event chain")
     elif _QUESTION.search(classification):
-        resolved = "qa"
-        source = "inferred"
+        resolved, source = "qa", "inferred"
         reasons.append("question/evidence query")
     elif _AVS.search(classification):
-        resolved = "avs"
-        source = "inferred"
+        resolved, source = "avs", "inferred"
         reasons.append("broad multi-result query")
     else:
-        resolved = "kis"
-        source = "default"
+        resolved, source = "kis", "default"
         reasons.append("default exact-instance search")
 
     expansion_terms = _expand(normalized)
@@ -161,7 +141,6 @@ def build_query_plan(query: str, profile: str = "auto") -> QueryPlan:
         ("caption", retrieval_query),
         ("objects", retrieval_query),
         ("ocr", quoted_query if quoted_query and "ocr" in hints else retrieval_query),
-        ("asr", quoted_query if quoted_query and "asr" in hints else retrieval_query),
     )
     return QueryPlan(
         original_query=original,

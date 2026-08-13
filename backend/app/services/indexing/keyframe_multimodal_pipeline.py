@@ -6,7 +6,7 @@ responsible for atomically publishing the returned final artifacts.
 
 The pipeline is fail-closed by default.  Every dense candidate must have an
 aligned SigLIP embedding and a successful OCR and object record before hard
-events are derived.  Caption and ASR data are optional soft signals.
+events are derived. Caption data is an optional soft signal.
 """
 
 from __future__ import annotations
@@ -105,7 +105,6 @@ class MultimodalKeyframePipelineResult:
     final_ocr_records: tuple[dict[str, Any], ...]
     final_object_records: tuple[dict[str, Any], ...]
     final_caption_records: tuple[dict[str, Any], ...]
-    final_asr_records: tuple[dict[str, Any], ...]
     candidate_ledger: tuple[dict[str, Any], ...]
     event_ledger: tuple[dict[str, Any], ...]
     feature_adapter_result: FeatureAdapterResult
@@ -155,7 +154,6 @@ def run_multimodal_keyframe_pipeline(
     ocr_records: Iterable[Mapping[str, Any]],
     object_records: Iterable[Mapping[str, Any]],
     caption_records: Iterable[Mapping[str, Any]] = (),
-    asr_records: Iterable[Mapping[str, Any]] = (),
     video_duration: float,
     selection_config: SelectionConfig,
     adapter_config: FeatureAdapterConfig | None = None,
@@ -211,13 +209,11 @@ def run_multimodal_keyframe_pipeline(
         _require_complete_success("OCR", identities, ocr_by_id)
         _require_complete_success("object", identities, object_by_id)
 
-    canonical_asr = _normalize_asr_records(asr_records, video_id=video_id)
     adapter_result = adapt_feature_records(
         candidate_records,
         ocr_records=tuple(ocr_by_id.values()),
         object_records=tuple(object_by_id.values()),
         caption_records=tuple(caption_by_id.values()),
-        asr_records=canonical_asr,
         embeddings=matrix,
         embedding_records=embedding_metadata,
         config=adapter_config,
@@ -324,7 +320,6 @@ def run_multimodal_keyframe_pipeline(
         final_ocr_records=final_ocr,
         final_object_records=final_objects,
         final_caption_records=final_captions,
-        final_asr_records=canonical_asr,
         candidate_ledger=candidate_ledger,
         event_ledger=event_ledger,
         feature_adapter_result=adapter_result,
@@ -652,33 +647,6 @@ def _require_complete_success(
             f"{label} features are incomplete: "
             f"missing={missing}; unsuccessful={unsuccessful}"
         )
-
-
-def _normalize_asr_records(
-    records: Iterable[Mapping[str, Any]],
-    *,
-    video_id: str,
-) -> tuple[dict[str, Any], ...]:
-    values: list[dict[str, Any]] = []
-    for position, raw_record in enumerate(records):
-        if not isinstance(raw_record, Mapping):
-            raise TypeError(f"asr_records[{position}] must be a mapping")
-        record = dict(raw_record)
-        _validate_record_video(record, video_id, f"asr_records[{position}]")
-        _record_status(record, f"asr_records[{position}]")
-        values.append(record)
-    return tuple(
-        sorted(
-            values,
-            key=lambda record: json.dumps(
-                record,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ),
-        )
-    )
 
 
 def _independent_temporal_gaps(

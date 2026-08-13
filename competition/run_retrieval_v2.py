@@ -77,15 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-gap-seconds", type=float, default=2.0)
     parser.add_argument("--target-density-per-second", type=float, default=0.5)
     parser.add_argument("--dedup-similarity-threshold", type=float, default=0.92)
-    parser.add_argument("--asr-protection-threshold", type=float, default=0.80)
     parser.add_argument(
         "--endpoint-protection",
         choices=("on", "off"),
         default="on",
     )
-    parser.add_argument("--asr-timeout-seconds", type=float, default=90.0)
-    parser.add_argument("--asr-cpu-timeout-seconds", type=float, default=600.0)
-    parser.add_argument("--asr-retries", type=int, default=1)
     parser.add_argument("--neighbor-window-seconds", type=float, default=5.0)
     parser.add_argument("--model-cache-root", type=Path, default=None)
     parser.add_argument("--offline-model-cache", action="store_true")
@@ -170,16 +166,8 @@ def build_stage_commands(
         str(args.target_density_per_second),
         "--dedup-similarity-threshold",
         str(args.dedup_similarity_threshold),
-        "--asr-protection-threshold",
-        str(args.asr_protection_threshold),
         "--endpoint-protection",
         args.endpoint_protection,
-        "--asr-timeout-seconds",
-        str(args.asr_timeout_seconds),
-        "--asr-cpu-timeout-seconds",
-        str(args.asr_cpu_timeout_seconds),
-        "--asr-retries",
-        str(args.asr_retries),
         "--model-cache-dir",
         str(model_cache_dir),
         "--model-cache-root",
@@ -303,20 +291,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         "candidate interval": args.candidate_interval_sec,
         "max gap": args.max_gap_seconds,
         "target density": args.target_density_per_second,
-        "ASR timeout": args.asr_timeout_seconds,
-        "ASR CPU timeout": args.asr_cpu_timeout_seconds,
         "CSES temporal window": args.cses_temporal_window_seconds,
         "VLM timeout": args.vlm_timeout_seconds,
     }
     invalid = [name for name, value in positive.items() if value <= 0]
     if invalid:
         raise ValueError("values must be positive: " + ", ".join(invalid))
-    if args.num_workers < 0 or args.asr_retries < 0 or args.native_retries < 0:
+    if args.num_workers < 0 or args.native_retries < 0:
         raise ValueError("workers and retry counts must be non-negative")
     if not 0.0 <= args.dedup_similarity_threshold <= 1.0:
         raise ValueError("dedup similarity threshold must be within [0, 1]")
-    if not 0.0 <= args.asr_protection_threshold <= 1.0:
-        raise ValueError("ASR protection threshold must be within [0, 1]")
     if args.search_depth < 100:
         raise ValueError("search depth must be at least 100")
     counts = (
@@ -481,7 +465,6 @@ def run(args: argparse.Namespace) -> Path:
             "max_gap_seconds": args.max_gap_seconds,
             "target_density_per_second": args.target_density_per_second,
             "dedup_similarity_threshold": args.dedup_similarity_threshold,
-            "asr_protection_threshold": args.asr_protection_threshold,
             "endpoint_protection": args.endpoint_protection == "on",
         }
         manifest = initialize_run_manifest(

@@ -113,6 +113,8 @@ def processing_fields(
     pipeline: str,
     model_name: str,
     model_version: str,
+    model_revision: str | None = None,
+    requested_model_revision: str | None = None,
     status: str,
     run_at: str,
     error: str | None = None,
@@ -126,6 +128,10 @@ def processing_fields(
         "run_at": run_at,
         "status": status,
     }
+    if model_revision:
+        value["model_revision"] = model_revision
+    if requested_model_revision:
+        value["requested_model_revision"] = requested_model_revision
     if error:
         value["error"] = error
     if skip_reason:
@@ -142,6 +148,42 @@ def existing_ids(output_path: Path, key: str) -> set[str]:
         if value is not None:
             ids.add(str(value))
     return ids
+
+
+def resumable_ids(
+    output_path: Path,
+    key: str,
+    *,
+    model_name: str,
+    model_revision: str | None = None,
+    requested_model_revision: str | None = None,
+) -> tuple[set[str], bool]:
+    """Return compatible IDs and whether an existing artifact must be replaced.
+
+    A model or explicitly requested revision change invalidates the complete
+    modality artifact. Unrelated historical files are never touched.
+    """
+    if not output_path.exists():
+        return set(), False
+    records = read_jsonl(output_path)
+    incompatible = False
+    ids: set[str] = set()
+    for record in records:
+        value = record.get(key)
+        if value is None:
+            continue
+        compatible = record.get("model_name") == model_name
+        if requested_model_revision is not None:
+            compatible = compatible and (
+                record.get("requested_model_revision") == requested_model_revision
+            )
+        elif model_revision is not None:
+            compatible = compatible and record.get("model_revision") == model_revision
+        if compatible:
+            ids.add(str(value))
+        else:
+            incompatible = True
+    return (set(), True) if incompatible else (ids, False)
 
 
 def resolve_image_path(record: dict[str, Any], metadata_path: Path) -> Path:
@@ -211,6 +253,7 @@ def report(
     output_path: Path,
     model_name: str,
     model_version: str,
+    model_revision: str | None = None,
     device: str,
     started_at: str,
     elapsed: float,
@@ -220,7 +263,7 @@ def report(
     error_count: int,
 ) -> dict[str, Any]:
     processed = success_count + error_count
-    return {
+    value = {
         "schema_version": SCHEMA_VERSION,
         "pipeline": pipeline,
         "started_at": started_at,
@@ -237,6 +280,9 @@ def report(
         "input_path": str(input_path),
         "output_path": str(output_path),
     }
+    if model_revision:
+        value["model_revision"] = model_revision
+    return value
 
 
 def json_log(service: str, event: str, *, latency: float = 0.0, **extra: Any) -> None:

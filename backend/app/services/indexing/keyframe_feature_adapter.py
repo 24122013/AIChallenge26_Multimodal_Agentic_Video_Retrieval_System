@@ -27,7 +27,7 @@ from .keyframe_candidates import KeyframeCandidate
 from .keyframe_selection import ProtectedEvent, SelectionCandidate
 
 
-COMPONENT_ORDER = ("ocr", "objects", "transition", "caption", "asr")
+COMPONENT_ORDER = ("ocr", "objects", "transition", "caption")
 _NON_WORD = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _WHITESPACE = re.compile(r"\s+")
 
@@ -95,13 +95,10 @@ class FeatureAdapterConfig:
     object_weight: float = 0.25
     transition_weight: float = 0.35
     caption_weight: float = 0.05
-    asr_weight: float = 0.10
-    asr_event_min_quality: float = 0.80
 
     ocr_event_priority: int = 2
     object_event_priority: int = 1
     transition_event_priority: int = 3
-    asr_event_priority: int = 2
 
     def __post_init__(self) -> None:
         probability_fields = (
@@ -121,7 +118,6 @@ class FeatureAdapterConfig:
             "object_extreme_min_area_ratio",
             "object_rare_frame_fraction",
             "transition_absolute_floor",
-            "asr_event_min_quality",
         )
         for name in probability_fields:
             object.__setattr__(self, name, _unit_interval(getattr(self, name), name))
@@ -158,7 +154,6 @@ class FeatureAdapterConfig:
             "ocr_event_priority",
             "object_event_priority",
             "transition_event_priority",
-            "asr_event_priority",
         )
         for name in count_fields:
             value = _non_negative_int(getattr(self, name), name)
@@ -176,7 +171,6 @@ class FeatureAdapterConfig:
             "object_weight",
             "transition_weight",
             "caption_weight",
-            "asr_weight",
         )
         weights = []
         for name in weight_fields:
@@ -214,7 +208,6 @@ class FeatureAdapterReport:
     modality_available_counts: tuple[tuple[str, int], ...]
     ocr_event_count: int
     object_event_count: int
-    asr_event_count: int
     transition_boundary_count: int
     suppressed_ocr_common_tracks: int
     suppressed_ocr_subtitle_observations: int
@@ -230,7 +223,6 @@ class FeatureAdapterReport:
             "modality_available_counts": dict(self.modality_available_counts),
             "ocr_event_count": self.ocr_event_count,
             "object_event_count": self.object_event_count,
-            "asr_event_count": self.asr_event_count,
             "transition_boundary_count": self.transition_boundary_count,
             "suppressed_ocr_common_tracks": self.suppressed_ocr_common_tracks,
             "suppressed_ocr_subtitle_observations": (
@@ -296,7 +288,6 @@ def adapt_feature_records(
     ocr_records: Iterable[Mapping[str, Any]] = (),
     object_records: Iterable[Mapping[str, Any]] = (),
     caption_records: Iterable[Mapping[str, Any]] = (),
-    asr_records: Iterable[Mapping[str, Any]] = (),
     embeddings: np.ndarray | None = None,
     embedding_records: Iterable[Mapping[str, Any]] = (),
     config: FeatureAdapterConfig | None = None,
@@ -357,14 +348,6 @@ def adapt_feature_records(
         config,
     )
     _adapt_captions(base, caption_index, component_scores, availability)
-    asr_events, _asr_stats = _adapt_asr(
-        base,
-        tuple(asr_records),
-        alias_to_id,
-        component_scores,
-        availability,
-        config,
-    )
     transition_events, transition_stats = _adapt_transitions(
         base,
         embedding_by_id,
@@ -375,7 +358,7 @@ def adapt_feature_records(
 
     events = tuple(
         sorted(
-            (*ocr_events, *object_events, *asr_events, *transition_events),
+            (*ocr_events, *object_events, *transition_events),
             key=lambda event: (-event.priority, event.event_type, event.event_id),
         )
     )
@@ -389,7 +372,6 @@ def adapt_feature_records(
         "objects": config.object_weight,
         "transition": config.transition_weight,
         "caption": config.caption_weight,
-        "asr": config.asr_weight,
     }
     selection_candidates: list[SelectionCandidate] = []
     score_records: list[CandidateComponentScore] = []
@@ -449,7 +431,6 @@ def adapt_feature_records(
         modality_available_counts=available_counts,
         ocr_event_count=len(ocr_events),
         object_event_count=len(object_events),
-        asr_event_count=len(asr_events),
         transition_boundary_count=transition_stats["boundary_count"],
         suppressed_ocr_common_tracks=ocr_stats["common_tracks"],
         suppressed_ocr_subtitle_observations=ocr_stats["subtitle_observations"],
@@ -1073,160 +1054,6 @@ def _adapt_captions(
         scores[candidate.candidate_id]["caption"] = _clamp01(score)
         if tokens:
             previous_tokens = tokens
-
-
-def _adapt_asr(
-    base: Sequence[_BaseCandidate],
-    records: Sequence[Mapping[str, Any]],
-    alias_to_id: Mapping[str, str],
-    scores: dict[str, dict[str, float]],
-    availability: dict[str, set[str]],
-    config: FeatureAdapterConfig,
-) -> tuple[tuple[ProtectedEvent, ...], dict[str, int]]:
-    if not records:
-        return (), {"repeated_episodes": 0, "weak_episodes": 0}
-    video_id = base[0].video_id if base else ""
-    by_id = {candidate.candidate_id: candidate for candidate in base}
-    successful_global = False
-    direct_scores: dict[str, float] = defaultdict(float)
-    timeline: list[tuple[float, float, float]] = []
-    episode_candidates: list[tuple[float, float, float, str, tuple[str, ...]]] = []
-    for position, record in enumerate(records):
-        if not isinstance(record, Mapping):
-            raise TypeError(f"asr_records[{position}] must be a mapping")
-        _validate_record_video(record, video_id, f"asr_records[{position}]")
-        status = _record_status(record, f"asr_records[{position}]")
-        if status != "success":
-            continue
-        raw_ids: list[str] = []
-        direct_id = record.get("candidate_id") or record.get("frame_id")
-        if direct_id is not None:
-            raw_ids.append(
-                _resolve_record_candidate_id(
-                    record,
-                    alias_to_id,
-                    f"asr_records[{position}]",
-                )
-            )
-        frame_ids = record.get("frame_ids")
-        if frame_ids is not None:
-            if isinstance(frame_ids, (str, bytes)) or not isinstance(frame_ids, Sequence):
-                raise TypeError("ASR frame_ids must be a sequence")
-            for raw_id in frame_ids:
-                if not isinstance(raw_id, str) or raw_id not in alias_to_id:
-                    raise ValueError(f"ASR record references unknown candidate: {raw_id!r}")
-                raw_ids.append(alias_to_id[raw_id])
-
-        nested = record.get("transcript_segments")
-        segment_records: Sequence[Mapping[str, Any]]
-        if nested is not None:
-            if not isinstance(nested, list) or any(
-                not isinstance(item, Mapping) for item in nested
-            ):
-                raise TypeError("ASR transcript_segments must be a list of mappings")
-            segment_records = nested
-        else:
-            segment_records = (record,)
-        local_scores = [_asr_segment_score(item) for item in segment_records]
-        record_score = max((item[2] for item in local_scores), default=0.0)
-        for candidate_id in raw_ids:
-            direct_scores[candidate_id] = max(direct_scores[candidate_id], record_score)
-            availability[candidate_id].add("asr")
-        if not raw_ids:
-            successful_global = True
-            timeline.extend(local_scores)
-        for segment, (start, end, quality) in zip(segment_records, local_scores):
-            text = _comparison_text(segment.get("text") or segment.get("transcript_text"))
-            episode_candidates.append(
-                (start, end, quality, text, tuple(dict.fromkeys(raw_ids)))
-            )
-
-    if successful_global:
-        for candidate in base:
-            availability[candidate.candidate_id].add("asr")
-            matching = [
-                score
-                for start, end, score in timeline
-                if start <= candidate.timestamp < end
-            ]
-            if matching:
-                scores[candidate.candidate_id]["asr"] = max(matching)
-    for candidate_id, score in direct_scores.items():
-        if candidate_id not in by_id:
-            raise ValueError(f"ASR record references unknown candidate: {candidate_id}")
-        scores[candidate_id]["asr"] = max(scores[candidate_id]["asr"], score)
-
-    events: list[ProtectedEvent] = []
-    seen_text: set[str] = set()
-    repeated = 0
-    weak = 0
-    for start, end, quality, text, direct_ids in sorted(
-        episode_candidates,
-        key=lambda item: (item[0], item[1], item[3]),
-    ):
-        if not text or quality < config.asr_event_min_quality:
-            weak += 1
-            continue
-        if text in seen_text:
-            repeated += 1
-            continue
-        seen_text.add(text)
-        candidate_ids = list(direct_ids)
-        if not candidate_ids:
-            candidate_ids = [
-                candidate.candidate_id
-                for candidate in base
-                if start <= candidate.timestamp < end
-            ]
-        if not candidate_ids and base:
-            midpoint = (start + end) / 2.0
-            candidate_ids = [
-                min(
-                    base,
-                    key=lambda candidate: (
-                        abs(candidate.timestamp - midpoint),
-                        candidate.frame_index,
-                        candidate.candidate_id,
-                    ),
-                ).candidate_id
-            ]
-        if not candidate_ids:
-            continue
-        anchor = by_id[candidate_ids[0]]
-        events.append(
-            ProtectedEvent(
-                event_id=_event_id("ASR", video_id, text, anchor.frame_index),
-                event_type="asr_high_quality",
-                candidate_ids=tuple(candidate_ids),
-                priority=config.asr_event_priority,
-            )
-        )
-    return tuple(events), {"repeated_episodes": repeated, "weak_episodes": weak}
-
-
-def _asr_segment_score(record: Mapping[str, Any]) -> tuple[float, float, float]:
-    raw_start = record.get("start", record.get("start_time", 0.0))
-    raw_end = record.get("end", record.get("end_time", raw_start))
-    start = _finite_real(raw_start, "ASR start")
-    end = _finite_real(raw_end, "ASR end")
-    if start < 0 or end < start:
-        raise ValueError("ASR interval must satisfy 0 <= start <= end")
-    if record.get("confidence") is not None:
-        confidence = _unit_interval(record.get("confidence"), "ASR confidence")
-    elif record.get("avg_logprob") is not None:
-        confidence = _clamp01(math.exp(_finite_real(record.get("avg_logprob"), "avg_logprob")))
-    else:
-        confidence = 0.5
-    no_speech = _unit_interval(
-        record.get("no_speech_probability", 0.0),
-        "ASR no_speech_probability",
-    )
-    text = _comparison_text(record.get("text") or record.get("transcript_text"))
-    if not text:
-        return start, end, 0.0
-    length_score = min(1.0, _alnum_count(text) / 20.0)
-    quality = _clamp01(confidence * (1.0 - no_speech) * (0.5 + 0.5 * length_score))
-    return start, end, quality
 
 
 def _adapt_transitions(

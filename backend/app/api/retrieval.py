@@ -6,7 +6,6 @@ even when the web dependency has not been installed yet.
 from __future__ import annotations
 
 from backend.app.services.retrieval.retrieval_manager import (
-    search_asr,
     search_caption,
     search_hybrid,
     search_object,
@@ -48,10 +47,6 @@ if APIRouter is not None:
     @router.post("/ocr")
     def ocr_search_endpoint(body: VisualSearchBody) -> dict:
         return _response(lambda: search_ocr(body.query, body.top_k).to_dict())
-
-    @router.post("/asr")
-    def asr_search_endpoint(body: VisualSearchBody) -> dict:
-        return _response(lambda: search_asr(body.query, body.top_k).to_dict())
 
     @router.post("/object")
     def object_search_endpoint(body: VisualSearchBody) -> dict:
@@ -108,10 +103,6 @@ def caption_search(query: str, top_k: int = 20) -> dict:
 
 def ocr_search(query: str, top_k: int = 20) -> dict:
     return search_ocr(query=query, top_k=top_k).to_dict()
-
-
-def asr_search(query: str, top_k: int = 20) -> dict:
-    return search_asr(query=query, top_k=top_k).to_dict()
 
 
 def object_search(query: str, top_k: int = 20) -> dict:

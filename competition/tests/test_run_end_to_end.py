@@ -58,18 +58,6 @@ class EndToEndRunnerTest(unittest.TestCase):
             keyframes[keyframes.index("--max-gap-seconds") + 1],
             "2.0",
         )
-        self.assertEqual(
-            keyframes[keyframes.index("--asr-timeout-seconds") + 1],
-            "90.0",
-        )
-        self.assertEqual(
-            keyframes[keyframes.index("--asr-cpu-timeout-seconds") + 1],
-            "600.0",
-        )
-        self.assertEqual(
-            keyframes[keyframes.index("--asr-retries") + 1],
-            "1",
-        )
         submission = str((self.root / "artifacts" / "results" / "submission.csv").resolve())
         self.assertIn(submission, commands["predict"])
         self.assertIn(submission, commands["validate-submission"])

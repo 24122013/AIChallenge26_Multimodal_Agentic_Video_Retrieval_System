@@ -241,7 +241,6 @@ def _event_quality(query: str, candidate: RetrievalResult) -> float:
     metadata_texts = [
         candidate.caption,
         candidate.ocr_text,
-        candidate.asr_text,
         " ".join(candidate.objects),
     ]
     populated = [text for text in metadata_texts if str(text).strip()]

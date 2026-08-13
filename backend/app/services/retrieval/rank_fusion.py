@@ -10,11 +10,10 @@ from backend.app.services.retrieval.query_plan import QueryPlan
 
 
 DEFAULT_RRF_WEIGHTS: dict[str, float] = {
-    "visual": 0.50,
-    "caption": 0.15,
+    "visual": 0.55,
+    "caption": 0.20,
     "ocr": 0.10,
-    "asr": 0.15,
-    "objects": 0.05,
+    "objects": 0.10,
 }
 
 

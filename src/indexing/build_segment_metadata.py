@@ -191,12 +191,6 @@ def _load_artifacts(
         return []
     if path.is_dir():
         candidates = sorted(path.glob(f"{filename_prefix}_*.jsonl"))
-        if filename_prefix == "asr":
-            candidates = [
-                candidate
-                for candidate in candidates
-                if not candidate.name.startswith("asr_segments_")
-            ]
         if not candidates:
             raise FileNotFoundError(
                 f"No {filename_prefix}_*.jsonl artifacts found in: {path}"
@@ -454,84 +448,6 @@ def aggregate_ocr(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
-def aggregate_asr(
-    records: Iterable[dict[str, Any]],
-    *,
-    segment_start: float,
-    segment_end: float,
-) -> list[dict[str, Any]]:
-    """Select overlapping ASR chunks and merge duplicate overlap chunks."""
-    prepared: list[tuple[float, float, str, str, dict[str, Any]]] = []
-    for ordinal, record in enumerate(records):
-        if record.get("status") not in {None, "success"}:
-            continue
-        text = normalize_text(record.get("text") or record.get("transcript_text"))
-        if not text:
-            continue
-        raw_start = record.get("start", record.get("start_time"))
-        raw_end = record.get("end", record.get("end_time"))
-        if raw_start is None or raw_end is None:
-            continue
-        start = _finite_non_negative(raw_start, "ASR start")
-        end = _finite_non_negative(raw_end, "ASR end")
-        if start > end:
-            raise ValueError(f"ASR start is after end: {start} > {end}")
-        if end <= segment_start or start >= segment_end:
-            continue
-        source_id = _source_id(
-            record,
-            preferred=("transcript_segment_id", "asr_id"),
-            fallback_prefix="ASR",
-            ordinal=ordinal,
-        )
-        prepared.append((start, end, source_id, text, record))
-    prepared.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
-    output: list[dict[str, Any]] = []
-    for start, end, source_id, text, record in prepared:
-        key = comparison_text(text)
-        duplicate = next(
-            (
-                value
-                for value in output
-                if value["_key"] == key
-                and end > value["start_time"]
-                and start < value["end_time"]
-            ),
-            None,
-        )
-        interval = {"start_time": start, "end_time": end, "source_id": source_id}
-        if duplicate is not None:
-            duplicate["start_time"] = min(duplicate["start_time"], start)
-            duplicate["end_time"] = max(duplicate["end_time"], end)
-            if interval not in duplicate["source_intervals"]:
-                duplicate["source_intervals"].append(interval)
-            if source_id not in duplicate["source_ids"]:
-                duplicate["source_ids"].append(source_id)
-            continue
-        value: dict[str, Any] = {
-            "_key": key,
-            "text": text,
-            "start_time": start,
-            "end_time": end,
-            "source_ids": [source_id],
-            "source_intervals": [interval],
-        }
-        if record.get("language") is not None:
-            value["language"] = record["language"]
-        output.append(value)
-    for value in output:
-        value.pop("_key")
-        value["source_ids"].sort()
-        value["source_intervals"].sort(
-            key=lambda item: (
-                item["start_time"],
-                item["end_time"],
-                item["source_id"],
-            )
-        )
-    return output
-
-
 def aggregate_objects(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Aggregate normalized labels without claiming detections are unique objects."""
     grouped: dict[str, dict[str, Any]] = {}
@@ -664,7 +580,6 @@ def build_segment_records(
     *,
     captions: Sequence[dict[str, Any]] = (),
     ocr: Sequence[dict[str, Any]] = (),
-    asr: Sequence[dict[str, Any]] = (),
     objects: Sequence[dict[str, Any]] = (),
     caption_similarity_threshold: float = 0.92,
 ) -> list[dict[str, Any]]:
@@ -673,11 +588,6 @@ def build_segment_records(
     caption_index = ArtifactIndex.build(captions)
     ocr_index = ArtifactIndex.build(ocr)
     object_index = ArtifactIndex.build(objects)
-    asr_by_video: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for record in asr:
-        video_id = str(record.get("video_id") or "")
-        asr_by_video[video_id].append(record)
-
     for segment in segments:
         ordered = segment.ordered_keyframes()
         frame_ids = {item.frame_id for item in ordered}
@@ -731,11 +641,6 @@ def build_segment_records(
             "captions_aggregated": caption_text,
             "caption_source_ids": caption_source_ids,
             "ocr": aggregate_ocr(ocr_records),
-            "asr": aggregate_asr(
-                asr_by_video.get(segment.video_id, []),
-                segment_start=start_time,
-                segment_end=end_time,
-            ),
             "objects": aggregate_objects(object_records),
         }
         if first.frame_index is not None:
@@ -752,7 +657,6 @@ def build_segment_metadata(
     *,
     captions_path: Path | None = None,
     ocr_path: Path | None = None,
-    asr_path: Path | None = None,
     objects_path: Path | None = None,
     strategy: str = "auto",
     fixed_duration_seconds: float = 10.0,
@@ -766,7 +670,6 @@ def build_segment_metadata(
             input_path,
             captions_path,
             ocr_path,
-            asr_path,
             objects_path,
         )
         if path is not None and path.is_file()
@@ -783,7 +686,6 @@ def build_segment_metadata(
         segments,
         captions=_load_artifacts(captions_path, filename_prefix="captions"),
         ocr=_load_artifacts(ocr_path, filename_prefix="ocr"),
-        asr=_load_artifacts(asr_path, filename_prefix="asr"),
         objects=_load_artifacts(objects_path, filename_prefix="objects"),
         caption_similarity_threshold=caption_similarity_threshold,
     )
@@ -806,7 +708,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True, help="Segment .jsonl or .json")
     parser.add_argument("--captions", type=Path)
     parser.add_argument("--ocr", type=Path)
-    parser.add_argument("--asr", type=Path)
     parser.add_argument("--objects", type=Path)
     parser.add_argument(
         "--strategy",
@@ -827,7 +728,6 @@ def main() -> None:
             args.output,
             captions_path=args.captions,
             ocr_path=args.ocr,
-            asr_path=args.asr,
             objects_path=args.objects,
             strategy=args.strategy,
             fixed_duration_seconds=args.fixed_duration_seconds,

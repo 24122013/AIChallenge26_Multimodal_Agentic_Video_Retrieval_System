@@ -73,9 +73,6 @@ class Phase3WorkspacePaths:
     ocr_report: Path
     objects: Path
     object_report: Path
-    asr: Path
-    asr_segments: Path
-    asr_report: Path
     feature_manifest: Path
     candidate_scores: Path
     protected_events: Path
@@ -264,9 +261,6 @@ def workspace_paths(
         ocr_report=root / "ocr_report.json",
         objects=root / "objects.jsonl",
         object_report=root / "objects_report.json",
-        asr=root / "asr.jsonl",
-        asr_segments=root / "asr_segments.jsonl",
-        asr_report=root / "asr_report.json",
         feature_manifest=root / "feature_manifest.json",
         candidate_scores=root / "candidate_scores.jsonl",
         protected_events=root / "protected_events.jsonl",

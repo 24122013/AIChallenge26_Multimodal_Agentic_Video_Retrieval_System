@@ -5,7 +5,7 @@ Owner: P4 Retrieval
 Implemented scope:
 
 - Phase 1: SigLIP2 visual text-to-keyframe retrieval.
-- Phase 2: lexical caption, OCR, ASR and object retrieval.
+- Phase 2: lexical caption, OCR and object retrieval.
 - Phase 3: hybrid candidate merge/rerank and ordered temporal retrieval.
 
 Phase 2 and multimodal Phase 3 require a generated Retrieval text index. Hybrid
@@ -45,7 +45,6 @@ Output:
       "thumbnail_path": "data/keyframes/L01_V001/000001.jpg",
       "caption": "",
       "ocr_text": "",
-      "asr_text": "",
       "objects": [],
       "modality_scores": {
         "visual": 0.92
@@ -94,7 +93,7 @@ fill `top_k`.
 
 ## Multimodal and Hybrid Search
 
-Build the lexical text index after Metadata has generated caption, OCR, ASR,
+Build the lexical text index after Metadata has generated caption, OCR,
 object or `segments_*.jsonl` artifacts:
 
 ```powershell
@@ -106,7 +105,7 @@ object or `segments_*.jsonl` artifacts:
 Supported modes in `backend.app.api.search.search`:
 
 - `visual`: SigLIP2 query embedding against FAISS.
-- `caption`, `ocr`, `asr`, `object`: one lexical metadata modality.
+- `caption`, `ocr`, `object`: one lexical metadata modality.
 - `hybrid`: visual and available text candidates, deduplicated and reranked.
 - `temporal`: ordered subqueries in the same video with a configurable time gap.
 

@@ -79,7 +79,7 @@ def advanced_text_search(
             expansions=(),
             modality_queries=tuple(
                 (modality, plan.original_query)
-                for modality in ("visual", "caption", "ocr", "asr", "objects")
+                for modality in ("visual", "caption", "ocr", "objects")
             ),
             reasons=("query planning disabled by ablation",),
         )

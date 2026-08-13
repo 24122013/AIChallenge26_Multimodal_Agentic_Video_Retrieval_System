@@ -80,7 +80,6 @@ def _combine(left: RetrievalResult, right: RetrievalResult) -> RetrievalResult:
         score=round(max(left.score, right.score), 6),
         caption=primary.caption or secondary.caption,
         ocr_text=primary.ocr_text or secondary.ocr_text,
-        asr_text=primary.asr_text or secondary.asr_text,
         objects=_unique([*primary.objects, *secondary.objects]),
         modality_scores=modality_scores,
         neighbors=_merge_neighbors(primary.neighbors, secondary.neighbors),

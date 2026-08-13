@@ -198,12 +198,12 @@ query bằng OpenCLIP rồi search trong index SigLIP2.
 
 ## Metadata ngoài Phase 2
 
-Caption, OCR, ASR và objects giữ schema hiện tại và không được tạo trong Phase
+Caption, OCR và objects giữ schema hiện tại và không được tạo trong Phase
 2. Các pipeline OpenCLIP/artifact cũ cũng không bị xóa hoặc overwrite.
 
 ## Multimodal ingestion metadata v1.0
 
-Caption, OCR, object detection và ASR là các JSONL độc lập. Chúng không sửa
+Caption, OCR và object detection là các JSONL độc lập. Chúng không sửa
 `keyframes_<video_id>.jsonl`, embedding, FAISS index hoặc frame map. Mọi record
 keyframe giữ nguyên giá trị của các khóa nhận dạng:
 
@@ -215,7 +215,7 @@ Các field provenance chung gồm:
 ```json
 {
   "schema_version": "1.0",
-  "pipeline": "caption|ocr|objects|asr|asr_segment_mapping",
+  "pipeline": "caption|ocr|objects",
   "model_name": "checkpoint-or-backend",
   "model_version": "installed-package-version",
   "run_at": "2026-07-25T12:00:00+00:00",
@@ -242,11 +242,22 @@ File: `captions_<video_id>.jsonl`.
   "source_video_path": "data/raw/video/L27_V001.mp4",
   "schema_version": "1.0",
   "pipeline": "caption",
-  "model_name": "Salesforce/blip-image-captioning-base",
-  "model_version": "4.x",
+  "model_name": "Qwen/Qwen3.5-9B",
+  "model_version": "5.x",
   "run_at": "2026-07-25T12:00:00+00:00",
   "status": "success",
   "caption": "two people standing beside a red car on a street",
+  "structured_caption": {
+    "scene": "street",
+    "people": [{"type": "people", "attributes": []}],
+    "objects": ["red car"],
+    "actions": ["standing"],
+    "relationships": ["people beside car"],
+    "colors": ["red"],
+    "visible_text": [],
+    "caption": "two people standing beside a red car on a street"
+  },
+  "caption_parse_status": "success",
   "caption_language": "en",
   "segment_caption": "Two people standing beside a red car on a street."
 }
@@ -265,9 +276,13 @@ File: `ocr_<video_id>.jsonl`.
   "video_id": "L27_V001",
   "status": "success",
   "ocr_text": "THÀNH PHỐ HỒ CHÍ MINH",
+  "ocr_text_normalized": "THÀNH PHỐ HỒ CHÍ MINH",
+  "ocr_text_unaccented": "THANH PHO HO CHI MINH",
   "text_regions": [
     {
       "text": "THÀNH PHỐ HỒ CHÍ MINH",
+      "normalized_text": "THÀNH PHỐ HỒ CHÍ MINH",
+      "unaccented_text": "THANH PHO HO CHI MINH",
       "polygon": [[10.0, 20.0], [300.0, 20.0], [300.0, 60.0], [10.0, 60.0]],
       "confidence": 0.94
     }
@@ -300,55 +315,18 @@ File: `objects_<video_id>.jsonl`. `bbox_xyxy` dùng pixel và `image_size` có d
     }
   ],
   "object_classes": ["person"],
+  "object_counts": {"person": 1},
   "class_counts": {"person": 1},
   "image_size": [640, 360],
   "confidence_threshold": 0.25,
-  "iou_threshold": 0.7
+  "iou_threshold": 0.7,
+  "open_vocabulary_mode": "text",
+  "vocabulary": ["person", "car"],
+  "evidence_only": true
 }
 ```
 
 Frame không có object vẫn là record thành công với ba collection rỗng.
-
-### ASR timeline và mapping
-
-`asr_<video_id>.jsonl` lưu timeline:
-
-```json
-{
-  "video_id": "L27_V001",
-  "source_video_path": "data/raw/video/L27_V001.mp4",
-  "transcript_segment_id": "ASR_L27_V001_000000",
-  "status": "success",
-  "start": 1.2,
-  "end": 3.8,
-  "text": "Xin chào các bạn",
-  "language": "vi",
-  "confidence": 0.91,
-  "avg_logprob": -0.09,
-  "no_speech_probability": 0.01
-}
-```
-
-Video không có audio sinh một record `status: "skipped"` với
-`skip_reason: "no_audio_stream"`. `asr_segments_<video_id>.jsonl` nhóm keyframe
-theo `segment_id` (fallback `shot_id`) và chỉ gắn transcript có khoảng thời gian
-giao với `[segment_start, segment_end]`:
-
-```json
-{
-  "video_id": "L27_V001",
-  "segment_id": "SHOT_L27_V001_000001",
-  "shot_id": "SHOT_L27_V001_000001",
-  "frame_ids": ["FRAME_L27_V001_000001"],
-  "segment_start": 0.0,
-  "segment_end": 4.0,
-  "transcript_text": "Xin chào các bạn",
-  "transcript_segments": [
-    {"start": 1.2, "end": 3.8, "text": "Xin chào các bạn", "language": "vi"}
-  ],
-  "status": "success"
-}
-```
 
 Mỗi pipeline còn sinh `<artifact>_<video_id>_report.json` chứa tổng số
 success/skip/error, runtime, throughput, model, device và đường dẫn input/output.
