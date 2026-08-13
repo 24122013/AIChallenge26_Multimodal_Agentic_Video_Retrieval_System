@@ -531,3 +531,12 @@ QA evidence:
   backend.tests.test_retrieval_phase2 `
   backend.tests.test_retrieval_phase3
 ```
+
+## Public TKIS/VKIS competition
+
+Pipeline dành riêng cho `data/public/` (250 video, TKIS, VKIS và xuất submission
+100 đáp án/query) nằm tại [competition/README.md](competition/README.md). Adapter
+này tái sử dụng toàn bộ pipeline đã triển khai: SigLIP2/FAISS, caption, OCR,
+objects, ASR, segment/text index và hybrid reranking. Toàn bộ artifact sinh mới
+được ghi trong `competition/`; pipeline dữ liệu mặc định ở `data/` không bị thay
+đổi.

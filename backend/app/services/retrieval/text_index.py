@@ -292,6 +292,20 @@ def _document_from_record(
         "ocr_text": text_for_modality(record, "ocr"),
         "asr_text": text_for_modality(record, "asr"),
         "objects": _object_labels(record),
+        "candidate_id": str(record.get("candidate_id") or ""),
+        "keyframe_ids": [str(value) for value in record.get("keyframe_ids") or []],
+        "keyframe_selection": list(record.get("keyframe_selection") or []),
+        "selection_phase": str(record.get("selection_phase") or ""),
+        "selection_reasons": [
+            str(value) for value in record.get("selection_reasons") or []
+        ],
+        "covered_event_ids": [
+            str(value) for value in record.get("covered_event_ids") or []
+        ],
+        "protected": bool(record.get("protected")),
+        "coverage_added": bool(record.get("coverage_added")),
+        "importance_score": record.get("importance_score"),
+        "semantic_novelty": record.get("semantic_novelty"),
         "modality": modality,
         "text": text,
         "doc_len": doc_len,

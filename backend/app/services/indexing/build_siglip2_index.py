@@ -105,6 +105,8 @@ def load_siglip2_model_processor(
     model_revision: str | None,
     device: str,
     model_cache_dir: Path | None,
+    use_autocast: bool = True,
+    local_files_only: bool = False,
 ):
     try:
         from transformers import AutoModel, AutoProcessor
@@ -120,10 +122,25 @@ def load_siglip2_model_processor(
     if model_cache_dir:
         model_cache_dir.mkdir(parents=True, exist_ok=True)
         common_kwargs["cache_dir"] = model_cache_dir.as_posix()
+    if local_files_only:
+        common_kwargs["local_files_only"] = True
 
-    model = AutoModel.from_pretrained(model_name, **common_kwargs)
+    model_kwargs = dict(common_kwargs)
+    compute_dtype = compute_dtype_for(device, use_autocast)
+    if device.startswith("cuda") and compute_dtype != torch.float32:
+        # Loading directly in the inference dtype avoids first materializing a
+        # ~4 GiB FP32 model on a 6 GiB GPU before autocast can take effect.
+        model_kwargs["dtype"] = compute_dtype
+    model = AutoModel.from_pretrained(model_name, **model_kwargs)
     processor = AutoProcessor.from_pretrained(model_name, **common_kwargs)
-    model.to(device)
+    try:
+        model.to(device)
+    except BaseException:
+        # A partially transferred model otherwise leaves allocator blocks
+        # cached until process exit, making an immediate retry less reliable.
+        del model
+        clear_cuda_cache(device)
+        raise
     model.eval()
     return model, processor
 
@@ -380,7 +397,7 @@ def _embedding_record(
     contract: dict,
 ) -> dict:
     keyframe_path = record["keyframe_path"]
-    return {
+    value = {
         "embedding_id": f"EMB_{record['frame_id']}",
         "frame_id": record["frame_id"],
         "video_id": record["video_id"],
@@ -401,6 +418,22 @@ def _embedding_record(
         "embedding_index": embedding_index,
         **contract,
     }
+    for field in (
+        "candidate_index",
+        "candidate_id",
+        "candidate_reasons",
+        "keyframe_strategy",
+        "selection_phase",
+        "selection_rank",
+        "selection_reasons",
+        "covered_event_ids",
+        "selection_score",
+        "protected",
+        "coverage_added",
+    ):
+        if field in record:
+            value[field] = record[field]
+    return value
 
 
 def validate_embedding_artifacts(
@@ -470,6 +503,7 @@ def encode_keyframes(
             model_revision=model_revision,
             device=resolved_device,
             model_cache_dir=model_cache_dir,
+            use_autocast=use_autocast,
         )
     else:
         model.to(resolved_device)

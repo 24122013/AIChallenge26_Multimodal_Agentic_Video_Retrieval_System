@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 import subprocess
 from collections import defaultdict
@@ -84,12 +85,33 @@ class WhisperBackend:
         self.model_version = "unknown"
         self._model: Any | None = None
         self._active_backend: str | None = None
+        self._dll_directory_handles: list[Any] = []
+
+    def _register_windows_cuda_dlls(self) -> None:
+        """Expose PyTorch's CUDA DLLs to CTranslate2 on Windows.
+
+        PyTorch loads its bundled DLLs internally, but CTranslate2 resolves
+        cublas by filename.  On Windows that lookup does not automatically
+        include ``torch/lib`` even though the required DLL is installed there.
+        The directory handles must remain alive for the backend lifetime.
+        """
+
+        if os.name != "nt" or self.device != "cuda" or self._dll_directory_handles:
+            return
+        try:
+            import torch
+        except ImportError:
+            return
+        torch_lib = Path(torch.__file__).resolve().parent / "lib"
+        if torch_lib.is_dir() and hasattr(os, "add_dll_directory"):
+            self._dll_directory_handles.append(os.add_dll_directory(str(torch_lib)))
 
     def _load(self) -> None:
         if self._model is not None:
             return
         if self.requested_backend in {"auto", "faster-whisper"}:
             try:
+                self._register_windows_cuda_dlls()
                 from faster_whisper import WhisperModel
 
                 compute_type = "float16" if self.device == "cuda" else "int8"

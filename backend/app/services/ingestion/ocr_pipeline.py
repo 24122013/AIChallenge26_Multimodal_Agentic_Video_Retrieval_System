@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
+from PIL import Image
+
 from backend.app.services.ingestion.common import (
     Timer,
     append_jsonl,
@@ -125,13 +127,17 @@ def run_ocr_file(
             valid_positions: list[int] = []
             valid_records: list[dict[str, Any]] = []
             valid_paths: list[Path] = []
+            valid_image_sizes: list[list[int]] = []
             for position, record in enumerate(batch):
                 try:
                     path = resolve_image_path(record, metadata_path)
                     verify_image(path)
+                    with Image.open(path) as image:
+                        image_size = [int(image.width), int(image.height)]
                     valid_positions.append(position)
                     valid_records.append(record)
                     valid_paths.append(path)
+                    valid_image_sizes.append(image_size)
                 except Exception as exc:
                     batch_values[position] = {
                         **identity(record),
@@ -147,9 +153,10 @@ def run_ocr_file(
                         "text_regions": [],
                     }
                     error_count += 1
-            for position, record, (raw, error) in zip(
+            for position, record, image_size, (raw, error) in zip(
                 valid_positions,
                 valid_records,
+                valid_image_sizes,
                 safe_infer(valid_paths, backend.infer),
                 strict=True,
             ):
@@ -166,6 +173,7 @@ def run_ocr_file(
                         ),
                         "ocr_text": "",
                         "text_regions": [],
+                        "image_size": image_size,
                     }
                     error_count += 1
                 else:
@@ -184,6 +192,7 @@ def run_ocr_file(
                                 " ".join(item["text"] for item in regions)
                             ),
                             "text_regions": regions,
+                            "image_size": image_size,
                             "languages": ["vi", "en"],
                             "confidence_threshold": conf_threshold,
                         }
@@ -201,6 +210,7 @@ def run_ocr_file(
                             ),
                             "ocr_text": "",
                             "text_regions": [],
+                            "image_size": image_size,
                         }
                         error_count += 1
                 batch_values[position] = value

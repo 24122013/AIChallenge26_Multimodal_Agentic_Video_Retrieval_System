@@ -14,13 +14,17 @@ from PIL import Image
 
 SCHEMA_VERSION = "1.0"
 IDENTITY_FIELDS = (
+    "candidate_id",
+    "candidate_index",
     "frame_id",
     "video_id",
     "segment_id",
     "shot_id",
     "timestamp",
+    "frame_index",
     "shot_start",
     "shot_end",
+    "candidate_reasons",
     "keyframe_path",
     "source_video_path",
 )

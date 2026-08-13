@@ -1,0 +1,47 @@
+version: 1
+baseline_score: 0.818
+base_run_root: competition/runs/retrieval-v2-baseline5s-dense
+labels: competition/evaluation/retrieval_labels.jsonl
+
+gates:
+  min_ndcg20_delta: 0.0
+  max_recall100_drop_by_task: 0.01
+  min_vlm_ndcg20_delta: 0.01
+
+experiments:
+  - id: legacy_5s
+    retrieval_mode: legacy
+    submission: competition/results/submission.csv
+
+  - id: dense_rescue
+    retrieval_mode: advanced
+    flags:
+      no_query_plan: true
+      no_rrf: true
+      no_cses: true
+      no_deterministic_rerank: true
+
+  - id: queryplan_rrf
+    retrieval_mode: advanced
+    flags:
+      no_cses: true
+      no_deterministic_rerank: true
+
+  - id: cses
+    retrieval_mode: advanced
+    flags:
+      no_deterministic_rerank: true
+
+  - id: deterministic_reranker
+    retrieval_mode: advanced
+
+  - id: optional_vlm
+    retrieval_mode: advanced
+    vlm_mode: optional
+
+offline_grid:
+  max_gap_seconds: [2, 3, 5]
+  dedup_similarity_threshold: [0.90, 0.92, 0.95]
+  relevance_lambda: [0.5, 0.6, 0.7]
+  asr_protection_threshold: [0.70, 0.80]
+  endpoint_protection: ["on", "off"]
