@@ -1,67 +1,157 @@
 # AIChallenge26 Multimodal Agentic Video Retrieval System
 
-Repo này xây dựng baseline video retrieval cho kì thi: video -> shot-aware keyframes -> SigLIP2 embeddings -> FAISS -> search trả frame và frame lân cận cùng shot.
+Hệ thống truy xuất video đa phương thức theo hai pha:
 
-## Pipeline hiện tại
+- **Offline:** video → keyframe → metadata đa phương thức → visual/text index.
+- **Online:** truy vấn → tìm kiếm theo từng modality → hợp nhất, rerank và trả về video/frame/timestamp.
+
+`backend/` và `src/` là pipeline lõi của repository. `competition/` là workspace độc lập để thử nghiệm các format dữ liệu, chiến lược retrieval và submission của từng cuộc thi; thư mục này **không phải kiến trúc chính của hệ thống** và không được dùng làm nơi lưu artifact mặc định của pipeline lõi.
+
+## Trạng thái hiện tại
+
+| Thành phần | Trạng thái | Ghi chú |
+| --- | --- | --- |
+| Keyframe extraction | Đã triển khai | TransNetV2, FFmpeg, shot-aware sampling, pHash; có tùy chọn dense coverage và CLIP dedup |
+| Visual indexing | Đã triển khai | SigLIP2 image embedding, FAISS `IndexFlatIP`, frame map và encoder manifest |
+| Multimodal ingestion | Đã triển khai | Caption, OCR, object detection và ASR |
+| Metadata indexing | Đã triển khai | Temporal neighbors, segment aggregation và BM25 text index |
+| Retrieval | Đã triển khai | Visual, caption, OCR, ASR, object, hybrid, temporal và QA evidence |
+| API | Một phần | Có router/wrapper cho search và retrieval; chưa có `FastAPI()` app tổng để chạy server |
+| Evaluation | Một phần | Có metric/evaluator cho keyframe và retrieval; benchmark/ablation/leaderboard tổng còn là khung |
+| Agent layer | Chưa triển khai | Các file trong `backend/app/services/agent/` hiện là placeholder |
+| Frontend và database | Chưa triển khai | Mới có cấu trúc thư mục/placeholder |
+| Competition adapters | Tách biệt | Runner, validation, experiment và submission nằm riêng trong `competition/` |
+
+## Kiến trúc pipeline hiện tại
 
 ```text
+                                OFFLINE PIPELINE
+
 data/raw/video/*.mp4
-  -> TransNetV2 shot detection
-  -> keyframe sampling + FFmpeg frame extraction + pHash dedup
-  -> keyframe metadata JSONL
-  -> SigLIP2 image embeddings
-  -> FAISS IndexFlatIP + frame_map + encoder manifest
-  -> text query -> SigLIP2 text embedding -> FAISS top-k -> results + same-shot neighbors
+        │
+        ▼
+TransNetV2 shot detection + FFmpeg frame extraction + dedup
+        │
+        ├── data/keyframes/<video_id>/*.jpg
+        └── data/metadata/keyframes_<video_id>.jsonl
+                    │
+          ┌─────────┴───────────────────────────────┐
+          │                                         │
+          ▼                                         ▼
+ SigLIP2 image encoder                 Multimodal ingestion
+          │                            ├── BLIP caption
+          │                            ├── EasyOCR vi/en
+          │                            ├── YOLO11n objects
+          │                            └── faster-whisper ASR
+          │                                         │
+          ▼                                         ▼
+ normalized embeddings                 captions/ocr/objects/asr JSONL
+          │                                         │
+          ▼                                         ▼
+ FAISS + frame map + manifest          segment aggregation + neighbors
+          │                                         │
+          │                                         ▼
+          │                                  BM25 text index
+          └──────────────────────┬──────────────────┘
+                                 │
+                                 ▼
+                                ONLINE
+
+query → mode dispatch → visual/text candidates → merge → weighted rerank
+                                      │
+                                      ├── temporal ordered-event matching
+                                      ├── QA evidence grouping
+                                      └── result + same-shot neighbors
 ```
 
-Indexing và retrieval mặc định dùng `google/siglip2-so400m-patch16-384`. Retrieval đọc model name, revision và vector dimension từ FAISS manifest để bảo đảm text query dùng đúng embedding space. FAISS dùng `IndexFlatIP` với vector đã normalize, tức inner product hoạt động như cosine similarity.
+Hai nhánh visual và metadata có thể được build độc lập sau khi có keyframe. Hybrid retrieval chỉ thực sự đa phương thức khi đã có text index; nếu text index chưa tồn tại, mode `hybrid` tự hạ cấp về visual-only.
 
-Pipeline OpenCLIP cũ vẫn được giữ làm legacy baseline và cho tùy chọn CLIP dedup.
+## Cấu trúc repository
+
+```text
+backend/
+  app/api/                    # Python wrappers và FastAPI routers
+  app/models/                 # Retrieval/metadata data contracts
+  app/services/
+    indexing/                 # Keyframe, embedding, FAISS, validation
+    ingestion/                # Caption, OCR, object, ASR
+    metadata/                 # Frame map và metadata lookup
+    retrieval/                # Visual/text/hybrid/temporal/QA retrieval
+    evaluation/               # Metric và evaluator đã triển khai một phần
+    agent/                    # Placeholder, chưa có agent runtime
+  tests/                      # Unit/regression tests của pipeline lõi
+
+src/indexing/                 # Neighbor index và segment-level aggregation
+configs/retrieval.yaml        # Cấu hình retrieval lõi
+data/                         # Dữ liệu và artifact mặc định; phần lớn bị Git ignore
+docs/                         # Schema, contract và tài liệu kỹ thuật chi tiết
+frontend/                     # Frontend scaffold, chưa có ứng dụng chạy được
+experiments/                  # Khu vực thí nghiệm chung
+notebooks/                    # Notebook launcher; không chứa thuật toán lõi
+reports/                      # Báo cáo benchmark/evaluation
+competition/                  # Testbed riêng cho các cuộc thi và submission
+```
 
 ## Cài đặt
 
-Chạy từ root repo bằng PowerShell:
+Chạy từ root repository bằng PowerShell:
 
 ```powershell
-py -m venv .venv; .\.venv\Scripts\python.exe -m pip install --upgrade pip; .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-`requirements.txt` đã gồm các thư viện chính: OpenCV, PyTorch, Transformers, OpenCLIP, FAISS CPU, Pillow, TransNetV2 PyTorch, FastAPI/Uvicorn.
-
-Lưu ý: `ffmpeg-python` chỉ là Python wrapper, không tự cài binary FFmpeg. TransNetV2 PyTorch cần `ffmpeg.exe` trong `PATH`.
-
-Kiểm tra:
+Pipeline cần binary `ffmpeg` và `ffprobe` trong `PATH`; package `ffmpeg-python` không tự cài hai binary này.
 
 ```powershell
 ffmpeg -version
+ffprobe -version
 ```
 
-Nếu lệnh trên không chạy, cài FFmpeg system trước khi chạy pipeline. Repo chỉ dùng TransNetV2 cho shot detection; thiếu FFmpeg thì extractor sẽ báo lỗi và dừng.
+Các model được tải lazy khi chạy lần đầu và cache dưới `data/model_cache/`. GPU CUDA được khuyến nghị cho SigLIP2, BLIP, OCR, YOLO và ASR; tất cả CLI chính đều có chế độ `--device auto` hoặc CPU fallback phù hợp.
 
-## Chuẩn bị video
+## Chuẩn bị dữ liệu
 
-Đặt video vào:
+Đặt video nguồn tại:
 
 ```text
 data/raw/video/
+  L27_V001.mp4
+  L27_V002.mp4
+  ...
 ```
 
-Ví dụ:
+Artifact lõi luôn ghi vào các thư mục con của `data/`:
 
 ```text
-data/raw/video/L27_V001.mp4
-data/raw/video/L27_V002.mp4
+data/keyframes/       # JPEG keyframe
+data/metadata/        # JSON/JSONL metadata, frame map, manifest, report
+data/embeddings/      # NumPy visual embeddings
+data/indexes/         # FAISS và BM25 index
+data/model_cache/     # Model weights/cache
 ```
 
-Folder dữ liệu lớn đã nằm trong `.gitignore`, không commit video/keyframes/embeddings/index.
+Video, model và artifact lớn đã được Git ignore; không commit chúng vào repository.
 
-## Bước 1: Extract keyframes
+## Chạy offline pipeline
 
-Chạy toàn bộ video:
+### 1. Trích xuất keyframe
 
 ```powershell
-.\.venv\Scripts\python.exe -B backend\app\services\indexing\extract_keyframes.py --video-dir data\raw\video --video-glob *.mp4 --output-dir data\keyframes --shot-device auto --shot-threshold 0.5 --phash-window-sec 12
+.\.venv\Scripts\python.exe -B backend\app\services\indexing\extract_keyframes.py `
+  --video-dir data\raw\video `
+  --video-glob *.mp4 `
+  --output-dir data\keyframes `
+  --shot-device auto
 ```
+
+Mặc định dùng strategy `legacy`:
+
+- shot dưới 4 giây: lấy midpoint;
+- shot từ 4 đến 8 giây: lấy frame tại 1/3 và 2/3;
+- shot dài hơn 8 giây: lấy một frame mỗi 4 giây;
+- loại frame gần trùng bằng pHash trong cùng cửa sổ thời gian.
 
 Output cho mỗi video:
 
@@ -71,30 +161,21 @@ data/metadata/keyframes_<video_id>.jsonl
 data/metadata/keyframes_<video_id>_extract_report.json
 ```
 
-Rule keyframe:
+Extractor còn hỗ trợ `--strategy dense_coverage` để sinh candidate dày và bảo đảm temporal coverage. Đây là strategy nâng cao, không phải mặc định. Dùng `--enable-clip-dedup` nếu muốn bổ sung OpenCLIP near-duplicate filtering.
 
-- Shot < 4s: lấy midpoint.
-- Shot 4-8s: lấy 2 frame tại 1/3 và 2/3 shot.
-- Shot > 8s: lấy mỗi 4s một frame.
-- Extract frame bằng FFmpeg theo timestamp đã chọn.
-- Dedup trong cùng video bằng pHash trong cửa sổ thời gian gần, mặc định 12s.
-- Metadata lưu `timestamp`, `frame_index`, `shot_start`, `shot_end`, `shot_id`, `source_video_path`.
-
-Nếu muốn bật CLIP dedup gần nhau:
+### 2. Sinh SigLIP2 image embedding
 
 ```powershell
-.\.venv\Scripts\python.exe -B backend\app\services\indexing\extract_keyframes.py --video-dir data\raw\video --enable-clip-dedup --phash-window-sec 12 --clip-similarity-threshold 0.985 --clip-window-sec 12
+Get-ChildItem data\metadata\keyframes_*.jsonl | ForEach-Object {
+  .\.venv\Scripts\python.exe -B backend\app\services\indexing\build_siglip2_index.py `
+    --metadata-path $_.FullName `
+    --batch-size auto `
+    --num-workers 4 `
+    --device auto
+}
 ```
 
-## Bước 2: Encode keyframes bằng SigLIP2
-
-Chạy cho toàn bộ metadata keyframe:
-
-```powershell
-Get-ChildItem data\metadata\keyframes_*.jsonl | ForEach-Object { .\.venv\Scripts\python.exe -B backend\app\services\indexing\build_siglip2_index.py --metadata-path $_.FullName --batch-size auto --num-workers 4 --device auto }
-```
-
-Output chính:
+Encoder mặc định là `google/siglip2-so400m-patch16-384`. Mỗi vector được chuẩn hóa L2 và đi kèm metadata chứa model/revision/dimension để khóa embedding contract.
 
 ```text
 data/embeddings/siglip2_so400m_patch16_384_<video_id>.npy
@@ -103,172 +184,57 @@ data/metadata/siglip2_so400m_patch16_384_skipped_<video_id>.jsonl
 data/metadata/siglip2_so400m_patch16_384_benchmark_<video_id>.json
 ```
 
-## Bước 3: Build FAISS index
+### 3. Build visual FAISS index
 
 ```powershell
-.\.venv\Scripts\python.exe -B backend\app\services\indexing\build_faiss_index.py --embeddings-glob "data/embeddings/siglip2_so400m_patch16_384_*.npy" --embedding-metadata-template "data/metadata/siglip2_so400m_patch16_384_embeddings_{video_id}.jsonl" --embeddings-prefix "siglip2_so400m_patch16_384_" --index-path data\indexes\siglip2_so400m_patch16_384_flat_ip.faiss --index-metadata-path data\metadata\siglip2_so400m_patch16_384_faiss_metadata.jsonl --frame-map-path data\metadata\siglip2_so400m_patch16_384_frame_map.json --manifest-path data\metadata\siglip2_so400m_patch16_384_faiss_manifest.json --report-path data\metadata\siglip2_so400m_patch16_384_index_report.json
+.\.venv\Scripts\python.exe -B backend\app\services\indexing\build_faiss_index.py
 ```
 
-Output retrieval cần có:
+Lệnh mặc định gom toàn bộ embedding SigLIP2 trong `data/embeddings/` và sinh:
 
 ```text
 data/indexes/siglip2_so400m_patch16_384_flat_ip.faiss
+data/metadata/siglip2_so400m_patch16_384_faiss_metadata.jsonl
 data/metadata/siglip2_so400m_patch16_384_frame_map.json
 data/metadata/siglip2_so400m_patch16_384_faiss_manifest.json
+data/metadata/siglip2_so400m_patch16_384_index_report.json
 ```
 
-## Bước 4: Test retrieval bằng Python
+FAISS mặc định dùng `IndexFlatIP` trên vector đã normalize, vì vậy inner product tương đương cosine similarity. Index, frame map và manifest phải được build cùng một lượt và cùng encoder contract.
 
-Retrieval tự đọc manifest để load đúng SigLIP2 checkpoint và kiểm tra query vector dimension trước khi search.
+### 4. Sinh metadata đa phương thức
+
+Các CLI nhận cả một file `keyframes_<video_id>.jsonl` hoặc thư mục chứa toàn bộ metadata.
 
 ```powershell
-.\.venv\Scripts\python.exe -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person cooking', top_k=5), ensure_ascii=False, indent=2))"
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_caption.py `
+  --metadata-path data\metadata --device auto --batch-size 4 --segment-caption
+
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_ocr.py `
+  --metadata-path data\metadata --device auto --batch-size 4 --conf-threshold 0.3
+
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_object_detection.py `
+  --metadata-path data\metadata --device auto --batch-size 8
+
+.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_asr.py `
+  --video-path data\raw\video `
+  --metadata-path data\metadata `
+  --video-glob *.mp4 `
+  --device auto --backend auto --model-size small
 ```
 
-Mỗi result sẽ có:
+Model mặc định:
 
-- `video_id`
-- `frame_id`
-- `timestamp`
-- `keyframe_path`
-- `shot_id`
-- `score`
-- `neighbors`: các keyframe lân cận cùng shot để UI hiển thị thêm ngữ cảnh.
+| Modality | Model/backend | Output |
+| --- | --- | --- |
+| Caption | `Salesforce/blip-image-captioning-base` | `captions_<video_id>.jsonl` |
+| OCR | EasyOCR `vi` + `en` | `ocr_<video_id>.jsonl` |
+| Object | YOLO11n (`yolo11n.pt`) | `objects_<video_id>.jsonl` |
+| ASR | faster-whisper `small`, fallback openai-whisper | `asr_<video_id>.jsonl`, `asr_segments_<video_id>.jsonl` |
 
-## API
+Mỗi pipeline ghi thêm `<artifact>_<video_id>_report.json`. Mặc định các record đã có được bỏ qua để resume an toàn; dùng `--overwrite` khi chủ động muốn build lại modality tương ứng. Metadata keyframe gốc và visual index không bị các bước này sửa trực tiếp.
 
-Repo hiện có router/wrapper trong `backend/app/api/search.py`, nhưng chưa có file app tổng kiểu `main.py` tạo `FastAPI()` và `include_router(...)`.
-
-Vì vậy cách test retrieval chắc chắn nhất hiện tại là gọi trực tiếp Python wrapper ở bước trên. Khi team thêm app tổng, router search có thể được include từ `backend.app.api.search`.
-
-## Kiểm tra nhanh
-
-```powershell
-.\.venv\Scripts\python.exe -B -m unittest discover -s backend\tests -p "test_*.py"; .\.venv\Scripts\python.exe -B backend\app\services\indexing\extract_keyframes.py --help
-```
-
-## Cấu trúc quan trọng
-
-```text
-backend/app/services/indexing/extract_keyframes.py       # TransNetV2 + keyframe sampling + dedup
-backend/app/services/indexing/build_siglip2_index.py     # encode ảnh keyframe thành SigLIP2 embeddings
-backend/app/services/indexing/build_faiss_index.py       # gom embeddings thành FAISS + frame_map
-backend/app/services/retrieval/search_visual.py          # text query -> SigLIP2 -> FAISS -> results
-backend/app/services/metadata/metadata_store.py          # lookup frame_map và same-shot neighbors
-docs/keyframe_extraction.md                              # giải thích chi tiết chiến lược keyframe
-```
-
-## Ghi chú cho team
-
-- Dùng `.\.venv\Scripts\python.exe`, không dùng `python` global nếu máy có nhiều Python.
-- `siglip2_so400m_patch16_384_frame_map.json`, FAISS index và manifest phải được build cùng một encoder contract.
-- Sau khi extract lại keyframes thì cần encode lại embeddings và build lại FAISS.
-- Extractor chỉ dùng TransNetV2. Nếu thiếu FFmpeg hoặc TransNetV2 lỗi, sửa môi trường rồi chạy lại.
-
-## Multimodal metadata ingestion
-
-Bốn pipeline trong `backend/app/services/ingestion/` sinh artifact JSONL riêng,
-không sửa metadata keyframe gốc, SigLIP2 embeddings hoặc FAISS:
-
-- Caption: `Salesforce/blip-image-captioning-base`, baseline gọn, có batch GPU
-  và sinh caption tiếng Anh trực tiếp bằng Transformers.
-- OCR: EasyOCR với `vi` + `en`, phù hợp baseline song ngữ, giữ Unicode và trả
-  polygon/confidence.
-- Objects: Ultralytics YOLO11n (`yolo11n.pt`), checkpoint COCO nhỏ và dễ tái lập.
-- ASR: `faster-whisper` model `small`, auto language + VAD; có fallback sang
-  `openai-whisper` nếu package đó đã được cài.
-
-### Cài dependency
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-ffprobe -version
-```
-
-`ffmpeg-python` không cung cấp binary. Cần cài FFmpeg system sao cho cả
-`ffmpeg.exe` và `ffprobe.exe` có trong `PATH`. Model được lazy-load sau khi CLI
-parse xong; cache nằm dưới `data/model_cache/` và đã được Git ignore.
-
-### Chạy một video
-
-```powershell
-.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_caption.py --metadata-path data\metadata\keyframes_L27_V001.jsonl --device auto --batch-size 4 --segment-caption
-.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_ocr.py --metadata-path data\metadata\keyframes_L27_V001.jsonl --device auto --batch-size 4 --conf-threshold 0.3
-.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_object_detection.py --metadata-path data\metadata\keyframes_L27_V001.jsonl --device auto --batch-size 8 --conf-threshold 0.25 --iou-threshold 0.7
-.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_asr.py --video-path data\raw\video\L27_V001.mp4 --metadata-path data\metadata\keyframes_L27_V001.jsonl --device auto --backend auto --model-size small
-```
-
-### Chạy toàn dataset
-
-CLI nhận trực tiếp thư mục. Chúng tự chọn `keyframes_*.jsonl` hoặc `*.mp4`:
-
-```powershell
-.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_caption.py --metadata-path data\metadata --device auto --batch-size 4
-.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_ocr.py --metadata-path data\metadata --device auto --batch-size 4
-.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_object_detection.py --metadata-path data\metadata --device auto --batch-size 8
-.\.venv\Scripts\python.exe -B backend\app\services\ingestion\run_asr.py --video-path data\raw\video --metadata-path data\metadata --video-glob "*.mp4" --device auto
-```
-
-Output mặc định:
-
-```text
-data/metadata/captions_<video_id>.jsonl
-data/metadata/ocr_<video_id>.jsonl
-data/metadata/objects_<video_id>.jsonl
-data/metadata/asr_<video_id>.jsonl
-data/metadata/asr_segments_<video_id>.jsonl
-data/metadata/<artifact>_<video_id>_report.json
-```
-
-Mặc định, record đã có trong output được skip để resume an toàn. Dùng
-`--overwrite` để tạo lại artifact của pipeline đó. Record lỗi ảnh/model được ghi
-riêng và không dừng batch; frame không có text/object vẫn là success. ASR dùng
-`ffprobe`: video không có audio là `skipped/no_audio_stream`, không phải error.
-
-Schema đầy đủ và JSON mẫu nằm trong `docs/metadata_schema.md`.
-
-### Tài nguyên và giới hạn
-
-Ước lượng thực hành: BLIP base khoảng 2 GB VRAM, EasyOCR dưới 2 GB, YOLO11n
-dưới 1 GB và faster-whisper small khoảng 2–3 GB; RAM CPU nên có tối thiểu
-8 GB. Batch mặc định phù hợp GPU 8 GB nhưng nên giảm khi ảnh lớn hoặc CUDA OOM.
-BLIP và YOLO COCO có thể bỏ sót chữ nhỏ, vật thể miền chuyên biệt hoặc chi tiết
-tiếng Việt. EasyOCR không trả language tin cậy theo từng vùng nên artifact ghi
-tập ngôn ngữ cấu hình. Confidence ASR được suy ra từ `avg_logprob`, không phải
-xác suất đã calibration. `segment_caption` là phép khử trùng lặp caption frame,
-không phải một lượt suy luận video-temporal.
-
-## Neighbor index và segment-level metadata
-
-Hai bước này chỉ tạo thêm artifact indexing/metadata, không sửa metadata keyframe
-gốc. Neighbor index là tùy chọn; segment metadata phải được build trước text
-index. Thứ tự chạy đầy đủ được khuyến nghị:
-
-```text
-keyframes_<video_id>.jsonl
-  -> neighbor index (tùy chọn)
-  -> caption/OCR/object/ASR ingestion
-  -> segment-level metadata
-  -> Retrieval text index
-  -> caption/OCR/ASR/object/hybrid/temporal search
-```
-
-### Build neighbor index
-
-Neighbor được tính trong cùng `video_id` theo cửa sổ timestamp. Output chỉ lưu
-`frame_id` và `delta_seconds` của neighbor; timestamp, frame index và path đầy đủ
-vẫn được resolve từ frame map/keyframe metadata chuẩn.
-
-Chạy cho một video:
-
-```powershell
-.\.venv\Scripts\python.exe -m src.indexing.build_neighbor_index `
-  --input data\metadata\keyframes_L27_V001.jsonl `
-  --output data\metadata\neighbors_L27_V001.jsonl `
-  --window-seconds 5
-```
-
-Chạy trên toàn bộ `keyframes_*.jsonl` trong thư mục:
+### 5. Build temporal neighbor index
 
 ```powershell
 .\.venv\Scripts\python.exe -m src.indexing.build_neighbor_index `
@@ -277,46 +243,9 @@ Chạy trên toàn bộ `keyframes_*.jsonl` trong thư mục:
   --window-seconds 5
 ```
 
-Tool ưu tiên `timestamp` có sẵn. Nếu record chỉ có `frame_index`, FPS được lấy
-từ `fps`/`video_fps` của từng record. Chỉ dùng fallback chung khi mọi video đầu
-vào có cùng FPS:
+Neighbor chỉ được tạo trong cùng `video_id`, sắp xếp theo timestamp và không chứa center frame.
 
-```powershell
-.\.venv\Scripts\python.exe -m src.indexing.build_neighbor_index `
-  --input data\metadata\legacy_keyframes.jsonl `
-  --output data\metadata\legacy_neighbors.jsonl `
-  --window-seconds 5 `
-  --fps 25
-```
-
-Neighbor luôn được sort theo timestamp, không chứa center frame và không bao giờ
-trộn giữa hai video. Duplicate `(video_id, frame_id)` đồng nhất được bỏ; duplicate
-xung đột sẽ báo lỗi.
-
-### Build segment-level metadata
-
-Chế độ mặc định `--strategy auto` dùng `segment_id`, fallback `shot_id`, cùng
-`shot_start/shot_end` đã có từ keyframe extraction. Nếu metadata cũ không có
-boundary, dùng fixed-duration window:
-
-```powershell
---strategy fixed --fixed-duration-seconds 10
-```
-
-Chạy cho một video sau khi đã sinh multimodal metadata:
-
-```powershell
-.\.venv\Scripts\python.exe -m src.indexing.build_segment_metadata `
-  --input data\metadata\keyframes_L27_V001.jsonl `
-  --captions data\metadata\captions_L27_V001.jsonl `
-  --ocr data\metadata\ocr_L27_V001.jsonl `
-  --asr data\metadata\asr_L27_V001.jsonl `
-  --objects data\metadata\objects_L27_V001.jsonl `
-  --output data\metadata\segments_L27_V001.jsonl `
-  --strategy auto
-```
-
-Chạy toàn dataset:
+### 6. Aggregate segment-level metadata
 
 ```powershell
 .\.venv\Scripts\python.exe -m src.indexing.build_segment_metadata `
@@ -329,34 +258,9 @@ Chạy toàn dataset:
   --strategy auto
 ```
 
-Khi nhận thư mục, tool tự chọn `keyframes_*.jsonl`, `captions_*.jsonl`,
-`ocr_*.jsonl`, `objects_*.jsonl` và `asr_*.jsonl`; `asr_segments_*` không được
-đọc lại để tránh duplicate.
+`auto` ưu tiên boundary từ `segment_id`/`shot_id`; dữ liệu cũ không có boundary có thể dùng `--strategy fixed --fixed-duration-seconds 10`. Segment record tổng hợp caption, OCR, ASR, object và giữ `source_ids`/`source_intervals` để truy ngược evidence.
 
-Mỗi segment chứa:
-
-- `segment_id`, `video_id`, `start_time`, `end_time`;
-- `start_frame`/`end_frame` khi nguồn có frame index;
-- `start_keyframe`, `end_keyframe`, `keyframe_ids`;
-- `captions_aggregated`, OCR, ASR và objects đã aggregate;
-- `source_ids`/`source_intervals` để truy ngược frame hoặc ASR chunk nguồn.
-
-Caption và OCR trùng được chuẩn hóa/gộp deterministic. ASR chỉ lấy chunk có
-khoảng thời gian giao với segment. Object có `track_id` được đếm theo track;
-nếu không có track, `occurrence_count_semantics` ghi rõ đây là số detection
-occurrence.
-
-Output JSONL được ghi compact và atomic. Chạy lại với cùng input/config cho cùng
-kết quả và tool từ chối ghi đè trực tiếp bất kỳ artifact nguồn nào. Schema,
-benchmark và các trade-off chi tiết nằm trong
-`reports/index_size_latency.md`.
-
-## Retrieval Phase 2-3: text, hybrid and temporal
-
-Chỉ build text index sau khi đã sinh caption/OCR/ASR/object và build
-`segments_<video_id>.jsonl` hoặc `segments_all.jsonl`. Khi nhận một thư mục,
-tool ưu tiên đọc `segments_all.jsonl`, sau đó `segments_*.jsonl`, rồi mới
-fallback về các artifact multimodal riêng lẻ.
+### 7. Build BM25 text index
 
 ```powershell
 .\.venv\Scripts\python.exe -B backend\app\services\indexing\build_text_index.py `
@@ -364,179 +268,90 @@ fallback về các artifact multimodal riêng lẻ.
   --output data\indexes\retrieval_text_index.json
 ```
 
-Mode `hybrid` tự động fallback về visual nếu text index chưa có. Các mode
-`caption`, `ocr`, `asr`, `object` sẽ báo rõ artifact Metadata đang thiếu.
+Folder mode ưu tiên `segments_all.jsonl`, sau đó `segments_*.jsonl`, rồi mới fallback về các artifact modality riêng lẻ.
 
-### Scoring lexical và temporal
+## Chạy retrieval
 
-Text search giữ nguyên BM25 artifact nhưng bổ sung xử lý ở query time:
-
-- bỏ các stopword không mô tả nội dung;
-- stemming nhẹ cho động từ tiếng Anh, ví dụ `sits`/`sitting` -> `sit`;
-- ưu tiên document khớp đủ từ quan trọng và đúng cụm từ;
-- giảm trọng số của chủ thể chung như `person` so với hành động như `enter`;
-- không hard-filter partial match, vì vậy hệ thống vẫn trả best-effort result
-  khi dataset không có cảnh khớp hoàn toàn.
-
-Temporal search vẫn dùng cùng flow `hybrid candidates -> ordered event matching`.
-Pass đầu yêu cầu cùng video, timestamp tăng, frame khác nhau và gap nằm trong
-`max_gap_seconds`. Nếu không có chain hợp lệ, hệ thống nới gap rồi mới dùng
-fallback tương thích cho index quá thưa. Điểm chain ưu tiên event yếu nhất để
-một event đúng không che mất event còn lại bị sai.
-
-Thay đổi scoring này tương thích text index hiện có; không đổi schema artifact,
-CLI hoặc thứ tự pipeline. Khi query một event không tồn tại trong dataset, kết
-quả vẫn được trả nhưng cần đọc `score`, caption và `modality_scores` như một kết
-quả gần đúng, không phải ground truth.
-
-Nếu không muốn trả kết quả visual có similarity quá thấp:
+Entry point ổn định hiện tại là Python wrapper:
 
 ```powershell
-$env:RETRIEVAL_MIN_SCORE="0.10"
+.\.venv\Scripts\python.exe -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person cooking', top_k=5, mode='hybrid'), ensure_ascii=False, indent=2))"
 ```
 
-Ngưỡng production cần được chọn trên tập query có ground truth, không nên coi
-`0.10` là ngưỡng mặc định cho mọi bộ dữ liệu. Cấu hình weights và index path nằm
-trong `configs/retrieval.yaml`.
+Các mode được hỗ trợ:
 
-## QA evidence retrieval
+| Mode | Nguồn | Hành vi |
+| --- | --- | --- |
+| `visual` | SigLIP2 + FAISS | Text-to-keyframe semantic search |
+| `caption` | BM25 caption | Tìm theo mô tả ảnh |
+| `ocr` | BM25 OCR | Tìm chữ xuất hiện trong frame |
+| `asr` | BM25 transcript | Tìm nội dung lời nói |
+| `object` | BM25 object labels | Tìm vật thể |
+| `hybrid` | Visual + các text modality có sẵn | Merge candidate, weighted rerank và same-shot dedup |
+| `temporal` | Nhiều hybrid subquery | Ghép event theo thứ tự trong cùng video |
+| `qa_evidence` | Hybrid retrieval | Gom evidence phục vụ câu hỏi |
 
-Mode `qa`/`qa_evidence` hỗ trợ QA dạng human-in-the-loop: hệ thống không tự sinh
-câu trả lời mà tìm các frame liên quan để người dùng nhìn ảnh và chọn đáp án.
-Mode này dùng lại nguyên pipeline hybrid hiện có, không cần artifact hoặc model
-index mới.
+Mỗi result chuẩn gồm `video_id`, `frame_id`, `timestamp`, `frame_index`, `shot_id`, `segment_id`, `score`, đường dẫn keyframe, metadata đa phương thức, `modality_scores` và các frame lân cận cùng shot khi có.
 
-Ví dụ:
+Trọng số hybrid, pool size, giới hạn `top_k`, same-shot dedup, text-index path và temporal gap nằm trong `configs/retrieval.yaml`. Các đường dẫn/runtime visual có thể override qua biến môi trường; danh sách đầy đủ nằm trong [Retrieval API contract](docs/retrieval_api_contract.md).
+
+## API hiện tại
+
+Repository có hai router:
+
+- `backend.app.api.search.router`: `POST /search`, dispatch bằng trường `mode`.
+- `backend.app.api.retrieval.router`: các endpoint `/retrieval/visual`, `/hybrid`, `/caption`, `/ocr`, `/asr`, `/object`, `/temporal` và `/qa-evidence`.
+
+Hiện chưa có file application tạo `FastAPI()` và `include_router(...)`, nên chưa có lệnh `uvicorn ...` chính thức. Không nên mô tả backend như một service deploy hoàn chỉnh cho đến khi app tổng, health check và deployment wiring được bổ sung.
+
+## Vai trò của `competition/`
+
+`competition/` là **competition sandbox** nằm bên cạnh hệ thống lõi:
+
+- adapter input/output theo format TKIS/VKIS hoặc cuộc thi khác;
+- runner end-to-end, resume và lineage theo từng run;
+- keyframe/retrieval ablation, dense rescue, ensemble;
+- validation và sinh `submission.csv`;
+- artifact riêng dưới `competition/` hoặc `competition/runs/<run_id>/`.
+
+Code tại đây có thể tái sử dụng service từ `backend/` và `src/`, nhưng pipeline lõi không được import ngược từ `competition/`. Dữ liệu chuẩn của hệ thống vẫn nằm trong `data/`, cấu hình retrieval chuẩn vẫn là `configs/retrieval.yaml`, và API runtime không phụ thuộc competition runner.
+
+Hướng dẫn chi tiết để chạy test cuộc thi nằm trong [competition/README.md](competition/README.md). Không đưa command submission/leaderboard vào luồng cài đặt chính của repository.
+
+## Kiểm tra
+
+Chạy regression tests của pipeline lõi:
 
 ```powershell
-.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm cái gì?', 5, 'qa'), ensure_ascii=False, indent=2))"
+.\.venv\Scripts\python.exe -B -m unittest discover -s backend\tests -p "test_*.py"
 ```
 
-Query planner sẽ:
-
-```text
-Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm cái gì?
-  -> Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm một vật
-  -> a woman wearing a red shirt sitting at a table holding an object
-  -> a woman wearing a red shirt sitting on a table holding an object
-```
-
-Các query Việt/Anh được search bằng hybrid, gộp theo frame, khử trùng cùng shot
-và cộng một bonus nhỏ cho frame xuất hiện trong nhiều query. Response chứa:
-
-- `answer_target`: loại thông tin cần quan sát, ví dụ `held_object`;
-- `retrieval_queries`: các query bằng chứng đã dùng;
-- `answer_mode = manual_visual_inspection`;
-- `results[].keyframe_path` và `thumbnail_path` để frontend hiển thị ảnh;
-- `timestamp`, `video_id`, caption/OCR/ASR/object và `neighbors` để xem ngữ cảnh.
-
-Endpoint tương ứng là `POST /retrieval/qa-evidence`. Repo chưa có FastAPI app
-tổng nên hiện tại có thể test chắc chắn bằng Python wrapper ở trên. Nếu không có
-frame khớp hoàn toàn, mode QA vẫn trả best-effort evidence; người dùng cần kiểm
-tra ảnh thay vì coi caption hoặc score là đáp án tự động.
-
-## Kiểm tra sau khi build
-
-### 1. Kiểm tra artifact bắt buộc
+Kiểm tra riêng competition sandbox khi thay đổi code trong `competition/`:
 
 ```powershell
-Get-Item `
-  data\indexes\siglip2_so400m_patch16_384_flat_ip.faiss, `
-  data\metadata\siglip2_so400m_patch16_384_frame_map.json, `
-  data\metadata\siglip2_so400m_patch16_384_faiss_manifest.json, `
-  data\indexes\retrieval_text_index.json |
-  Select-Object FullName, Length, LastWriteTime
+.\.venv\Scripts\python.exe -B -m unittest discover -s competition\tests -p "test_*.py"
 ```
 
-Nếu một đường dẫn báo `Cannot find path`, pipeline tương ứng chưa được build
-xong. Ba artifact SigLIP2/FAISS đầu tiên phục vụ `visual`; text index cuối cùng
-phục vụ `caption`, `ocr`, `asr`, `object` và `hybrid`.
+Một số smoke test model thật cần model cache, video và phần cứng phù hợp; unit test còn lại dùng artifact synthetic/fake để kiểm tra contract và tính deterministic.
 
-### 2. Kiểm tra số document của từng modality trong text index
+## Quy tắc artifact quan trọng
 
-```powershell
-.\.venv\Scripts\python.exe -B -c "import json; from pathlib import Path; p=json.loads(Path('data/indexes/retrieval_text_index.json').read_text(encoding='utf-8')); print(json.dumps({k:v.get('stats', {}) for k,v in p.get('modalities', {}).items()}, ensure_ascii=False, indent=2))"
-```
+- Sau khi extract lại keyframe, phải encode lại embedding và build lại FAISS.
+- Không trộn embedding từ model/revision/dimension khác nhau trong cùng index.
+- Retrieval đọc encoder contract từ manifest và từ chối query vector sai dimension.
+- Không sửa trực tiếp keyframe metadata để nhét kết quả caption/OCR/ASR/object; mỗi modality có artifact riêng và được aggregate ở bước segment.
+- `frame_map`, FAISS index và manifest là một bộ artifact bất khả phân.
+- Thay đổi path/config ở runtime cần xóa cache engine trong process bằng `clear_retrieval_caches()` trước khi search lại.
+- Pipeline lõi ghi vào `data/`; competition runner ghi vào workspace của `competition/`. Không dùng chung output root giữa hai luồng.
 
-`doc_count` lớn hơn `0` nghĩa là modality đó đã có dữ liệu để search. Nếu một
-modality có `doc_count = 0`, kiểm tra lại artifact nguồn và build lại segment,
-sau đó build lại text index.
+## Tài liệu liên quan
 
-### 3. Test từng search mode
+- [Kiến trúc tổng quan](docs/architecture.md)
+- [Metadata schema](docs/metadata_schema.md)
+- [Keyframe extraction](docs/keyframe_extraction.md)
+- [Retrieval API contract](docs/retrieval_api_contract.md)
+- [Evaluation protocol](docs/eval_protocol.md)
+- [Service boundaries](docs/service_boundaries.md)
+- [Competition sandbox](competition/README.md)
 
-Visual SigLIP2 + FAISS:
-
-```powershell
-.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person cooking', 5, 'visual'), ensure_ascii=False, indent=2))"
-```
-
-Caption:
-
-```powershell
-.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person cooking', 5, 'caption'), ensure_ascii=False, indent=2))"
-```
-
-OCR:
-
-```powershell
-.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('restaurant menu', 5, 'ocr'), ensure_ascii=False, indent=2))"
-```
-
-ASR:
-
-```powershell
-.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('how to prepare food', 5, 'asr'), ensure_ascii=False, indent=2))"
-```
-
-Object:
-
-```powershell
-.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('person', 5, 'object'), ensure_ascii=False, indent=2))"
-```
-
-Hybrid:
-
-```powershell
-.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person cooking', 5, 'hybrid'), ensure_ascii=False, indent=2))"
-```
-
-Temporal:
-
-```powershell
-.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('a person enters then sits down', 5, 'temporal'), ensure_ascii=False, indent=2))"
-```
-
-QA evidence:
-
-```powershell
-.\.venv\Scripts\python.exe -B -c "from backend.app.api.search import search; import json; print(json.dumps(search('Người phụ nữ mặc áo đỏ đang ngồi trên bàn cầm cái gì?', 5, 'qa'), ensure_ascii=False, indent=2))"
-```
-
-### 4. Đọc kết quả kiểm tra
-
-- Không có exception và `results` là một list: mode đã load được artifact.
-- `results` rỗng không nhất thiết là lỗi; query có thể không khớp dữ liệu.
-- Trong kết quả `hybrid`, kiểm tra `modality_scores`. Các key như `caption`,
-  `ocr`, `asr` hoặc `objects` cho biết candidate có đóng góp từ text metadata.
-- Nếu chưa có `retrieval_text_index.json`, `hybrid` chỉ fallback về `visual`;
-  khi đó chưa được coi là kiểm tra multimodal hoàn chỉnh.
-- Với `temporal`, kiểm tra từng phần tử trong `events`. Tất cả event phải đúng
-  nội dung và có timestamp tăng; điểm thấp cho biết đây có thể là best-effort
-  fallback vì dataset không chứa đủ chuỗi hành động.
-
-### 5. Chạy test hồi quy Retrieval
-
-```powershell
-.\.venv\Scripts\python.exe -B -m unittest `
-  backend.tests.test_retrieval_phase2 `
-  backend.tests.test_retrieval_phase3
-```
-
-## Public TKIS/VKIS competition
-
-Pipeline dành riêng cho `data/public/` (250 video, TKIS, VKIS và xuất submission
-100 đáp án/query) nằm tại [competition/README.md](competition/README.md). Adapter
-này tái sử dụng toàn bộ pipeline đã triển khai: SigLIP2/FAISS, caption, OCR,
-objects, ASR, segment/text index và hybrid reranking. Toàn bộ artifact sinh mới
-được ghi trong `competition/`; pipeline dữ liệu mặc định ở `data/` không bị thay
-đổi.
+Khi tài liệu thiết kế cũ khác với implementation, README này và code trong `backend/`, `src/` là nguồn tham chiếu cho pipeline đang chạy; các module placeholder không được xem là tính năng đã hoàn thành.

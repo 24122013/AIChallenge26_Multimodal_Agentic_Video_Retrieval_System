@@ -1,8 +1,11 @@
-# Pipeline đầy đủ cho cuộc thi TKIS/VKIS
+# Competition sandbox: TKIS/VKIS
 
-`competition/` là adapter của toàn bộ phần đã được triển khai trong hệ thống gốc cho
-bộ dữ liệu `data/public/`. Adapter không viết lại thuật toán lõi mà gọi trực tiếp các
-service hiện có:
+> **Phạm vi:** `competition/` chỉ là workspace riêng để test, tối ưu và đóng gói
+> submission cho các cuộc thi. Đây không phải pipeline lõi, API runtime hay nơi lưu
+> artifact mặc định của hệ thống.
+
+Sandbox hiện cung cấp adapter TKIS/VKIS cho bộ dữ liệu `data/public/`. Adapter không
+viết lại thuật toán lõi mà gọi trực tiếp các service trong `backend/` và `src/`:
 
 - TransNetV2 + dense sampling + multimodal hard selector để trích keyframe;
 - SigLIP2 để tạo image/text embedding;
