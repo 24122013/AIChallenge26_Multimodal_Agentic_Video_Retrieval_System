@@ -74,6 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--batch-size", type=_batch_size, default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--caption-batch-size", type=int, default=2)
+    parser.add_argument(
+        "--caption-quantization",
+        choices=("none", "8bit", "4bit"),
+        default="none",
+    )
+    parser.add_argument("--ocr-batch-size", type=int, default=4)
+    parser.add_argument("--object-batch-size", type=int, default=8)
     parser.add_argument("--candidate-interval-sec", type=float, default=0.5)
     parser.add_argument("--max-gap-seconds", type=float, default=2.0)
     parser.add_argument("--target-density-per-second", type=float, default=0.5)
@@ -178,6 +186,14 @@ def build_stage_commands(
         str(args.batch_size),
         "--num-workers",
         str(args.num_workers),
+        "--caption-batch-size",
+        str(args.caption_batch_size),
+        "--caption-quantization",
+        args.caption_quantization,
+        "--ocr-batch-size",
+        str(args.ocr_batch_size),
+        "--object-batch-size",
+        str(args.object_batch_size),
         "--candidate-interval-sec",
         str(args.candidate_interval_sec),
         "--max-gap-seconds",
@@ -371,11 +387,22 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.rrf_k,
         args.vlm_top_m,
         args.bge_batch_size,
+        args.caption_batch_size,
+        args.ocr_batch_size,
+        args.object_batch_size,
     )
     if any(value < 0 for value in counts):
         raise ValueError("retrieval cardinalities must be non-negative")
-    if args.bge_batch_size < 1:
-        raise ValueError("BGE batch size must be positive")
+    if any(
+        value < 1
+        for value in (
+            args.bge_batch_size,
+            args.caption_batch_size,
+            args.ocr_batch_size,
+            args.object_batch_size,
+        )
+    ):
+        raise ValueError("model batch sizes must be positive")
     if not 0.0 <= float(args.bge_reranker_alpha) <= 1.0:
         raise ValueError("BGE reranker alpha must be within [0, 1]")
 

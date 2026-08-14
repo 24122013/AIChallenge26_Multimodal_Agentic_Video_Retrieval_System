@@ -48,6 +48,10 @@ class RetrievalV2RunnerTest(unittest.TestCase):
             "on",
         )
         self.assertIn("--resume", commands["keyframes"])
+        self.assertEqual(
+            commands["keyframes"][commands["keyframes"].index("--caption-quantization") + 1],
+            "none",
+        )
         dense = commands["dense-index"]
         self.assertEqual(
             dense[dense.index("--source-output-root") + 1],
