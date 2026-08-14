@@ -2,18 +2,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
 from backend.app.models.retrieval import RetrievalResult
+from backend.app.services.agent.query_expansion import (
+    QueryExpansionConfig,
+    QueryExpansionProvider,
+    build_query_expansion_plan,
+)
 from backend.app.services.retrieval.advanced_rerank import (
     AdvancedRankedFrame,
     rerank_dense_candidates,
 )
 from backend.app.services.retrieval.cses import CSESConfig, CSESSelection, select_cses
 from backend.app.services.retrieval.query_plan import QueryPlan, build_query_plan
-from backend.app.services.retrieval.rank_fusion import aggregate_clips, weighted_rrf
+from backend.app.services.retrieval.rank_fusion import (
+    aggregate_clips,
+    fuse_query_variants,
+    weighted_rrf,
+)
 from backend.app.services.retrieval.rank_fusion import FusedCandidate
 from competition.dense_index import DenseCandidateIndex
 
@@ -35,6 +44,7 @@ class AdvancedSearchConfig:
     dense_rescue_enabled: bool = True
     cses_enabled: bool = True
     deterministic_rerank_enabled: bool = True
+    query_expansion: QueryExpansionConfig = QueryExpansionConfig()
 
 
 @dataclass(frozen=True)
@@ -46,6 +56,9 @@ class AdvancedSearchResponse:
     candidate_clip_count: int
     candidate_row_count: int
     selected_row_count: int
+    intra_modality_trace: Mapping[str, Sequence[Mapping[str, object]]]
+    skipped_modalities: Mapping[str, str]
+    inter_modality_trace: Sequence[Mapping[str, object]]
 
     def trace(self) -> dict[str, object]:
         return {
@@ -55,6 +68,13 @@ class AdvancedSearchResponse:
             "candidate_clip_count": self.candidate_clip_count,
             "candidate_row_count": self.candidate_row_count,
             "selected_row_count": self.selected_row_count,
+            "intra_modality_fusion": {
+                name: [dict(value) for value in values]
+                for name, values in self.intra_modality_trace.items()
+            },
+            "skipped_modalities": dict(self.skipped_modalities),
+            "inter_modality_fusion": [dict(value) for value in self.inter_modality_trace],
+            "rerank_canonical_query": self.plan.original_query,
             "results": [result.to_dict() for result in self.results],
         }
 
@@ -67,10 +87,22 @@ def advanced_text_search(
     dense_index: DenseCandidateIndex,
     profile: str = "auto",
     config: AdvancedSearchConfig | None = None,
+    expansion_provider: QueryExpansionProvider | None = None,
+    plan: QueryPlan | None = None,
 ) -> AdvancedSearchResponse:
     config = config or AdvancedSearchConfig()
-    plan = build_query_plan(query, profile=profile)
+    plan = plan or build_query_plan(
+        query,
+        profile=profile,
+        expansion_provider=expansion_provider,
+        expansion_config=config.query_expansion,
+    )
     if not config.query_plan_enabled:
+        disabled_expansion = build_query_expansion_plan(
+            plan.original_query,
+            provider=None,
+            config=replace(config.query_expansion, enabled=False),
+        )
         plan = replace(
             plan,
             normalized_query=plan.original_query,
@@ -82,18 +114,57 @@ def advanced_text_search(
                 for modality in ("visual", "caption", "ocr", "objects")
             ),
             reasons=("query planning disabled by ablation",),
+            expansion_plan=disabled_expansion,
         )
     visual_engine = getattr(hybrid_engine, "visual_engine")
     text_engines = getattr(hybrid_engine, "text_engines")
-    groups: dict[str, Sequence[RetrievalResult]] = {
-        "visual": visual_engine.search(
-            plan.query_for("visual"),
+    semantic_variants = plan.expansion_plan.accepted_variants
+    variant_groups: dict[str, Sequence[RetrievalResult]] = {}
+    variant_weights: dict[str, float] = {}
+    for index, variant in enumerate(semantic_variants):
+        key = "original" if variant.type == "original" else f"paraphrase_{index}"
+        variant_groups[key] = visual_engine.search(
+            variant.text,
             top_k=max(config.coarse_top_n * 4, 200),
         ).results
+        variant_weights[key] = variant.weight
+    visual_intra = fuse_query_variants(
+        variant_groups,
+        weights=variant_weights,
+        k=config.rrf_k,
+        max_expansion_contribution=config.query_expansion.max_expansion_contribution,
+    )
+    groups: dict[str, Sequence[RetrievalResult]] = {
+        "visual": [value.as_retrieval_result() for value in visual_intra]
     }
+    intra_trace: dict[str, list[Mapping[str, object]]] = {
+        "visual": [value.to_dict() for value in visual_intra]
+    }
+    skipped_modalities: dict[str, str] = {}
     for modality, engine in sorted(text_engines.items()):
+        if modality == "caption":
+            caption_groups = {
+                key: engine.search_results(
+                    semantic_variants[index].text,
+                    top_k=max(config.coarse_top_n * 2, 100),
+                )
+                for index, key in enumerate(variant_groups)
+            }
+            caption_intra = fuse_query_variants(
+                caption_groups,
+                weights=variant_weights,
+                k=config.rrf_k,
+                max_expansion_contribution=config.query_expansion.max_expansion_contribution,
+            )
+            groups[modality] = [value.as_retrieval_result() for value in caption_intra]
+            intra_trace[modality] = [value.to_dict() for value in caption_intra]
+            continue
+        modality_query = plan.query_for(modality).strip()
+        if modality in {"ocr", "objects"} and not modality_query:
+            skipped_modalities[modality] = "no_reliable_modality_terms"
+            continue
         groups[modality] = engine.search_results(
-            plan.query_for(modality),
+            modality_query,
             top_k=max(config.coarse_top_n * 2, 100),
         )
     if config.rrf_enabled:
@@ -103,6 +174,7 @@ def advanced_text_search(
             k=config.rrf_k,
             hint_boost=config.modality_hint_boost,
         )
+        inter_trace = [value.to_dict() for value in fused]
     else:
         legacy = hybrid_engine.search(
             plan.retrieval_query,
@@ -117,6 +189,7 @@ def advanced_text_search(
             )
             for result in legacy
         ]
+        inter_trace = []
     clips = aggregate_clips(fused, top_n=config.coarse_top_n)
     coarse_clip_scores: dict[tuple[str, str], float] = {}
     coarse_clip_keys: list[tuple[str, str]] = []
@@ -128,7 +201,10 @@ def advanced_text_search(
         if key not in coarse_clip_keys:
             coarse_clip_keys.append(key)
 
-    query_vector = np.asarray(text_encoder.encode(plan.retrieval_query), dtype=np.float32).reshape(-1)
+    query_vector = np.asarray(
+        text_encoder.encode(plan.original_query),
+        dtype=np.float32,
+    ).reshape(-1)
     event_vectors = [
         np.asarray(text_encoder.encode(event), dtype=np.float32).reshape(-1)
         for event in plan.temporal_events
@@ -141,6 +217,9 @@ def advanced_text_search(
         coarse_clip_keys=coarse_clip_keys,
         coarse_clip_scores=coarse_clip_scores,
         config=config,
+        intra_modality_trace=intra_trace,
+        skipped_modalities=skipped_modalities,
+        inter_modality_trace=inter_trace,
     )
 
 
@@ -152,7 +231,11 @@ def advanced_vector_search(
     config: AdvancedSearchConfig | None = None,
 ) -> AdvancedSearchResponse:
     config = config or AdvancedSearchConfig()
-    plan = build_query_plan("visual image instance", profile="kis")
+    plan = build_query_plan(
+        "visual image instance",
+        profile="kis",
+        expansion_config=QueryExpansionConfig(enabled=False),
+    )
     coarse_clip_keys: list[tuple[str, str]] = []
     coarse_clip_scores: dict[tuple[str, str], float] = {}
     for result in coarse_results:
@@ -173,6 +256,9 @@ def advanced_vector_search(
         coarse_clip_keys=coarse_clip_keys,
         coarse_clip_scores=coarse_clip_scores,
         config=config,
+        intra_modality_trace={},
+        skipped_modalities={"query_expansion": "VKIS image query"},
+        inter_modality_trace=[],
     )
 
 
@@ -185,6 +271,9 @@ def _select_and_rerank(
     coarse_clip_keys: Sequence[tuple[str, str]],
     coarse_clip_scores: dict[tuple[str, str], float],
     config: AdvancedSearchConfig,
+    intra_modality_trace: Mapping[str, Sequence[Mapping[str, object]]],
+    skipped_modalities: Mapping[str, str],
+    inter_modality_trace: Sequence[Mapping[str, object]],
 ) -> AdvancedSearchResponse:
     dense_hits = dense_index.search(query_vector, config.dense_global_top_k)
     chosen_clips = list(dict.fromkeys(coarse_clip_keys))[: config.coarse_top_n]
@@ -299,6 +388,9 @@ def _select_and_rerank(
         candidate_clip_count=len(chosen_clips),
         candidate_row_count=candidate_row_count,
         selected_row_count=len(selections),
+        intra_modality_trace=intra_modality_trace,
+        skipped_modalities=skipped_modalities,
+        inter_modality_trace=inter_modality_trace,
     )
 
 

@@ -22,7 +22,7 @@ import time
 from dataclasses import asdict
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import cv2
 import numpy as np
@@ -97,6 +97,9 @@ from backend.app.services.ingestion.ocr_pipeline import (
     run_ocr_file,
 )
 from backend.app.services.metadata.metadata_store import FrameRecord, MetadataStore
+from backend.app.services.agent.query_expansion import (
+    build_production_query_expansion_provider,
+)
 from backend.app.services.retrieval.hybrid_search import (
     HybridSearchConfig,
     HybridSearchEngine,
@@ -119,6 +122,7 @@ from backend.app.services.retrieval.advanced_search import (
     advanced_vector_search,
 )
 from backend.app.services.retrieval.advanced_rerank import AdvancedRankedFrame
+from backend.app.services.retrieval.query_plan import QueryPlan, build_query_plan
 from backend.app.services.retrieval.vlm_reranker import (
     DEFAULT_VLM_MODEL,
     VLM_MODES,
@@ -3509,6 +3513,46 @@ def promote_run_command(args: argparse.Namespace) -> None:
     print(json.dumps(active, ensure_ascii=False, indent=2))
 
 
+def precompute_tkis_query_plans(
+    questions: Sequence[Question],
+    *,
+    profile: str,
+    expansion_config,
+    device: str,
+    cache_dir: Path,
+    model_cache_dir: Path,
+    local_files_only: bool,
+    provider_factory: Callable[..., object] | None = None,
+) -> dict[str, QueryPlan]:
+    """Expand TKIS queries once before SigLIP allocation; VKIS never calls it."""
+    tkis_questions = [question for question in questions if question.task == "TKIS"]
+    if not tkis_questions:
+        return {}
+    factory = provider_factory or build_production_query_expansion_provider
+    provider = None
+    if expansion_config.enabled:
+        provider = factory(
+            config=expansion_config,
+            device=device,
+            cache_dir=cache_dir,
+            model_cache_dir=model_cache_dir,
+            local_files_only=local_files_only,
+        )
+    try:
+        return {
+            question.query_id: build_query_plan(
+                question.text,
+                profile=profile,
+                expansion_provider=provider,
+                expansion_config=expansion_config,
+            )
+            for question in tkis_questions
+        }
+    finally:
+        if provider is not None:
+            provider.close()
+
+
 def predict_command(args: argparse.Namespace) -> None:
     public_root = args.public_root.resolve()
     output_root = args.output_root.resolve()
@@ -3535,6 +3579,7 @@ def predict_command(args: argparse.Namespace) -> None:
     columns = submission_columns(public_root)
     paths = competition_index_paths(output_root)
     runtime = load_retrieval_runtime_config(args.retrieval_config)
+    resolved_device = choose_device(args.device)
 
     _require_current_index_lineage(
         corpus=corpus,
@@ -3547,8 +3592,27 @@ def predict_command(args: argparse.Namespace) -> None:
         public_root=public_root,
         output_root=output_root,
     )
+    query_plans: dict[str, QueryPlan] = {}
+    if advanced_mode:
+        expansion_config = replace(
+            runtime.query_expansion,
+            enabled=(
+                runtime.query_expansion.enabled
+                and not args.no_query_expansion
+                and not args.no_query_plan
+            ),
+        )
+        query_plans = precompute_tkis_query_plans(
+            questions,
+            profile=args.retrieval_profile,
+            expansion_config=expansion_config,
+            device=resolved_device,
+            cache_dir=args.query_expansion_cache_dir,
+            model_cache_dir=args.query_expansion_model_cache_dir,
+            local_files_only=args.offline_model_cache,
+        )
+        gc.collect()
     contract = load_encoder_contract(paths["manifest"])
-    resolved_device = choose_device(args.device)
     model, processor = load_siglip2_model_processor(
         model_name=contract.model_name,
         model_revision=contract.model_revision,
@@ -3640,6 +3704,7 @@ def predict_command(args: argparse.Namespace) -> None:
             dense_rescue_enabled=not args.no_dense_rescue,
             cses_enabled=not args.no_cses,
             deterministic_rerank_enabled=not args.no_deterministic_rerank,
+            query_expansion=expansion_config,
         )
 
     predictions: dict[str, list[str]] = {}
@@ -3666,6 +3731,7 @@ def predict_command(args: argparse.Namespace) -> None:
                     dense_index=dense_index,
                     profile=args.retrieval_profile,
                     config=advanced_config,
+                    plan=query_plans[question.query_id],
                 )
             else:
                 vector = vkis_vectors.get(question.query_id)
@@ -4351,6 +4417,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Refuse network access and load the resolved SigLIP2 revision from cache.",
     )
+    predict_parser.add_argument(
+        "--query-expansion-cache-dir",
+        type=Path,
+        default=Path("data/model_cache/query_expansion"),
+        help="Cache for the production TKIS paraphrase provider.",
+    )
+    predict_parser.add_argument(
+        "--query-expansion-model-cache-dir",
+        type=Path,
+        default=Path("data/model_cache/caption"),
+        help="Hugging Face cache shared with the Qwen caption stage.",
+    )
     predict_parser.add_argument("--search-depth", type=int, default=200)
     predict_parser.add_argument(
         "--tkis-routing",
@@ -4443,6 +4521,11 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--vlm-top-m", type=int, default=20)
     predict_parser.add_argument("--vlm-timeout-seconds", type=float, default=120.0)
     predict_parser.add_argument("--no-query-plan", action="store_true")
+    predict_parser.add_argument(
+        "--no-query-expansion",
+        action="store_true",
+        help="Explicit TKIS ablation: use the original query only.",
+    )
     predict_parser.add_argument("--no-rrf", action="store_true")
     predict_parser.add_argument("--no-dense-rescue", action="store_true")
     predict_parser.add_argument("--no-cses", action="store_true")

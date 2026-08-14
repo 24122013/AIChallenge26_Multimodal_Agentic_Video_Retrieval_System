@@ -231,6 +231,27 @@ class VLMFallbackTest(unittest.TestCase):
                 runner=timeout,
             )
 
+    def test_vlm_semantic_query_is_original_and_candidate_image_is_evidence(self) -> None:
+        original = "a red bus next to two cars"
+        calls: list[tuple[str, Path]] = []
+
+        def record(query: str, image_path: Path):
+            calls.append((query, image_path))
+            return {"score": 0.9}
+
+        ranked, report = rerank_with_vlm(
+            [self.candidate],
+            query=original,
+            mode="optional",
+            cache_root=self.root / "cache-original-query",
+            image_resolver=lambda _item: self.image,
+            runner=record,
+        )
+
+        self.assertEqual(calls, [(original, self.image)])
+        self.assertEqual(report.status, "passed")
+        self.assertEqual(ranked[0].breakdown["vlm"], 0.9)
+
 
 class DenseIndexContractTest(unittest.TestCase):
     def setUp(self) -> None:

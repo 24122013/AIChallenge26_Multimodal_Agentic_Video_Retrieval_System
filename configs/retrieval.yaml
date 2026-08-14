@@ -20,3 +20,18 @@ text_index:
   path: data/indexes/retrieval_text_index.json
   default_top_k: 20
   max_top_k: 200
+
+query_expansion:
+  enabled: true
+  max_paraphrases: 2
+  original_weight: 1.0
+  paraphrase_weight: 0.6
+  max_expansion_contribution: 1.0
+  max_query_chars: 512
+  hard_paraphrase_limit: 8
+  model_name: Qwen/Qwen3.5-9B
+  model_revision: c202236
+  timeout_seconds: 120.0
+  max_new_tokens: 384
+  dtype: auto
+  quantization: 4bit

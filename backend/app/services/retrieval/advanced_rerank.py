@@ -71,7 +71,10 @@ def rerank_dense_candidates(
     matrix = np.asarray(vectors[rows], dtype=np.float32)
     query = _normalized(query_vector)
     dense_scores = (np.clip(matrix @ query, -1.0, 1.0) + 1.0) / 2.0
-    query_tokens = set(content_tokens(plan.normalized_query, fallback_to_all=True))
+    # The canonical semantic target is always the user's Original Query.  Query
+    # expansion/normalization may widen recall upstream, while candidate
+    # metadata remains evidence scored against that unchanged target here.
+    query_tokens = set(content_tokens(plan.original_query, fallback_to_all=True))
     max_cses = max(selection.selection_gain for selection in selections) or 1.0
     raw_coarse = dict(coarse_scores or {})
     max_coarse = max(raw_coarse.values(), default=1.0) or 1.0

@@ -189,6 +189,7 @@ class QwenCaptionBackend:
             inputs = self._processor.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
+                enable_thinking=False,
                 tokenize=True,
                 return_dict=True,
                 return_tensors="pt",
