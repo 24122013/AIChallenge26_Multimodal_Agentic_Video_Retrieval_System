@@ -38,6 +38,10 @@ from competition.run_manifest import (
     sha256_file,
     update_run_manifest,
 )
+from backend.app.services.ingestion.caption_pipeline import (
+    DEFAULT_MODEL_NAME as DEFAULT_CAPTION_MODEL_NAME,
+    DEFAULT_MODEL_REVISION as DEFAULT_CAPTION_MODEL_REVISION,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +89,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--neighbor-window-seconds", type=float, default=5.0)
     parser.add_argument("--model-cache-root", type=Path, default=None)
     parser.add_argument("--offline-model-cache", action="store_true")
+    parser.add_argument("--caption-model-name", default=DEFAULT_CAPTION_MODEL_NAME)
+    parser.add_argument(
+        "--caption-model-revision",
+        default=DEFAULT_CAPTION_MODEL_REVISION,
+    )
     parser.add_argument(
         "--caption-batch-size",
         type=int,
@@ -189,6 +198,10 @@ def build_stage_commands(
         str(model_cache_dir),
         "--model-cache-root",
         str(cache_root),
+        "--caption-model-name",
+        args.caption_model_name,
+        "--caption-model-revision",
+        args.caption_model_revision,
         "--caption-batch-size",
         str(args.caption_batch_size),
         "--caption-quantization",
@@ -499,6 +512,8 @@ def run(args: argparse.Namespace) -> Path:
             "target_density_per_second": args.target_density_per_second,
             "dedup_similarity_threshold": args.dedup_similarity_threshold,
             "endpoint_protection": args.endpoint_protection == "on",
+            "caption_model_name": args.caption_model_name,
+            "caption_model_revision": args.caption_model_revision,
             "caption_batch_size": args.caption_batch_size,
             "caption_quantization": args.caption_quantization,
         }

@@ -148,8 +148,9 @@ model/config thay vì ghi đè lineage cũ.
 ## 5. Query expansion TKIS
 
 Provider production mặc định là local `Qwen/Qwen3.5-9B` revision `c202236`; đây là
-provider sinh paraphrase thật, lazy-load một lần trước khi SigLIP được cấp phát, và dùng
-chung model cache với caption. Response cache riêng nằm tại
+provider sinh paraphrase thật, lazy-load một lần trước khi SigLIP được cấp phát. Provider
+dùng chung thư mục cache với caption nhưng giữ checkpoint 9B riêng với checkpoint caption
+4B. Response cache riêng nằm tại
 `data\model_cache\query_expansion`.
 
 Luồng xử lý cho mỗi TKIS query:

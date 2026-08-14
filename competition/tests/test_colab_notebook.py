@@ -38,6 +38,8 @@ class ColabRetrievalNotebookTest(unittest.TestCase):
             "REPO_ROOT / 'competition' / 'run_retrieval_v2.py'",
         ):
             self.assertIn(required, self.raw)
+        self.assertNotIn("Caption Qwen 9B", self.raw)
+        self.assertNotIn("GPU_MEMORY_MIB < 30000", self.raw)
         self.assertNotIn("codex/retrieval-leaderboard-v2", self.raw)
 
     def test_notebook_requires_real_query_expansion_trace(self) -> None:

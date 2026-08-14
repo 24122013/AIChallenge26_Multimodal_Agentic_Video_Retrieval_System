@@ -11,9 +11,12 @@ from typing import Any, Sequence
 from PIL import Image
 
 from backend.app.services.ingestion.caption_pipeline import (
+    DEFAULT_MODEL_NAME,
+    DEFAULT_MODEL_REVISION,
     parse_caption_output,
     run_caption_file,
 )
+from backend.app.services.ingestion.run_caption import build_parser as build_caption_parser
 from backend.app.services.ingestion.common import read_jsonl
 from backend.app.services.ingestion.object_pipeline import (
     deterministic_class_id,
@@ -59,6 +62,10 @@ class FailingCaptionBackend(FakeCaptionBackend):
 
 class RevisedCaptionBackend(FakeCaptionBackend):
     model_revision = "new-revision"
+
+
+class AlternateCaptionModelBackend(FakeCaptionBackend):
+    model_name = "alternate-caption"
 
 
 class FakeOcrBackend:
@@ -178,6 +185,18 @@ class MultimodalIngestionTest(unittest.TestCase):
         self.assertEqual(plain["caption"], "person standing beside a red car")
         self.assertEqual(plain["structured_caption"], None)
 
+    def test_caption_cli_uses_pinned_4b_defaults(self) -> None:
+        args = build_caption_parser().parse_args(
+            ["--metadata-path", str(self.metadata)]
+        )
+        self.assertEqual(DEFAULT_MODEL_NAME, "Qwen/Qwen3.5-4B")
+        self.assertEqual(
+            DEFAULT_MODEL_REVISION,
+            "c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97",
+        )
+        self.assertEqual(args.model_name, DEFAULT_MODEL_NAME)
+        self.assertEqual(args.model_revision, DEFAULT_MODEL_REVISION)
+
     def test_caption_batch_order_model_error_and_segment_determinism(self) -> None:
         output = self.root / "captions.jsonl"
         report = run_caption_file(
@@ -231,6 +250,30 @@ class MultimodalIngestionTest(unittest.TestCase):
         values = read_jsonl(output)
         self.assertEqual(len(values), 3)
         self.assertEqual({item["model_revision"] for item in values}, {"new-revision"})
+
+    def test_caption_model_change_replaces_only_its_artifact(self) -> None:
+        output = self.root / "captions.jsonl"
+        report_path = self.root / "caption_report.json"
+        run_caption_file(
+            self.metadata,
+            output_path=output,
+            report_path=report_path,
+            device="cpu",
+            backend=FakeCaptionBackend(),
+        )
+        run_caption_file(
+            self.metadata,
+            output_path=output,
+            report_path=report_path,
+            device="cpu",
+            backend=AlternateCaptionModelBackend(),
+        )
+        values = read_jsonl(output)
+        self.assertEqual(len(values), 3)
+        self.assertEqual(
+            {item["model_name"] for item in values},
+            {"alternate-caption"},
+        )
 
     def test_ppocr_normalization_geometry_unicode_threshold_and_empty(self) -> None:
         regions = normalize_regions(

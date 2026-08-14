@@ -301,6 +301,11 @@ class Phase3PipelineIntegrationTest(unittest.TestCase):
     def test_keyframes_defaults_stop_at_hard_coverage_and_require_hard_features(self) -> None:
         args = build_parser().parse_args(["keyframes"])
 
+        self.assertEqual(args.caption_model_name, "Qwen/Qwen3.5-4B")
+        self.assertEqual(
+            args.caption_model_revision,
+            "c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97",
+        )
         self.assertIsNone(args.target_keyframes)
         self.assertIsNone(args.hard_max_keyframes)
         self.assertFalse(args.allow_partial_features)

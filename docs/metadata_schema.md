@@ -242,7 +242,7 @@ File: `captions_<video_id>.jsonl`.
   "source_video_path": "data/raw/video/L27_V001.mp4",
   "schema_version": "1.0",
   "pipeline": "caption",
-  "model_name": "Qwen/Qwen3.5-9B",
+  "model_name": "Qwen/Qwen3.5-4B",
   "model_version": "5.x",
   "run_at": "2026-07-25T12:00:00+00:00",
   "status": "success",

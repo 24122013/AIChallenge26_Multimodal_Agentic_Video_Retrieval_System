@@ -80,6 +80,18 @@ class RetrievalV2RunnerTest(unittest.TestCase):
             "on",
         )
         self.assertIn("--resume", commands["keyframes"])
+        self.assertEqual(
+            commands["keyframes"][
+                commands["keyframes"].index("--caption-model-name") + 1
+            ],
+            "Qwen/Qwen3.5-4B",
+        )
+        self.assertEqual(
+            commands["keyframes"][
+                commands["keyframes"].index("--caption-model-revision") + 1
+            ],
+            "c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97",
+        )
         dense = commands["dense-index"]
         self.assertEqual(
             dense[dense.index("--source-output-root") + 1],

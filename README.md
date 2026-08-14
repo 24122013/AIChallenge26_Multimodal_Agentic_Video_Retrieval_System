@@ -148,7 +148,7 @@ Lặp lại cho mỗi file `keyframes_<video>.jsonl`. Embedding và embedding me
 
 ### 3. Sinh metadata đa phương thức
 
-Caption:
+Caption (mặc định `Qwen/Qwen3.5-4B`):
 
 ```powershell
 .\.venv\Scripts\python.exe backend\app\services\ingestion\run_caption.py `
