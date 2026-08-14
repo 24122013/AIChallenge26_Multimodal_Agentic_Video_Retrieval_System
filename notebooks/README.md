@@ -1,7 +1,16 @@
 # Colab launcher cho Retrieval v2 + BGE + grounded QA
 
-Notebook [colab_retrieval_v2_launcher.ipynb](colab_retrieval_v2_launcher.ipynb)
-là launcher end-to-end cho branch `feature/new_qa_new_model`.
+Branch `feature/new_qa_new_model` có hai launcher end-to-end cùng kiến trúc và
+cùng contract output:
+
+| Notebook | Cấu hình keyframes | GPU phù hợp | Ảnh hưởng dự kiến |
+|---|---|---|---|
+| [E2E.ipynb](E2E.ipynb) | Qwen caption 4-bit, batch 1; OCR/object batch 2; 0 worker | T4/L4 | Ít VRAM hơn; caption có thể khác nhẹ do quantization |
+| [E2E_FULL_PRECISION.ipynb](E2E_FULL_PRECISION.ipynb) | Qwen caption không quantize, batch 2; OCR batch 4; object batch 8; 2 worker | Tối thiểu khoảng 24 GB, khuyến nghị A100 40 GB | Giữ cấu hình chất lượng cũ, tốn VRAM hơn |
+
+Giảm batch và số worker chỉ đổi tốc độ/bộ nhớ, không chủ ý đổi chất lượng.
+Khác biệt chất lượng có thể đến từ Qwen caption 4-bit trong profile low-memory.
+Cả hai notebook vẫn bắt buộc BGE-M3 và BGE reranker như nhau.
 
 ## Output được giữ nguyên
 
@@ -36,7 +45,7 @@ model mới không thể âm thầm biến thành baseline cũ.
 4. Chạy tuần tự toàn bộ cell.
 5. Lần đầu cần mạng và đủ dung lượng Drive cho video artifacts/checkpoint.
 
-Notebook cài `requirements-core.txt` cộng đúng một GPU profile; không cài
+Hai notebook cài `requirements-core.txt` cộng đúng một GPU profile; không cài
 `requirements.txt` CPU. Sau install, cell preflight bắt buộc cả Torch và Paddle
 nhìn thấy CUDA.
 
@@ -53,6 +62,11 @@ bge-text-index, dense-index, predict, validate-submission
 Không đổi `RUN_ID` giữa chừng nếu muốn dùng checkpoints cũ. Nếu đổi dataset,
 source code fingerprint hoặc keyframe config, runner sẽ fail closed và yêu cầu
 run root mới.
+
+Khi so sánh hai profile, phải dùng hai `RUN_ID` riêng, ví dụ
+`new-model-lowmem-001` và `new-model-full-001`. Không resume artifact đã tạo bằng
+4-bit vào run full precision hoặc ngược lại; manifest cần giữ đúng lineage của
+cấu hình sinh keyframe/caption.
 
 ## Artifact để kiểm tra
 

@@ -120,11 +120,16 @@ Xem đầy đủ workflow và tùy chọn model trong
 
 ## Colab end-to-end và contract submission
 
-Notebook [`notebooks/colab_retrieval_v2_launcher.ipynb`](notebooks/colab_retrieval_v2_launcher.ipynb)
-chạy đủ 10 stage, build BGE-M3 index, dùng BGE reranker cho TKIS rồi tạo
+Notebook low-memory [`notebooks/E2E.ipynb`](notebooks/E2E.ipynb) và notebook
+full precision [`notebooks/E2E_FULL_PRECISION.ipynb`](notebooks/E2E_FULL_PRECISION.ipynb)
+đều chạy đủ 10 stage, build BGE-M3 index, dùng BGE reranker cho TKIS rồi tạo
 `results/submission.csv`. Output public **không đổi**: đúng 100 query trong
 `questions.csv` (50 TKIS + 50 VKIS), mỗi query 100 answer theo đúng thứ tự và
 header của `sample_submission.csv`.
+
+Profile low-memory dành cho T4/L4 và quantize Qwen caption 4-bit; caption có thể
+khác nhẹ. Profile full precision giữ cấu hình cũ nhưng cần GPU tối thiểu khoảng
+24 GB, khuyến nghị A100 40 GB. Dùng `RUN_ID` riêng cho từng profile khi benchmark.
 
 Public dataset hiện không có QA. Vì vậy notebook chạy KIS/AVS/QA smoke riêng
 sau submission và ghi `results/task_smoke.json`; QA không được thêm vào
