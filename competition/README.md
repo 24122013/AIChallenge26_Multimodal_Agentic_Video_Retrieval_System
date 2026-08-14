@@ -22,7 +22,8 @@ evidence không phải điều kiện loại candidate. Feature manifest fingerp
 ## Chạy end-to-end
 
 Runner v2 dưới đây giữ output submission cũ nhưng thêm stage BGE text index và
-BGE rerank. Dùng `required` khi mục tiêu là kiểm tra model mới thật sự chạy:
+BGE rerank. Competition profile mặc định bắt buộc cả hai BGE mode ở
+`required`; chỉ hạ xuống `off`/`optional` khi chủ động chạy local/dev:
 
 ```powershell
 .\.venv\Scripts\python.exe -m competition.run_retrieval_v2 `
@@ -42,8 +43,10 @@ validate-input -> keyframes -> index -> neighbors -> segments -> text-index
 -> bge-text-index -> dense-index -> predict -> validate-submission
 ```
 
-`bge-text-index` chỉ đọc metadata đã có, không extract video lại. BGE-M3 và
-reranker chỉ áp dụng cho TKIS trong submission; VKIS vẫn đi qua visual query.
+`bge-text-index` chỉ đọc metadata đã có, không extract video lại, và chỉ nhận
+keyframe semantic/canonical đã được chọn. Dense candidate frames bị loại khỏi
+source contract. BGE-M3 và reranker chỉ áp dụng cho TKIS trong submission; VKIS
+vẫn đi qua visual query.
 Kết quả vẫn là 100 query x 100 answer. Với benchmark chính thức, thay revision
 `main` bằng commit hash đã khóa.
 
@@ -142,14 +145,18 @@ kiểm tra từng task bằng:
 python -m backend.app.services.retrieval.run_task_smoke --task kis
 python -m backend.app.services.retrieval.run_task_smoke --task avs
 $env:QA_ANSWER_MODE = "required"
+$env:QA_BGE_DENSE_ENABLED = "true"
+$env:QA_BGE_RERANKER_ENABLED = "true"
 python -m backend.app.services.retrieval.run_task_smoke --task qa
 ```
 
 Các lệnh này cần `RETRIEVAL_*` và `QA_BGE_*` trỏ tới artifacts của run; xem
-biến môi trường đầy đủ ở README gốc. KIS/AVS không gọi Qwen answerer. QA dùng
-Top-3 evidence và trả `answered` hoặc `insufficient_evidence`. Không có ASR,
-query expansion chỉ được nhận qua input ngoài, temporal chỉ được parser đánh
-dấu handoff.
+biến môi trường đầy đủ ở README gốc. KIS/AVS không gọi Qwen answerer. QA
+non-temporal dùng tối đa Top-3 evidence. QA temporal chạy retrieval theo từng
+event, giữ toàn bộ strict chain tối đa 5 evidence; chain `relaxed_gap` hoặc
+`sparse_compat` chỉ phục vụ audit và trả `insufficient_evidence` mà không gọi
+Qwen. Không có ASR; external whole-query expansion bị bỏ qua ở temporal route
+và được ghi trong trace.
 
 Object labels là prompt-dependent evidence. Khi đổi vocabulary phải rebuild
 object artifacts, segment metadata và text index để lineage nhất quán.

@@ -1,11 +1,13 @@
 """Typed QA routing and provenance-preserving evidence bundles.
 
-The module is intentionally deterministic.  It does not translate, expand, or
-answer a question.  Expanded queries are accepted only as caller-owned input;
-temporal intent is exposed in the query plan but is not executed here.
+The module is intentionally deterministic.  It does not translate or answer a
+question.  Caller-owned expansions are supported for non-temporal QA only;
+temporal QA retrieves every parsed event through this same routing stack.
 """
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -15,7 +17,9 @@ from backend.app.services.retrieval.candidate_merger import (
     merge_candidates,
 )
 from backend.app.services.retrieval.query_plan import QueryPlan, build_query_plan
+from backend.app.services.retrieval.query_terms import weighted_query_coverage
 from backend.app.services.retrieval.rank_fusion import weighted_rrf
+from backend.app.services.retrieval.temporal_search import match_ordered_events
 
 
 class HybridSearchEngineLike(Protocol):
@@ -99,6 +103,12 @@ class QaRoutingConfig:
     rrf_k: int = 60
     modality_hint_boost: float = 1.5
     consensus_bonus: float = 0.03
+    constraint_rerank_enabled: bool = True
+    constraint_weight: float = 0.15
+    constraint_min_signal: float = 0.20
+    temporal_routing_enabled: bool = True
+    temporal_max_events: int = 5
+    temporal_max_gap_seconds: float = 180.0
     weights: tuple[tuple[str, float], ...] = (
         ("visual", 0.55),
         ("caption", 0.20),
@@ -123,6 +133,14 @@ class QaRoutingConfig:
             raise ValueError("modality_hint_boost must be >= 1")
         if self.consensus_bonus < 0:
             raise ValueError("consensus_bonus must be non-negative")
+        if not 0.0 <= self.constraint_weight <= 1.0:
+            raise ValueError("constraint_weight must be between 0 and 1")
+        if not 0.0 <= self.constraint_min_signal <= 1.0:
+            raise ValueError("constraint_min_signal must be between 0 and 1")
+        if self.temporal_max_events < 1:
+            raise ValueError("temporal_max_events must be >= 1")
+        if self.temporal_max_gap_seconds < 0:
+            raise ValueError("temporal_max_gap_seconds must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -138,6 +156,16 @@ class QaEvidence:
     objects: tuple[str, ...]
     source_modalities: tuple[str, ...]
     retrieval_score: float
+    base_retrieval_score: float
+    constraint_score: float
+    matched_constraints: tuple[str, ...]
+    temporal_event_index: int | None = None
+    temporal_match_rank: int | None = None
+    temporal_match_mode: str = ""
+    temporal_chain_id: str = ""
+    temporal_event_query: str = ""
+    temporal_event_role: str = ""
+    temporal_chain_score: float | None = None
     warnings: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -153,16 +181,36 @@ class QaEvidence:
             "objects": list(self.objects),
             "source_modalities": list(self.source_modalities),
             "retrieval_score": self.retrieval_score,
+            "base_retrieval_score": self.base_retrieval_score,
+            "constraint_score": self.constraint_score,
+            "matched_constraints": list(self.matched_constraints),
+            "temporal_event_index": self.temporal_event_index,
+            "temporal_match_rank": self.temporal_match_rank,
+            "temporal_match_mode": self.temporal_match_mode,
+            "temporal_chain_id": self.temporal_chain_id,
+            "temporal_event_query": self.temporal_event_query,
+            "temporal_event_role": self.temporal_event_role,
+            "temporal_chain_score": self.temporal_chain_score,
             "warnings": list(self.warnings),
         }
 
 
+@dataclass(frozen=True)
+class _ConstraintEvidence:
+    base_score: float
+    constraint_score: float = 0.0
+    matched_constraints: tuple[str, ...] = ()
+
+
 @dataclass
 class _RoutingTrace:
-    queries: list[dict[str, str]] = field(default_factory=list)
+    queries: list[dict[str, Any]] = field(default_factory=list)
     modality_queries: list[dict[str, Any]] = field(default_factory=list)
     fallback_used: bool = False
     reranker: str = "off"
+    constraint_rerank: dict[str, Any] = field(default_factory=dict)
+    temporal_route: dict[str, Any] = field(default_factory=dict)
+    fallback_reasons: list[str] = field(default_factory=list)
 
     def to_dict(
         self,
@@ -181,12 +229,17 @@ class _RoutingTrace:
             "fusion_pool_size": config.fusion_pool_size,
             "rerank_pool_size": config.rerank_pool_size,
             "fallback_used": self.fallback_used,
+            "fallback_reasons": list(dict.fromkeys(self.fallback_reasons)),
             "reranker": self.reranker,
+            "constraint_rerank": dict(self.constraint_rerank),
+            "temporal_route": dict(self.temporal_route),
             "temporal_handoff": plan.needs_temporal,
             "feature_flags": {
                 "typed_parser": config.typed_parser_enabled,
                 "qa_router": config.router_enabled,
                 "evidence_bundle": config.evidence_bundle_enabled,
+                "constraint_rerank": config.constraint_rerank_enabled,
+                "temporal_routing": config.temporal_routing_enabled,
             },
         }
 
@@ -241,6 +294,8 @@ class QaEvidenceSearchEngine:
                 answer_type="unknown",
                 retrieval_statement=plan.normalized_query,
                 known_constraints=(),
+                constraint_roles=(),
+                answer_event_index=None,
                 confidence=0.0,
                 reasons=(*plan.reasons, "typed parser disabled by feature flag"),
                 modality_queries=tuple(
@@ -248,60 +303,85 @@ class QaEvidenceSearchEngine:
                     for modality in ("visual", "caption", "objects", "ocr")
                 ),
             )
+        if (
+            plan.needs_temporal
+            and self.config.temporal_routing_enabled
+        ):
+            return self._search_temporal(
+                plan,
+                requested_top_k=requested_top_k,
+                expanded_queries=expanded_queries or (),
+            )
+
         external_queries = _external_queries(
             expanded_queries or (),
             base_query=plan.retrieval_statement,
         )
-        queries = (plan.retrieval_statement, *external_queries)
+        query_specs = _query_branches(plan, external_queries)
+        queries = tuple(query for query, _source in query_specs)
         trace = _RoutingTrace(
             queries=[
                 {
                     "query": query,
-                    "source": "parser" if index == 0 else "external_expansion",
+                    "source": source,
                 }
-                for index, query in enumerate(queries)
-            ]
+                for query, source in query_specs
+            ],
+            temporal_route={
+                "executed": False,
+                "event_queries": [],
+                "event_count": 0,
+                "match_count": 0,
+                "match_mode": "none",
+                "warnings": (
+                    ["temporal_routing_disabled"]
+                    if plan.needs_temporal
+                    else []
+                ),
+                "answer_eligible": not plan.needs_temporal,
+                "reason": (
+                    "temporal_routing_disabled"
+                    if plan.needs_temporal
+                    else None
+                ),
+                "external_expansions_ignored": False,
+            },
         )
+        if plan.needs_temporal:
+            trace.fallback_used = True
+            _append_reason(trace, "temporal:temporal_routing_disabled")
 
         query_groups: list[list[RetrievalResult]] = []
         conflict_sources: list[RetrievalResult] = []
-        for query in queries:
-            modality_groups = (
-                self._retrieve_modalities(query, plan, trace)
-                if self.config.router_enabled
-                else {}
+        for query, source in query_specs:
+            group, sources = self._retrieve_and_fuse(
+                query,
+                plan=plan,
+                trace=trace,
+                use_plan_queries=source in {"parser", "full_proposition"},
             )
-            conflict_sources.extend(
-                result for group in modality_groups.values() for result in group
-            )
-            if not modality_groups:
-                trace.fallback_used = True
-                fallback = self.hybrid_engine.search(
-                    query,
-                    top_k=self.config.per_modality_limit,
-                ).results
-                modality_groups = {"hybrid": fallback}
-                conflict_sources.extend(fallback)
-            query_groups.append(
-                _rrf_results(
-                    modality_groups,
-                    plan=plan,
-                    config=self.config,
-                )
-            )
+            query_groups.append(group)
+            conflict_sources.extend(sources)
 
         fused_pool = _fuse_evidence(
             query_groups,
-            top_k=(
-                self.config.rerank_pool_size
-                if self.candidate_reranker is not None
-                else self.config.fusion_pool_size
-            ),
+            top_k=self.config.rerank_pool_size,
             consensus_bonus=self.config.consensus_bonus,
         )
-        reranked = self._rerank(plan.retrieval_statement, fused_pool, trace)
+        rerank_query = (
+            _neutral_context_query(plan)
+            if plan.answer_type == "yes_no"
+            else plan.retrieval_statement
+        )
+        reranked = self._rerank(rerank_query, fused_pool, trace)
+        constrained, constraint_details = self._constraint_rerank(
+            reranked,
+            plan=plan,
+            trace=trace,
+        )
+        final_pool = constrained[: self.config.fusion_pool_size]
         selected = merge_candidates(
-            [reranked],
+            [final_pool],
             top_k=requested_top_k,
             dedupe_same_shot=True,
         )
@@ -312,6 +392,10 @@ class QaEvidenceSearchEngine:
                     result,
                     index=index,
                     conflict_keys=conflict_keys,
+                    constraint_detail=constraint_details.get(
+                        candidate_identity(result),
+                        _ConstraintEvidence(base_score=float(result.score)),
+                    ),
                 )
                 for index, result in enumerate(
                     selected[:evidence_top_k],
@@ -321,28 +405,276 @@ class QaEvidenceSearchEngine:
             if self.config.evidence_bundle_enabled
             else []
         )
+        answer_eligible = bool(evidence) and not plan.needs_temporal
+        trace.temporal_route["answer_eligible"] = answer_eligible
+        trace.temporal_route["reason"] = (
+            "temporal_routing_disabled"
+            if plan.needs_temporal
+            else (None if answer_eligible else "no_evidence")
+        )
         return {
             **_legacy_plan_fields(plan, queries),
             "query_plan": plan.to_dict(),
             "routing_trace": trace.to_dict(plan=plan, config=self.config),
             "top_k": requested_top_k,
             "answer_mode": "manual_visual_inspection",
+            "answer_eligible": answer_eligible,
+            "preflight_block_reason": (
+                "temporal_routing_disabled"
+                if plan.needs_temporal
+                else (None if answer_eligible else "no_evidence")
+            ),
+            "temporal_matches": [],
             "evidence_count": len(evidence),
             "evidence": [item.to_dict() for item in evidence],
             # Kept for /retrieval/qa-evidence and mode=qa compatibility.
             "results": [result.to_dict() for result in selected],
         }
 
+    def _search_temporal(
+        self,
+        plan: QueryPlan,
+        *,
+        requested_top_k: int,
+        expanded_queries: Sequence[str],
+    ) -> dict[str, Any]:
+        events = tuple(
+            " ".join(str(event).split())
+            for event in getattr(plan, "temporal_events", ())
+            if " ".join(str(event).split())
+        )
+        if len(events) > self.config.temporal_max_events:
+            raise ValueError(
+                "temporal_query_too_complex: "
+                f"supports at most {self.config.temporal_max_events} events"
+            )
+        if not events:
+            events = (plan.retrieval_statement,)
+
+        ignored_expansions = bool(tuple(expanded_queries))
+        trace = _RoutingTrace(
+            queries=[
+                {
+                    "query": event,
+                    "source": "temporal_event",
+                    "event_index": index,
+                }
+                for index, event in enumerate(events)
+            ],
+            temporal_route={
+                "executed": True,
+                "event_queries": list(events),
+                "event_count": len(events),
+                "external_expansions_ignored": ignored_expansions,
+            },
+        )
+        if ignored_expansions:
+            trace.fallback_reasons.append(
+                "external_expansions_ignored_for_temporal"
+            )
+
+        event_results: list[list[RetrievalResult]] = []
+        detail_by_event: dict[
+            tuple[int, tuple[str, str]],
+            _ConstraintEvidence,
+        ] = {}
+        conflict_sources: list[RetrievalResult] = []
+        constraint_reports: list[dict[str, Any]] = []
+        for event_index, event in enumerate(events):
+            group, sources = self._retrieve_and_fuse(
+                event,
+                plan=plan,
+                trace=trace,
+                use_plan_queries=False,
+            )
+            conflict_sources.extend(sources)
+            reranked = self._rerank(event, group, trace)
+            constrained, details = self._constraint_rerank(
+                reranked,
+                plan=plan,
+                trace=trace,
+                query_scope=event,
+            )
+            constraint_reports.append(dict(trace.constraint_rerank))
+            pool = constrained[: self.config.fusion_pool_size]
+            event_results.append(pool)
+            for identity, detail in details.items():
+                detail_by_event[(event_index, identity)] = detail
+
+        matches = match_ordered_events(
+            event_results,
+            max_gap_seconds=self.config.temporal_max_gap_seconds,
+            top_k=requested_top_k,
+            event_queries=list(events),
+        )
+        best_match = matches[0] if matches else None
+        best_events = list(best_match.events) if best_match is not None else []
+        match_mode = best_match.match_mode if best_match is not None else "none"
+        route_warnings = list(best_match.warnings) if best_match is not None else [
+            "temporal_no_chain"
+        ]
+        event_roles, target_valid, target_reason = _temporal_event_roles(
+            plan,
+            len(events),
+        )
+        complete_chain = bool(best_match and len(best_events) == len(events))
+        if best_match is None:
+            block_reason = "temporal_no_chain"
+        elif match_mode != "strict":
+            block_reason = f"temporal_match_not_strict:{match_mode}"
+        elif not complete_chain:
+            block_reason = "temporal_chain_incomplete"
+        elif not target_valid:
+            block_reason = target_reason
+        else:
+            block_reason = None
+        answer_eligible = block_reason is None
+        if not answer_eligible:
+            trace.fallback_used = True
+            _append_reason(trace, f"temporal:{block_reason}")
+        constraint_applied = any(
+            bool(report.get("applied"))
+            for report in constraint_reports
+        )
+        trace.constraint_rerank = {
+            "per_event": constraint_reports,
+            "applied": constraint_applied,
+            "status": "applied" if constraint_applied else "not_applied",
+            "weight": self.config.constraint_weight,
+            "min_signal": self.config.constraint_min_signal,
+            "max_signal": max(
+                (
+                    float(report.get("max_signal", 0.0))
+                    for report in constraint_reports
+                ),
+                default=0.0,
+            ),
+        }
+        trace.temporal_route.update(
+            {
+                "match_count": len(matches),
+                "match_mode": match_mode,
+                "warnings": route_warnings,
+                "answer_eligible": answer_eligible,
+                "reason": block_reason,
+                "answer_event_index": plan.answer_event_index,
+                "chain_id": best_match.chain_id if best_match else "",
+                "chain_score": best_match.score if best_match else None,
+            }
+        )
+
+        conflict_keys = _conflicting_shots(conflict_sources)
+        evidence = []
+        if self.config.evidence_bundle_enabled and best_match is not None:
+            for evidence_index, result in enumerate(
+                best_events,
+                start=1,
+            ):
+                event_index = evidence_index - 1
+                evidence.append(
+                    _build_evidence(
+                        result,
+                        index=evidence_index,
+                        conflict_keys=conflict_keys,
+                        constraint_detail=detail_by_event.get(
+                            (event_index, candidate_identity(result)),
+                            _ConstraintEvidence(
+                                base_score=float(result.score)
+                            ),
+                        ),
+                        temporal_event_index=event_index,
+                        temporal_match_rank=1,
+                        temporal_match_mode=match_mode,
+                        temporal_chain_id=best_match.chain_id,
+                        temporal_event_query=events[event_index],
+                        temporal_event_role=event_roles[event_index],
+                        temporal_chain_score=best_match.score,
+                        extra_warnings=best_match.warnings,
+                    )
+                )
+
+        temporal_results = []
+        if best_match is not None:
+            for event_index, result in enumerate(best_events):
+                payload = result.to_dict()
+                payload.update(
+                    {
+                        "temporal_event_index": event_index,
+                        "temporal_match_rank": 1,
+                        "temporal_match_mode": match_mode,
+                        "temporal_chain_id": best_match.chain_id,
+                        "temporal_event_query": events[event_index],
+                        "temporal_event_role": event_roles[event_index],
+                        "temporal_chain_score": best_match.score,
+                    }
+                )
+                temporal_results.append(payload)
+
+        return {
+            **_legacy_plan_fields(plan, events),
+            "query_plan": plan.to_dict(),
+            "routing_trace": trace.to_dict(plan=plan, config=self.config),
+            "top_k": requested_top_k,
+            "answer_mode": "manual_visual_inspection",
+            "answer_eligible": answer_eligible,
+            "preflight_block_reason": block_reason,
+            "temporal_matches": [match.to_dict() for match in matches],
+            "evidence_count": len(evidence),
+            "evidence": [item.to_dict() for item in evidence],
+            "results": temporal_results,
+        }
+
+    def _retrieve_and_fuse(
+        self,
+        query: str,
+        *,
+        plan: QueryPlan,
+        trace: _RoutingTrace,
+        use_plan_queries: bool,
+    ) -> tuple[list[RetrievalResult], list[RetrievalResult]]:
+        modality_groups = (
+            self._retrieve_modalities(
+                query,
+                plan,
+                trace,
+                use_plan_queries=use_plan_queries,
+            )
+            if self.config.router_enabled
+            else {}
+        )
+        conflict_sources = [
+            result
+            for group in modality_groups.values()
+            for result in group
+        ]
+        if not modality_groups:
+            trace.fallback_used = True
+            _append_reason(trace, "hybrid_router_fallback")
+            fallback = self.hybrid_engine.search(
+                query,
+                top_k=self.config.per_modality_limit,
+            ).results
+            modality_groups = {"hybrid": fallback}
+            conflict_sources.extend(fallback)
+        fused = _rrf_results(
+                modality_groups,
+                plan=plan,
+                config=self.config,
+            )
+        return (fused[: self.config.rerank_pool_size], conflict_sources)
+
     def _retrieve_modalities(
         self,
         query: str,
         plan: QueryPlan,
         trace: _RoutingTrace,
+        *,
+        use_plan_queries: bool,
     ) -> dict[str, list[RetrievalResult]]:
         groups: dict[str, list[RetrievalResult]] = {}
         visual_engine = getattr(self.hybrid_engine, "visual_engine", None)
         if visual_engine is not None:
-            visual_query = plan.query_for("visual") if query == plan.retrieval_statement else query
+            visual_query = plan.query_for("visual") if use_plan_queries else query
             results = visual_engine.search(
                 visual_query,
                 top_k=self.config.per_modality_limit,
@@ -358,7 +690,7 @@ class QaEvidenceSearchEngine:
 
         text_engines = getattr(self.hybrid_engine, "text_engines", {})
         for modality, engine in sorted(dict(text_engines or {}).items()):
-            modality_query = plan.query_for(modality) if query == plan.retrieval_statement else query
+            modality_query = plan.query_for(modality) if use_plan_queries else query
             results = engine.search_results(
                 modality_query,
                 top_k=self.config.per_modality_limit,
@@ -389,6 +721,7 @@ class QaEvidenceSearchEngine:
                 )
             except Exception as exc:  # noqa: BLE001 - feature-flag fallback.
                 trace.fallback_used = True
+                _append_reason(trace, f"dense_text:{type(exc).__name__}")
                 trace.modality_queries.append(
                     {
                         "query": query,
@@ -411,7 +744,7 @@ class QaEvidenceSearchEngine:
             output = self.candidate_reranker.rerank(
                 query,
                 candidates,
-                top_k=self.config.fusion_pool_size,
+                top_k=self.config.rerank_pool_size,
             )
             if hasattr(output, "results"):
                 output = output.results
@@ -423,10 +756,119 @@ class QaEvidenceSearchEngine:
                 if isinstance(report, Mapping) and report.get("status") == "fallback"
                 else "applied"
             )
+            if trace.reranker.startswith("fallback:"):
+                trace.fallback_used = True
+                _append_reason(trace, f"reranker:{trace.reranker}")
             return list(output)
         except Exception as exc:  # noqa: BLE001 - documented Phase 5 fallback.
             trace.reranker = f"fallback:{type(exc).__name__}"
+            trace.fallback_used = True
+            _append_reason(trace, f"reranker:{type(exc).__name__}")
             return candidates
+
+    def _constraint_rerank(
+        self,
+        candidates: list[RetrievalResult],
+        *,
+        plan: QueryPlan,
+        trace: _RoutingTrace,
+        query_scope: str | None = None,
+    ) -> tuple[
+        list[RetrievalResult],
+        dict[tuple[str, str], _ConstraintEvidence],
+    ]:
+        base_details = {
+            candidate_identity(candidate): _ConstraintEvidence(
+                base_score=float(candidate.score)
+            )
+            for candidate in candidates
+        }
+        if not self.config.constraint_rerank_enabled:
+            trace.constraint_rerank = {
+                "applied": False,
+                "status": "disabled",
+                "weight": self.config.constraint_weight,
+                "min_signal": self.config.constraint_min_signal,
+            }
+            return candidates, base_details
+
+        constraints = _context_constraints(plan, query_scope=query_scope)
+        if not constraints:
+            trace.constraint_rerank = {
+                "applied": False,
+                "status": "no_context_constraints",
+                "weight": self.config.constraint_weight,
+                "min_signal": self.config.constraint_min_signal,
+            }
+            return candidates, base_details
+
+        try:
+            scored: list[
+                tuple[int, RetrievalResult, float, tuple[str, ...]]
+            ] = []
+            for index, candidate in enumerate(candidates):
+                score, matched = _constraint_score(candidate, constraints)
+                scored.append((index, candidate, score, matched))
+            max_signal = max((item[2] for item in scored), default=0.0)
+            details = {
+                candidate_identity(candidate): _ConstraintEvidence(
+                    base_score=float(candidate.score),
+                    constraint_score=round(score, 8),
+                    matched_constraints=matched,
+                )
+                for _index, candidate, score, matched in scored
+            }
+            if max_signal < self.config.constraint_min_signal:
+                trace.constraint_rerank = {
+                    "applied": False,
+                    "status": "below_min_signal",
+                    "weight": self.config.constraint_weight,
+                    "min_signal": self.config.constraint_min_signal,
+                    "max_signal": round(max_signal, 8),
+                    "candidate_count": len(candidates),
+                }
+                return candidates, details
+
+            constraint_weight = self.config.constraint_weight
+            reranked = [
+                (
+                    index,
+                    replace(
+                        candidate,
+                        score=round(
+                            (1.0 - constraint_weight) * float(candidate.score)
+                            + constraint_weight * score,
+                            8,
+                        ),
+                    ),
+                )
+                for index, candidate, score, _matched in scored
+            ]
+            reranked.sort(key=lambda item: (-item[1].score, item[0]))
+            trace.constraint_rerank = {
+                "applied": True,
+                "status": "applied",
+                "weight": constraint_weight,
+                "min_signal": self.config.constraint_min_signal,
+                "max_signal": round(max_signal, 8),
+                "candidate_count": len(candidates),
+                "context_constraints": {
+                    category: list(values)
+                    for category, values in constraints.items()
+                },
+            }
+            return [item[1] for item in reranked], details
+        except Exception as exc:  # noqa: BLE001 - fail-open is the contract.
+            trace.fallback_used = True
+            _append_reason(trace, f"constraint_rerank:{type(exc).__name__}")
+            trace.constraint_rerank = {
+                "applied": False,
+                "status": "scorer_error",
+                "weight": self.config.constraint_weight,
+                "min_signal": self.config.constraint_min_signal,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            return candidates, base_details
 
 
 def plan_qa_question(
@@ -436,6 +878,46 @@ def plan_qa_question(
 ) -> QueryPlan:
     """Return the shared immutable QueryPlan contract for QA."""
     return build_query_plan(question, task_mode=task_mode)
+
+
+def _temporal_event_roles(
+    plan: QueryPlan,
+    event_count: int,
+) -> tuple[tuple[str, ...], bool, str | None]:
+    """Assign answer/context roles and validate the parser's target contract."""
+
+    if plan.answer_type == "yes_no":
+        if plan.answer_event_index is not None:
+            return (
+                tuple("whole_chain" for _ in range(event_count)),
+                False,
+                "temporal_yes_no_target_must_be_whole_chain",
+            )
+        return (
+            tuple("whole_chain" for _ in range(event_count)),
+            True,
+            None,
+        )
+
+    answer_index = plan.answer_event_index
+    if (
+        isinstance(answer_index, bool)
+        or not isinstance(answer_index, int)
+        or not 0 <= answer_index < event_count
+    ):
+        return (
+            tuple("context" for _ in range(event_count)),
+            False,
+            "temporal_answer_target_missing",
+        )
+    return (
+        tuple(
+            "answer_target" if index == answer_index else "context"
+            for index in range(event_count)
+        ),
+        True,
+        None,
+    )
 
 
 def _legacy_plan_fields(
@@ -448,6 +930,216 @@ def _legacy_plan_fields(
         "answer_type": plan.answer_type,
         "retrieval_queries": list(queries),
     }
+
+
+def _query_branches(
+    plan: QueryPlan,
+    external_queries: Sequence[str],
+) -> tuple[tuple[str, str], ...]:
+    base_query = plan.retrieval_statement or plan.retrieval_query
+    branches: list[tuple[str, str]] = []
+    if plan.answer_type == "yes_no":
+        neutral_query = _neutral_context_query(plan)
+        if neutral_query and neutral_query.casefold() != base_query.casefold():
+            branches.append((neutral_query, "neutral_context"))
+        branches.append((base_query, "full_proposition"))
+    else:
+        branches.append((base_query, "parser"))
+    branches.extend((query, "external_expansion") for query in external_queries)
+    return tuple(branches)
+
+
+def _neutral_context_query(plan: QueryPlan) -> str:
+    context = _context_constraints(plan)
+    phrases = [
+        phrase
+        for values in context.values()
+        for phrase in values
+    ]
+    if phrases:
+        return " ".join(dict.fromkeys(phrases))
+
+    query = plan.retrieval_statement or plan.retrieval_query
+    for phrase in _hypothesis_phrases(plan):
+        query = re.sub(
+            rf"(?<!\w){re.escape(phrase)}(?!\w)",
+            " ",
+            query,
+            flags=re.IGNORECASE,
+        )
+    query = re.sub(
+        r"^\s*(?:is|are|was|were|do|does|did|has|have|can|could|có|phải|liệu)\s+",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"\bkhông\s*$", "", query, flags=re.IGNORECASE)
+    return " ".join(query.split()).strip(" ?.!;,")
+
+
+def _context_constraints(
+    plan: QueryPlan,
+    *,
+    query_scope: str | None = None,
+) -> dict[str, tuple[str, ...]]:
+    payload = plan.to_dict()
+    raw_constraints = payload.get("known_constraints", plan.constraints)
+    if not isinstance(raw_constraints, Mapping):
+        raw_constraints = plan.constraints
+    roles = _constraint_roles(plan)
+    context: dict[str, tuple[str, ...]] = {}
+    for raw_category, raw_values in raw_constraints.items():
+        category = str(raw_category)
+        if isinstance(raw_values, str):
+            values: Sequence[object] = (raw_values,)
+        elif isinstance(raw_values, Sequence):
+            values = raw_values
+        else:
+            continue
+        accepted: list[str] = []
+        for raw_phrase in values:
+            phrase = " ".join(str(raw_phrase).split())
+            if not phrase:
+                continue
+            role = roles.get(category, {}).get(phrase.casefold(), "context")
+            if role != "context":
+                continue
+            accepted.append(phrase)
+        if accepted:
+            context[category] = tuple(dict.fromkeys(accepted))
+
+    # Whole-query constraints can contain later event actions.  For an event
+    # retrieval, retain subjects as cross-event anchors and only use other
+    # phrases that actually occur in the clean event clause.  If the parser
+    # cannot align a phrase, retrieval remains fail-open rather than guessing.
+    if query_scope:
+        scoped: dict[str, tuple[str, ...]] = {}
+        normalized_scope = _normalize_match_text(query_scope)
+        for category, values in context.items():
+            kept = tuple(
+                phrase
+                for phrase in values
+                if category == "subject"
+                or _normalized_phrase_present(phrase, normalized_scope)
+            )
+            if kept:
+                scoped[category] = kept
+        return scoped
+    return context
+
+
+def _hypothesis_phrases(plan: QueryPlan) -> tuple[str, ...]:
+    roles = _constraint_roles(plan)
+    return tuple(
+        phrase
+        for category_roles in roles.values()
+        for phrase, role in category_roles.items()
+        if role == "hypothesis"
+    )
+
+
+def _constraint_roles(plan: QueryPlan) -> dict[str, dict[str, str]]:
+    payload = plan.to_dict()
+    raw = payload.get("constraint_roles")
+    if raw is None:
+        raw = getattr(plan, "constraint_roles", ())
+    normalized: dict[str, dict[str, str]] = {}
+    entries = raw.items() if isinstance(raw, Mapping) else raw or ()
+    for entry in entries:
+        try:
+            raw_category, raw_roles = entry
+        except (TypeError, ValueError):
+            continue
+        category = str(raw_category)
+        role_entries = (
+            raw_roles.items()
+            if isinstance(raw_roles, Mapping)
+            else raw_roles or ()
+        )
+        category_roles: dict[str, str] = {}
+        for role_entry in role_entries:
+            try:
+                raw_phrase, raw_role = role_entry
+            except (TypeError, ValueError):
+                continue
+            role = str(raw_role).strip().casefold()
+            if role not in {"context", "hypothesis"}:
+                continue
+            category_roles[str(raw_phrase).casefold()] = role
+        if category_roles:
+            normalized[category] = category_roles
+    return normalized
+
+
+def _constraint_score(
+    candidate: RetrievalResult,
+    constraints: Mapping[str, Sequence[str]],
+) -> tuple[float, tuple[str, ...]]:
+    category_scores: list[float] = []
+    matched: list[str] = []
+    for category, phrases in constraints.items():
+        fields = _constraint_fields(candidate, category)
+        if not fields:
+            category_scores.append(0.0)
+            continue
+        phrase_scores: list[float] = []
+        for phrase in phrases:
+            normalized_phrase = _normalize_match_text(phrase)
+            exact = any(
+                _normalized_phrase_present(phrase, _normalize_match_text(text))
+                for text in fields
+            )
+            score = 1.0 if exact else max(
+                (weighted_query_coverage(phrase, text) for text in fields),
+                default=0.0,
+            )
+            bounded = max(0.0, min(1.0, float(score)))
+            phrase_scores.append(bounded)
+            if bounded > 0.0 and normalized_phrase:
+                matched.append(f"{category}:{phrase}")
+        if phrase_scores:
+            category_scores.append(sum(phrase_scores) / len(phrase_scores))
+    if not category_scores:
+        return 0.0, ()
+    return (
+        sum(category_scores) / len(category_scores),
+        tuple(dict.fromkeys(matched)),
+    )
+
+
+def _constraint_fields(
+    candidate: RetrievalResult,
+    category: str,
+) -> tuple[str, ...]:
+    normalized = category.strip().casefold()
+    if normalized in {"subject", "subjects", "object", "objects"}:
+        return tuple(
+            text
+            for text in (candidate.caption, " ".join(candidate.objects))
+            if str(text).strip()
+        )
+    if normalized in {"attributes", "actions", "locations"}:
+        return (candidate.caption,) if candidate.caption.strip() else ()
+    if normalized == "ocr_terms":
+        return (candidate.ocr_text,) if candidate.ocr_text.strip() else ()
+    return ()
+
+
+def _normalize_match_text(value: object) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value)).casefold()
+    return " ".join(re.findall(r"[^\W_]+", normalized, re.UNICODE))
+
+
+def _normalized_phrase_present(phrase: str, normalized_text: str) -> bool:
+    normalized_phrase = _normalize_match_text(phrase)
+    if not normalized_phrase or not normalized_text:
+        return False
+    return f" {normalized_phrase} " in f" {normalized_text} "
+
+
+def _append_reason(trace: _RoutingTrace, reason: str) -> None:
+    if reason not in trace.fallback_reasons:
+        trace.fallback_reasons.append(reason)
 
 
 def _external_queries(
@@ -585,8 +1277,17 @@ def _build_evidence(
     *,
     index: int,
     conflict_keys: set[tuple[str, str]],
+    constraint_detail: _ConstraintEvidence,
+    temporal_event_index: int | None = None,
+    temporal_match_rank: int | None = None,
+    temporal_match_mode: str = "",
+    temporal_chain_id: str = "",
+    temporal_event_query: str = "",
+    temporal_event_role: str = "",
+    temporal_chain_score: float | None = None,
+    extra_warnings: Sequence[str] = (),
 ) -> QaEvidence:
-    warnings: list[str] = []
+    warnings: list[str] = list(extra_warnings)
     image_path = result.keyframe_path or result.thumbnail_path
     if not image_path:
         warnings.append("missing_image_path")
@@ -613,5 +1314,15 @@ def _build_evidence(
         objects=tuple(str(value) for value in result.objects),
         source_modalities=modalities,
         retrieval_score=round(float(result.score), 8),
-        warnings=tuple(warnings),
+        base_retrieval_score=round(float(constraint_detail.base_score), 8),
+        constraint_score=round(float(constraint_detail.constraint_score), 8),
+        matched_constraints=constraint_detail.matched_constraints,
+        temporal_event_index=temporal_event_index,
+        temporal_match_rank=temporal_match_rank,
+        temporal_match_mode=temporal_match_mode,
+        temporal_chain_id=temporal_chain_id,
+        temporal_event_query=temporal_event_query,
+        temporal_event_role=temporal_event_role,
+        temporal_chain_score=temporal_chain_score,
+        warnings=tuple(dict.fromkeys(warnings)),
     )

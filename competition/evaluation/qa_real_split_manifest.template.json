@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "qa_real_dataset_manifest_template",
+  "example_only": false,
+  "labels_adjudicated": false,
+  "dataset_sha256": "REPLACE_AFTER_ADJUDICATION",
+  "annotation_policy": {
+    "independent_annotators": 2,
+    "adjudication_required": true,
+    "answer_aliases_allowed": true,
+    "multiple_evidence_windows_allowed": true
+  },
+  "required_quotas_per_split": {
+    "query_count": 80,
+    "languages": {
+      "vi": 40,
+      "en": 40
+    },
+    "unanswerable_count_min": 16,
+    "temporal_count_min": 16,
+    "constraint_heavy_count_min": 24
+  },
+  "splits": {
+    "dev": {
+      "query_count": 0,
+      "query_ids": [],
+      "languages": {
+        "vi": 0,
+        "en": 0
+      },
+      "unanswerable_count": 0,
+      "temporal_count": 0,
+      "constraint_heavy_count": 0,
+      "dataset_sha256": "REPLACE",
+      "query_ids_sha256": "REPLACE"
+    },
+    "locked_test": {
+      "query_count": 0,
+      "query_ids": [],
+      "languages": {
+        "vi": 0,
+        "en": 0
+      },
+      "unanswerable_count": 0,
+      "temporal_count": 0,
+      "constraint_heavy_count": 0,
+      "dataset_sha256": "REPLACE",
+      "query_ids_sha256": "REPLACE"
+    }
+  },
+  "locked_test_policy": {
+    "reuse": "single_use",
+    "labels_hidden": true,
+    "receipt_required": true
+  }
+}

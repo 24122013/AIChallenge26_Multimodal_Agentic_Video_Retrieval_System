@@ -27,7 +27,8 @@ query -> visual/text/temporal retrieval -> hybrid rerank -> evidence
 - Dense text: `BAAI/bge-m3` (1024 chiều, FAISS IP); BM25 vẫn được giữ để bắt
   exact keyword/OCR.
 - QA rerank: `BAAI/bge-reranker-v2-m3`; grounded answer dùng
-  `Qwen/Qwen3.5-9B@c202236`, mặc định tắt và chỉ load khi chạy QA.
+  `Qwen/Qwen3.5-9B@c202236235762e1c871ad0ccb60c8ee5ba337b9a`, mặc định
+  tắt và chỉ load khi chạy QA.
 
 ## Cài đặt
 
@@ -187,6 +188,12 @@ evidence bundle, BGE dense và BGE reranker có feature flag riêng. Smoke chỉ
 nhận checkpoint/artifact/contract chạy được; muốn so chất lượng phải dùng dev
 labels, và locked test chỉ được mở một lần theo policy trong
 `competition/evaluation/`.
+
+BGE-M3 chỉ index metadata của keyframe semantic/canonical đã được chọn; dense
+candidate frames không thuộc source contract này. Với QA non-temporal, answerer
+nhận tối đa Top-3 evidence. Với temporal, chỉ chain `strict` đầy đủ (tối đa 5
+event) mới được gọi Qwen; `relaxed_gap` và `sparse_compat` chỉ trả chain để audit
+và abstain.
 
 ## Schema metadata chính
 

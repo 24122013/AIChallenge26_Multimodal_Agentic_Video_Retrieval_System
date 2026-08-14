@@ -64,9 +64,19 @@ class RetrievalV2RunnerTest(unittest.TestCase):
             str(self.run_root.resolve()),
         )
         self.assertEqual(predict[predict.index("--vlm-mode") + 1], "off")
-        self.assertEqual(predict[predict.index("--bge-dense-mode") + 1], "off")
-        self.assertEqual(predict[predict.index("--bge-reranker-mode") + 1], "off")
+        self.assertEqual(predict[predict.index("--bge-dense-mode") + 1], "required")
+        self.assertEqual(
+            predict[predict.index("--bge-reranker-mode") + 1],
+            "required",
+        )
         self.assertIn("--model-revision", commands["bge-text-index"])
+        self.assertIn("--canonical-only", commands["bge-text-index"])
+        self.assertEqual(
+            commands["bge-text-index"][
+                commands["bge-text-index"].index("--metadata") + 1
+            ],
+            str(self.run_root.resolve() / "metadata"),
+        )
         self.assertTrue(predict[predict.index("--retrieval-config") + 1].endswith("retrieval.yaml"))
 
     def test_stage_range_is_ordered(self) -> None:
@@ -137,9 +147,7 @@ class RetrievalV2RunnerTest(unittest.TestCase):
 
         run(self._args())
 
-        # The disabled BGE index stage is an explicit passed/skipped stage and
-        # therefore does not spawn a subprocess.
-        self.assertEqual(stage_mock.call_count, len(STAGES) - 1)
+        self.assertEqual(stage_mock.call_count, len(STAGES))
         append_mock.assert_called_once()
         manifest = (self.run_root / "run_manifest.json").read_text(encoding="utf-8")
         self.assertIn('"status": "architecture_complete"', manifest)

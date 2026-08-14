@@ -129,6 +129,200 @@ class QueryParserV2Test(unittest.TestCase):
         self.assertEqual(plan.retrieval_statement, "Khung cảnh này thế nào")
         self.assertEqual(plan.expansions, ())
 
+    def test_bilingual_answer_type_collisions(self) -> None:
+        cases = (
+            ("Biển hiệu phía trên cửa ghi chữ gì?", "ocr"),
+            ("What number is printed on the runner's bib?", "ocr"),
+            ("How many runners are visible?", "count"),
+            ("Người đi xe đạp có đội mũ bảo hiểm không?", "yes_no"),
+            ("Tên của con chó trong đoạn video là gì?", "identity"),
+            ("What is the cyclist's home address?", "location"),
+        )
+        for question, expected in cases:
+            with self.subTest(question=question):
+                self.assertEqual(
+                    build_query_plan(question, task_mode="qa").answer_type,
+                    expected,
+                )
+
+    def test_constraints_are_canonical_and_roles_separate_hypotheses(self) -> None:
+        object_plan = build_query_plan(
+            "What is the child in the blue shirt holding?",
+            task_mode="qa",
+        )
+        self.assertEqual(object_plan.constraints["subject"], ["child"])
+        self.assertEqual(object_plan.constraints["attributes"], ["blue shirt"])
+        self.assertNotIn("blue", object_plan.constraints["attributes"])
+        self.assertEqual(object_plan.roles["attributes"]["blue shirt"], "context")
+
+        yes_no = build_query_plan("Is the traffic light green?", task_mode="qa")
+        self.assertEqual(yes_no.roles["objects"]["traffic light"], "context")
+        self.assertEqual(yes_no.roles["attributes"]["green"], "hypothesis")
+        helmet = build_query_plan(
+            "Người đi xe đạp có đội mũ bảo hiểm không?",
+            task_mode="qa",
+        )
+        self.assertEqual(helmet.roles["subject"]["người đi xe đạp"], "context")
+        self.assertEqual(helmet.roles["objects"]["mũ bảo hiểm"], "hypothesis")
+        light = build_query_plan(
+            "Có phải đèn giao thông xanh lá không?",
+            task_mode="qa",
+        )
+        self.assertEqual(light.roles["objects"]["đèn giao thông"], "context")
+        self.assertEqual(light.roles["attributes"]["xanh lá"], "hypothesis")
+
+    def test_constraint_fallbacks_are_not_limited_to_fixture_nouns(self) -> None:
+        holding = build_query_plan("What is the chef holding?", task_mode="qa")
+        self.assertEqual(holding.constraints["subject"], ["chef"])
+        backpack = build_query_plan("Where is the backpack placed?", task_mode="qa")
+        self.assertEqual(backpack.constraints["objects"], ["backpack"])
+        trucks = build_query_plan(
+            "How many trucks are under the bridge?",
+            task_mode="qa",
+        )
+        self.assertEqual(trucks.constraints["objects"], ["trucks"])
+        self.assertEqual(trucks.constraints["locations"], ["under the bridge"])
+
+    def test_temporal_events_are_clean_ordered_and_keep_answer_semantics(self) -> None:
+        plan = build_query_plan(
+            "Tìm cảnh người đàn ông vào bếp, rồi ngồi xuống làm gì?",
+            task_mode="qa",
+        )
+        self.assertEqual(plan.temporal_events[0], "người đàn ông vào bếp")
+        self.assertEqual(plan.temporal_events[1], "ngồi xuống")
+        self.assertEqual(plan.answer_type, "action")
+        self.assertEqual(plan.answer_event_index, 1)
+        self.assertEqual(plan.to_dict()["answer_event_index"], 1)
+
+        after = build_query_plan(
+            "người đàn ông ngồi sau khi vào bếp",
+            task_mode="temporal",
+        )
+        self.assertEqual(after.temporal_events, ("vào bếp", "người đàn ông ngồi"))
+        self.assertEqual(after.temporal_relation, "after")
+
+        before = build_query_plan(
+            "What did the man do before he sat down?",
+            task_mode="qa",
+        )
+        self.assertEqual(before.answer_type, "action")
+        self.assertEqual(before.temporal_events, ("the man", "he sat down"))
+        self.assertEqual(before.answer_event_index, 0)
+
+        whole_chain = build_query_plan(
+            "Người đàn ông vào bếp rồi có ngồi xuống không?",
+            task_mode="qa",
+        )
+        self.assertEqual(whole_chain.answer_type, "yes_no")
+        self.assertIsNone(whole_chain.answer_event_index)
+
+        spatial = build_query_plan(
+            "What is the woman next to the window doing?",
+            task_mode="qa",
+        )
+        self.assertFalse(spatial.needs_temporal)
+        self.assertEqual(spatial.temporal_relation, "none")
+
+    def test_preposed_mixed_and_repeated_temporal_relations_are_chronological(self) -> None:
+        before = build_query_plan(
+            "Before he sat down, what did the man do?",
+            task_mode="qa",
+        )
+        self.assertEqual(before.temporal_events, ("the man", "he sat down"))
+        self.assertEqual(before.temporal_relation, "before")
+        self.assertEqual(before.answer_event_index, 0)
+
+        after = build_query_plan(
+            "After he entered the room, what did the man do?",
+            task_mode="qa",
+        )
+        self.assertEqual(after.temporal_events, ("he entered the room", "the man"))
+        self.assertEqual(after.temporal_relation, "after")
+        self.assertEqual(after.answer_event_index, 1)
+
+        mixed = build_query_plan(
+            "He entered after opening the door, then sat down.",
+            task_mode="qa",
+        )
+        self.assertEqual(
+            mixed.temporal_events,
+            ("opening the door", "He entered", "sat down"),
+        )
+        self.assertEqual(mixed.temporal_relation, "mixed")
+
+        repeated = build_query_plan(
+            "A after B after C",
+            task_mode="temporal",
+        )
+        self.assertEqual(repeated.temporal_events, ("C", "B", "A"))
+        self.assertEqual(repeated.temporal_relation, "after")
+
+        cue_first = build_query_plan(
+            "What did the man do, then he sat down?",
+            task_mode="qa",
+        )
+        self.assertEqual(cue_first.answer_event_index, 0)
+
+    def test_yes_no_auxiliaries_generic_entities_and_predicate_roles(self) -> None:
+        english = build_query_plan(
+            "Would the mechanic carry a wrench?",
+            task_mode="qa",
+        )
+        self.assertEqual(english.answer_type, "yes_no")
+        self.assertEqual(english.constraints["subject"], ["mechanic"])
+        self.assertEqual(english.constraints["objects"], ["wrench"])
+        self.assertEqual(english.roles["subject"]["mechanic"], "context")
+        self.assertEqual(english.roles["objects"]["wrench"], "hypothesis")
+        self.assertTrue({"visual", "caption", "objects"}.issubset(english.modality_hints))
+
+        vietnamese = build_query_plan(
+            "Có phải bác sĩ đang cầm ống nghe không?",
+            task_mode="qa",
+        )
+        self.assertEqual(vietnamese.constraints["subject"], ["bác sĩ"])
+        self.assertEqual(vietnamese.constraints["objects"], ["ống nghe"])
+        self.assertEqual(vietnamese.roles["subject"]["bác sĩ"], "context")
+        self.assertEqual(vietnamese.roles["objects"]["ống nghe"], "hypothesis")
+
+        contextual = build_query_plan(
+            "Is the child in the blue shirt holding a ball?",
+            task_mode="qa",
+        )
+        self.assertEqual(contextual.roles["attributes"]["blue shirt"], "context")
+        self.assertEqual(contextual.roles["actions"]["holding"], "hypothesis")
+        self.assertEqual(contextual.roles["objects"]["ball"], "hypothesis")
+
+        running = build_query_plan(
+            "Is the running man holding a cup?",
+            task_mode="qa",
+        )
+        self.assertEqual(running.roles["actions"]["running"], "context")
+        self.assertEqual(running.roles["actions"]["holding"], "hypothesis")
+
+    def test_generic_plural_subject_and_object_slots(self) -> None:
+        cases = (
+            ("What are the children doing?", "subject", ["children"]),
+            ("What does the chef carry?", "subject", ["chef"]),
+            ("Where are the keys?", "objects", ["keys"]),
+            ("What color are the curtains?", "objects", ["curtains"]),
+        )
+        for question, category, expected in cases:
+            with self.subTest(question=question):
+                plan = build_query_plan(question, task_mode="qa")
+                self.assertEqual(plan.constraints[category], expected)
+
+    def test_temporal_query_rejects_more_than_five_events(self) -> None:
+        with self.assertRaisesRegex(ValueError, "temporal_query_too_complex"):
+            build_query_plan(
+                "a rồi b rồi c rồi d rồi e rồi f",
+                task_mode="qa",
+            )
+        with self.assertRaisesRegex(ValueError, "temporal_query_too_complex"):
+            build_query_plan(
+                "a before b before c before d before e before f",
+                task_mode="qa",
+            )
+
 
 class QaRouterEvidenceTest(unittest.TestCase):
     def test_external_expansion_is_passthrough_and_traceable(self) -> None:

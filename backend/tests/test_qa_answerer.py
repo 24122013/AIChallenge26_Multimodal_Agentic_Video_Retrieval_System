@@ -10,6 +10,7 @@ from unittest.mock import patch
 from backend.app.services.retrieval.qa_answerer import (
     GroundedAnswer,
     LazyQwenGroundedRunner,
+    QA_PROMPT_REVISION,
     RequiredQaAnswerError,
     answer_question,
     build_grounded_prompt,
@@ -103,6 +104,7 @@ class QaAnswererTest(unittest.TestCase):
             self.assertEqual(answer.status, "disabled")
             self.assertEqual(report.status, "disabled")
             self.assertTrue(report.manual_evidence_available)
+            self.assertFalse(report.model_invoked)
             self.assertFalse(called)
             self.assertEqual(list(Path(temporary).iterdir()), [])
 
@@ -122,6 +124,35 @@ class QaAnswererTest(unittest.TestCase):
             self.assertEqual(answer.status, "insufficient_evidence")
             self.assertEqual(report.status, "insufficient_evidence")
             self.assertFalse(report.manual_evidence_available)
+            self.assertFalse(report.model_invoked)
+
+    def test_failed_preflight_abstains_in_required_mode_without_model(self) -> None:
+        called = False
+
+        def runner(*_: object) -> dict[str, object]:
+            nonlocal called
+            called = True
+            return _answered_payload()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            answer, report = answer_question(
+                "A rồi B?",
+                [_evidence()],
+                answer_type="yes_no",
+                mode="required",
+                cache_root=Path(temporary),
+                runner=runner,
+                answer_eligible=False,
+                preflight_block_reason="temporal_match_not_strict:relaxed_gap",
+            )
+        self.assertFalse(called)
+        self.assertEqual(answer.status, "insufficient_evidence")
+        self.assertEqual(
+            answer.reason,
+            "temporal_match_not_strict:relaxed_gap",
+        )
+        self.assertEqual(report.status, "insufficient_evidence")
+        self.assertFalse(report.model_invoked)
 
     def test_optional_success_is_cached_by_question_evidence_and_revision(self) -> None:
         calls = 0
@@ -170,12 +201,67 @@ class QaAnswererTest(unittest.TestCase):
         self.assertEqual(first.status, "answered")
         self.assertEqual(second, first)
         self.assertFalse(first_report.cache_hit)
+        self.assertTrue(first_report.model_invoked)
         self.assertTrue(second_report.cache_hit)
+        self.assertFalse(second_report.model_invoked)
         self.assertFalse(third_report.cache_hit)
         self.assertFalse(fourth_report.cache_hit)
         self.assertEqual(third.status, "answered")
         self.assertEqual(fourth.status, "answered")
         self.assertEqual(calls, 3)
+
+    def test_temporal_lineage_is_part_of_cache_identity(self) -> None:
+        calls = 0
+
+        def runner(*_: object) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            payload = _answered_payload()
+            payload["answer"] = "waves"
+            payload["answer_type"] = "action"
+            return payload
+
+        common = {
+            "temporal_event_index": 0,
+            "temporal_match_rank": 1,
+            "temporal_match_mode": "strict",
+            "temporal_chain_id": "TC-test",
+            "temporal_chain_score": 0.75,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_root = Path(temporary)
+            _, first_report = answer_question(
+                "What did he do before leaving?",
+                [
+                    _evidence(
+                        **common,
+                        temporal_event_query="the man",
+                        temporal_event_role="answer_target",
+                    )
+                ],
+                answer_type="action",
+                mode="optional",
+                cache_root=cache_root,
+                runner=runner,
+            )
+            _, second_report = answer_question(
+                "What did he do before leaving?",
+                [
+                    _evidence(
+                        **common,
+                        temporal_event_query="he left",
+                        temporal_event_role="context",
+                    )
+                ],
+                answer_type="action",
+                mode="optional",
+                cache_root=cache_root,
+                runner=runner,
+            )
+
+        self.assertFalse(first_report.cache_hit)
+        self.assertFalse(second_report.cache_hit)
+        self.assertEqual(calls, 2)
 
     def test_unknown_evidence_citation_falls_back_in_optional_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -191,6 +277,7 @@ class QaAnswererTest(unittest.TestCase):
         self.assertEqual(report.status, "fallback")
         self.assertIn("unknown evidence_ids", report.fallback_reason)
         self.assertTrue(report.manual_evidence_available)
+        self.assertTrue(report.model_invoked)
 
     def test_cache_identity_failure_preserves_optional_manual_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch(
@@ -243,6 +330,7 @@ class QaAnswererTest(unittest.TestCase):
         self.assertEqual(caught.exception.report.status, "failed")
         self.assertTrue(caught.exception.report.manual_evidence_available)
         self.assertIn("CUDA out of memory", caught.exception.report.fallback_reason)
+        self.assertTrue(caught.exception.report.model_invoked)
 
     def test_timeout_returns_quick_optional_fallback(self) -> None:
         def slow(*_: object) -> dict[str, object]:
@@ -353,6 +441,28 @@ class PromptAndLazyRunnerTest(unittest.TestCase):
         self.assertIn("using only the supplied visual evidence", prompt)
         self.assertIn('"evidence_id": "E001"', prompt)
         self.assertNotIn("must not appear", prompt)
+        self.assertEqual(QA_PROMPT_REVISION, "grounded-qa-v2")
+
+    def test_prompt_preserves_temporal_chain_lineage(self) -> None:
+        prompt = build_grounded_prompt(
+            "What happened before he left?",
+            [
+                _evidence(
+                    temporal_event_index=0,
+                    temporal_match_rank=1,
+                    temporal_match_mode="strict",
+                    temporal_chain_id="TC-test",
+                    temporal_event_query="what happened",
+                    temporal_event_role="answer_target",
+                    temporal_chain_score=0.75,
+                )
+            ],
+            "action",
+        )
+
+        self.assertIn('"temporal_chain_id": "TC-test"', prompt)
+        self.assertIn('"temporal_event_role": "answer_target"', prompt)
+        self.assertIn('"temporal_chain_score": 0.75', prompt)
 
     def test_lazy_runner_validates_4bit_cpu_before_model_load(self) -> None:
         runner = LazyQwenGroundedRunner(device="cpu", quantization="4bit")

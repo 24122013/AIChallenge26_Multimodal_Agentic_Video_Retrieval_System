@@ -63,6 +63,7 @@ class BgeM3BuildReport:
     dimension: int
     source_records_sha256: str
     documents_sha256: str
+    source_kind: str
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -73,6 +74,7 @@ class BgeM3BuildReport:
             "dimension": self.dimension,
             "source_records_sha256": self.source_records_sha256,
             "documents_sha256": self.documents_sha256,
+            "source_kind": self.source_kind,
         }
 
 
@@ -115,6 +117,45 @@ def has_retrievable_text(record: Mapping[str, object]) -> bool:
     )
 
 
+def _source_kind(
+    records: Sequence[Mapping[str, object]],
+    *,
+    canonical_only: bool,
+) -> str:
+    selected = all(
+        str(record.get("artifact_role") or "").casefold()
+        == "selected_keyframe"
+        and bool(str(record.get("video_id") or "").strip())
+        and bool(str(record.get("frame_id") or "").strip())
+        and bool(
+            str(
+                record.get("keyframe_path")
+                or record.get("frame_path")
+                or record.get("thumbnail_path")
+                or ""
+            ).strip()
+        )
+        for record in records
+    )
+    segments = all(
+        bool(str(record.get("video_id") or "").strip())
+        and bool(str(record.get("segment_id") or record.get("shot_id") or "").strip())
+        and isinstance(record.get("keyframe_selection"), list)
+        and bool(record.get("keyframe_selection"))
+        for record in records
+    )
+    if selected:
+        return "selected_keyframes"
+    if segments:
+        return "canonical_segments"
+    if canonical_only:
+        raise ValueError(
+            "canonical-only BGE-M3 indexing requires selected_keyframe records "
+            "or Phase-4 segments with non-empty keyframe_selection lineage"
+        )
+    return "legacy_metadata"
+
+
 def build_bge_m3_index(
     records: Sequence[Mapping[str, object]],
     output_root: str | Path,
@@ -126,11 +167,22 @@ def build_bge_m3_index(
     device: str = "auto",
     cache_dir: str | Path | None = None,
     local_files_only: bool = False,
+    canonical_only: bool = False,
 ) -> BgeM3BuildReport:
     """Build three deterministic artifacts from existing metadata records."""
 
     if not records:
         raise ValueError("BGE-M3 indexing requires at least one metadata record")
+    dense_candidate_count = sum(
+        str(record.get("artifact_role") or "").casefold() == "dense_candidate"
+        for record in records
+    )
+    if dense_candidate_count:
+        raise ValueError(
+            "BGE-M3 index refuses dense_candidate metadata; build it from "
+            "canonical selected-keyframe/segment metadata only"
+        )
+    source_kind = _source_kind(records, canonical_only=canonical_only)
     if not str(model_name).strip() or not str(model_revision).strip():
         raise ValueError("BGE-M3 model name and revision must be non-empty")
     paths = BgeM3ArtifactPaths.from_root(output_root)
@@ -199,6 +251,11 @@ def build_bge_m3_index(
             "records_sha256": source_records_sha256,
             "documents_sha256": documents_sha256,
         },
+        "source_contract": {
+            "canonical_only": bool(canonical_only),
+            "source_kind": source_kind,
+            "dense_candidates_rejected": True,
+        },
         "artifacts": {
             "index": {
                 "filename": paths.index.name,
@@ -220,6 +277,7 @@ def build_bge_m3_index(
         dimension=BGE_M3_DIMENSION,
         source_records_sha256=source_records_sha256,
         documents_sha256=documents_sha256,
+        source_kind=source_kind,
     )
 
 
@@ -297,6 +355,26 @@ def validate_bge_m3_artifacts(
         source_hashes.append(source_sha)
         document_hashes.append(document_sha)
         frame_records.append(item)
+
+    source_contract = manifest.get("source_contract")
+    if not isinstance(source_contract, dict):
+        raise ValueError("BGE-M3 manifest is missing the source contract")
+    canonical_only = source_contract.get("canonical_only")
+    if not isinstance(canonical_only, bool):
+        raise ValueError("BGE-M3 source contract has invalid canonical_only")
+    if source_contract.get("dense_candidates_rejected") is not True:
+        raise ValueError("BGE-M3 source contract must reject dense candidates")
+    metadata_records = [
+        item["metadata"]
+        for item in frame_records
+        if isinstance(item.get("metadata"), Mapping)
+    ]
+    computed_source_kind = _source_kind(
+        metadata_records,
+        canonical_only=canonical_only,
+    )
+    if source_contract.get("source_kind") != computed_source_kind:
+        raise ValueError("BGE-M3 source kind does not match frame-map lineage")
 
     declared_sources = manifest.get("source_hashes")
     expected_sources = {

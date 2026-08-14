@@ -115,12 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bge-dense-mode",
         choices=("off", "optional", "required"),
-        default="off",
+        default="required",
     )
     parser.add_argument(
         "--bge-reranker-mode",
         choices=("off", "optional", "required"),
-        default="off",
+        default="required",
     )
     parser.add_argument("--bge-m3-model-name", default="BAAI/bge-m3")
     parser.add_argument("--bge-m3-model-revision", default="main")
@@ -324,6 +324,7 @@ def build_stage_commands(
             "backend.app.services.indexing.build_bge_m3_index",
             "--metadata",
             str(run_root / "metadata"),
+            "--canonical-only",
             "--output-root",
             str(run_root / "indexes" / "bge_m3"),
             "--model-name",

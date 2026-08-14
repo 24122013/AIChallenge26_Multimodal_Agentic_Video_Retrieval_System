@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import os
+from dataclasses import fields
 from functools import lru_cache
 from pathlib import Path
+from typing import Any, Mapping
 
 from backend.app.models.retrieval import VisualSearchResponse
 from backend.app.services.retrieval.hybrid_search import HybridSearchEngine
@@ -13,6 +15,11 @@ from backend.app.services.retrieval.qa_evidence import (
     QaRoutingConfig,
 )
 from backend.app.services.retrieval.qa_pipeline import QaPipelineConfig, QaSearchPipeline
+from backend.app.services.retrieval.qa_answerer import (
+    DEFAULT_QA_MODEL,
+    DEFAULT_QA_MODEL_REVISION,
+    QA_PROMPT_REVISION,
+)
 from backend.app.services.retrieval.rerank import HybridReranker
 from backend.app.services.retrieval.retrieval_config import (
     RetrievalRuntimeConfig,
@@ -61,6 +68,36 @@ def _choice_from_env(
     if value not in choices:
         raise ValueError(f"{name} must be one of {choices}, got {value!r}")
     return value
+
+
+def _qa_routing_config() -> QaRoutingConfig:
+    """Build the QA config while tolerating mixed-version router deployments."""
+
+    requested: dict[str, object] = {
+        "typed_parser_enabled": _bool_from_env("QA_TYPED_PARSER_ENABLED", True),
+        "router_enabled": _bool_from_env("QA_ROUTER_ENABLED", True),
+        "evidence_bundle_enabled": _bool_from_env("QA_EVIDENCE_BUNDLE_ENABLED", True),
+        "constraint_rerank_enabled": _bool_from_env(
+            "QA_CONSTRAINT_RERANK_ENABLED",
+            True,
+        ),
+        "constraint_weight": float(os.getenv("QA_CONSTRAINT_WEIGHT", "0.15")),
+        "constraint_min_signal": float(
+            os.getenv("QA_CONSTRAINT_MIN_SIGNAL", "0.20")
+        ),
+        "temporal_routing_enabled": _bool_from_env(
+            "QA_TEMPORAL_ROUTING_ENABLED",
+            True,
+        ),
+        "temporal_max_events": int(os.getenv("QA_TEMPORAL_MAX_EVENTS", "5")),
+        "temporal_max_gap_seconds": float(
+            os.getenv("QA_TEMPORAL_MAX_GAP_SECONDS", "180")
+        ),
+    }
+    supported = {field.name for field in fields(QaRoutingConfig)}
+    return QaRoutingConfig(
+        **{name: value for name, value in requested.items() if name in supported}
+    )
 
 
 def load_visual_search_config() -> VisualSearchConfig:
@@ -191,17 +228,7 @@ def get_qa_evidence_search_engine() -> QaEvidenceSearchEngine:
         get_hybrid_search_engine(),
         dense_text_engine=dense_text_engine,
         candidate_reranker=reranker,
-        config=QaRoutingConfig(
-            typed_parser_enabled=_bool_from_env(
-                "QA_TYPED_PARSER_ENABLED",
-                True,
-            ),
-            router_enabled=_bool_from_env("QA_ROUTER_ENABLED", True),
-            evidence_bundle_enabled=_bool_from_env(
-                "QA_EVIDENCE_BUNDLE_ENABLED",
-                True,
-            ),
-        ),
+        config=_qa_routing_config(),
     )
 
 
@@ -217,8 +244,11 @@ def get_qa_search_pipeline() -> QaSearchPipeline:
         from backend.app.services.retrieval.qa_answerer import build_local_qwen_runner
 
         answer_runner = build_local_qwen_runner(
-            model_name=os.getenv("QA_ANSWER_MODEL", "Qwen/Qwen3.5-9B"),
-            model_revision=os.getenv("QA_ANSWER_MODEL_REVISION", "c202236"),
+            model_name=os.getenv("QA_ANSWER_MODEL", DEFAULT_QA_MODEL),
+            model_revision=os.getenv(
+                "QA_ANSWER_MODEL_REVISION",
+                DEFAULT_QA_MODEL_REVISION,
+            ),
             device=os.getenv("QA_ANSWER_DEVICE") or None,
             quantization=os.getenv("QA_ANSWER_QUANTIZATION", "auto"),
             cache_dir=_path_from_env(
@@ -230,8 +260,11 @@ def get_qa_search_pipeline() -> QaSearchPipeline:
         get_qa_evidence_search_engine(),
         config=QaPipelineConfig(
             answer_mode=answer_mode,
-            model_name=os.getenv("QA_ANSWER_MODEL", "Qwen/Qwen3.5-9B"),
-            model_revision=os.getenv("QA_ANSWER_MODEL_REVISION", "c202236"),
+            model_name=os.getenv("QA_ANSWER_MODEL", DEFAULT_QA_MODEL),
+            model_revision=os.getenv(
+                "QA_ANSWER_MODEL_REVISION",
+                DEFAULT_QA_MODEL_REVISION,
+            ),
             answer_cache_root=_path_from_env(
                 "QA_ANSWER_CACHE_DIR",
                 Path("data/cache/qa_answers"),
@@ -246,6 +279,70 @@ def get_qa_search_pipeline() -> QaSearchPipeline:
         ),
         answer_runner=answer_runner,
     )
+
+
+def get_qa_runtime_lineage() -> dict[str, Any]:
+    """Return the exact QA model/index contracts used by the current engines."""
+
+    engine = get_qa_evidence_search_engine()
+    dense = getattr(engine, "dense_text_engine", None)
+    reranker = getattr(engine, "candidate_reranker", None)
+
+    dense_manifest: Mapping[str, object] = {}
+    artifacts = getattr(dense, "artifacts", None)
+    manifest = getattr(artifacts, "manifest", None)
+    if isinstance(manifest, Mapping):
+        dense_manifest = manifest
+    model_contract = dense_manifest.get("model", {})
+    if not isinstance(model_contract, Mapping):
+        model_contract = {}
+    artifact_contract = dense_manifest.get("artifacts", {})
+    if not isinstance(artifact_contract, Mapping):
+        artifact_contract = {}
+    source_hashes = dense_manifest.get("source_hashes", {})
+    if not isinstance(source_hashes, Mapping):
+        source_hashes = {}
+    source_contract = dense_manifest.get("source_contract", {})
+    if not isinstance(source_contract, Mapping):
+        source_contract = {}
+
+    rerank_report = getattr(reranker, "last_report", None)
+    answer_mode = _choice_from_env(
+        "QA_ANSWER_MODE",
+        "off",
+        ("off", "optional", "required"),
+    )
+    return {
+        "answer_model": {
+            "enabled": answer_mode != "off",
+            "mode": answer_mode,
+            "name": os.getenv("QA_ANSWER_MODEL", DEFAULT_QA_MODEL),
+            "revision": os.getenv(
+                "QA_ANSWER_MODEL_REVISION",
+                DEFAULT_QA_MODEL_REVISION,
+            ),
+            "prompt_revision": QA_PROMPT_REVISION,
+        },
+        "dense_text": {
+            "enabled": dense is not None,
+            "model_name": str(model_contract.get("name") or getattr(dense, "model_name", "")),
+            "model_revision": str(
+                model_contract.get("revision")
+                or getattr(dense, "model_revision", "")
+            ),
+            "index_schema_version": dense_manifest.get("schema_version"),
+            "vector_count": dense_manifest.get("vector_count"),
+            "artifact_checksums": dict(artifact_contract),
+            "source_hashes": dict(source_hashes),
+            "source_contract": dict(source_contract),
+        },
+        "reranker": {
+            "enabled": reranker is not None,
+            "model_name": str(getattr(reranker, "model_name", "")),
+            "model_revision": str(getattr(reranker, "model_revision", "")),
+            "last_report": dict(rerank_report) if isinstance(rerank_report, Mapping) else None,
+        },
+    }
 
 
 def clear_retrieval_caches() -> None:

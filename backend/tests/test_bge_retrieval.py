@@ -24,6 +24,9 @@ from backend.app.services.retrieval.bge_reranker import (
     rerank_with_bge,
     reranker_document,
 )
+from backend.app.services.indexing.build_bge_m3_index import (
+    load_canonical_keyframe_records,
+)
 
 
 class HashEncoder:
@@ -151,6 +154,91 @@ class BgeM3DenseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             with self.assertRaisesRegex(ValueError, "shape mismatch"):
                 build_bge_m3_index(self.records(), tmp_dir, encoder=wrong)
+
+    def test_rejects_dense_candidate_metadata_before_encoding(self) -> None:
+        records = self.records()
+        records[0]["artifact_role"] = "dense_candidate"
+        encoder = HashEncoder()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.assertRaisesRegex(ValueError, "refuses dense_candidate"):
+                build_bge_m3_index(records, tmp_dir, encoder=encoder)
+        self.assertEqual(encoder.calls, [])
+
+    def test_canonical_only_rejects_unmarked_candidate_level_metadata(self) -> None:
+        records = self.records()
+        records[0]["candidate_id"] = "CANDIDATE_V2_0001"
+        encoder = HashEncoder()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.assertRaisesRegex(ValueError, "canonical-only"):
+                build_bge_m3_index(
+                    records,
+                    tmp_dir,
+                    encoder=encoder,
+                    canonical_only=True,
+                )
+        self.assertEqual(encoder.calls, [])
+
+    def test_canonical_segment_source_contract_is_audited(self) -> None:
+        records = self.records()
+        for record in records:
+            record["segment_id"] = f"S-{record['frame_id']}"
+            record["keyframe_selection"] = [
+                {"frame_id": record["frame_id"], "selection_rank": 1}
+            ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            report = build_bge_m3_index(
+                records,
+                tmp_dir,
+                encoder=HashEncoder(),
+                canonical_only=True,
+            )
+            validated = validate_bge_m3_artifacts(tmp_dir)
+        self.assertEqual(report.source_kind, "canonical_segments")
+        self.assertEqual(
+            validated.manifest["source_contract"],
+            {
+                "canonical_only": True,
+                "source_kind": "canonical_segments",
+                "dense_candidates_rejected": True,
+            },
+        )
+
+    def test_canonical_loader_joins_only_selected_frame_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            selected = {
+                "video_id": "V1",
+                "frame_id": "F1",
+                "artifact_role": "selected_keyframe",
+                "keyframe_path": "keyframes/V1/F1.jpg",
+                "timestamp": 1.0,
+                "shot_id": "S1",
+            }
+            (root / "keyframes_V1.jsonl").write_text(
+                json.dumps(selected) + "\n",
+                encoding="utf-8",
+            )
+            (root / "captions_V1.jsonl").write_text(
+                "\n".join(
+                    (
+                        json.dumps(
+                            {"video_id": "V1", "frame_id": "F1", "caption": "phone"}
+                        ),
+                        json.dumps(
+                            {"video_id": "V1", "frame_id": "F999", "caption": "candidate"}
+                        ),
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            records = load_canonical_keyframe_records(root)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["frame_id"], "F1")
+        self.assertEqual(records[0]["caption"], "phone")
+        self.assertEqual(records[0]["keyframe_path"], "keyframes/V1/F1.jpg")
+        self.assertEqual(records[0]["artifact_role"], "selected_keyframe")
 
     def test_detects_frame_map_tampering_before_search(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

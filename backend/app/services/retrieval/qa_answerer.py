@@ -22,8 +22,8 @@ from typing import Any, Mapping, Protocol, Sequence
 QA_ANSWER_MODES = ("off", "optional", "required")
 QA_ANSWER_STATUSES = ("answered", "insufficient_evidence", "disabled", "error")
 DEFAULT_QA_MODEL = "Qwen/Qwen3.5-9B"
-DEFAULT_QA_MODEL_REVISION = "c202236"
-QA_PROMPT_REVISION = "grounded-qa-v1"
+DEFAULT_QA_MODEL_REVISION = "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+QA_PROMPT_REVISION = "grounded-qa-v2"
 
 
 class QaAnswerRunner(Protocol):
@@ -102,6 +102,7 @@ class QaAnswerReport:
     cache_hit: bool
     latency_ms: float
     manual_evidence_available: bool
+    model_invoked: bool = False
     fallback_reason: str = ""
 
     def to_dict(self) -> dict[str, object]:
@@ -138,6 +139,8 @@ def answer_question(
     model_revision: str = DEFAULT_QA_MODEL_REVISION,
     max_evidence: int = 3,
     timeout_seconds: float = 120.0,
+    answer_eligible: bool = True,
+    preflight_block_reason: str = "",
 ) -> tuple[GroundedAnswer, QaAnswerReport]:
     """Answer one question from the top grounded evidence items.
 
@@ -161,6 +164,34 @@ def answer_question(
 
     started = time.perf_counter()
 
+    if not bool(answer_eligible):
+        block_reason = (
+            " ".join(str(preflight_block_reason).split()).strip()
+            or "Answer generation was blocked by evidence preflight."
+        )
+        try:
+            evidence_count = len(evidence[: int(max_evidence)])
+        except Exception:
+            evidence_count = 0
+        answer = GroundedAnswer(
+            status="insufficient_evidence",
+            answer=None,
+            answer_type=cleaned_answer_type,
+            confidence=0.0,
+            reason=block_reason,
+        )
+        return answer, _report(
+            mode=normalized_mode,
+            status="insufficient_evidence",
+            model_name=model_name,
+            model_revision=model_revision,
+            evidence_count=evidence_count,
+            cache_hit=False,
+            started=started,
+            manual_evidence_available=bool(evidence_count),
+            model_invoked=False,
+        )
+
     if normalized_mode == "off":
         try:
             evidence_count = len(evidence[: int(max_evidence)])
@@ -182,6 +213,7 @@ def answer_question(
             cache_hit=False,
             started=started,
             manual_evidence_available=bool(evidence_count),
+            model_invoked=False,
         )
 
     selected: tuple[dict[str, object], ...] = ()
@@ -210,6 +242,7 @@ def answer_question(
                 cache_hit=False,
                 started=started,
                 manual_evidence_available=False,
+                model_invoked=False,
             )
 
         known_evidence_ids = {str(item["evidence_id"]) for item in selected}
@@ -236,9 +269,11 @@ def answer_question(
                 cache_hit=True,
                 started=started,
                 manual_evidence_available=True,
+                model_invoked=False,
             )
 
         scorer = runner or _shared_local_qwen_runner(model_name, model_revision)
+        model_invoked = True
         payload = _call_with_timeout(
             scorer,
             cleaned_question,
@@ -261,6 +296,7 @@ def answer_question(
             cache_hit=False,
             started=started,
             manual_evidence_available=True,
+            model_invoked=True,
         )
     except Exception as exc:
         reason = f"{type(exc).__name__}: {exc}"
@@ -280,6 +316,7 @@ def answer_question(
             cache_hit=False,
             started=started,
             manual_evidence_available=bool(raw_evidence_count),
+            model_invoked=locals().get("model_invoked", False),
             fallback_reason=reason,
         )
         if normalized_mode == "required":
@@ -301,6 +338,7 @@ def _report(
     cache_hit: bool,
     started: float,
     manual_evidence_available: bool,
+    model_invoked: bool,
     fallback_reason: str = "",
 ) -> QaAnswerReport:
     return QaAnswerReport(
@@ -313,6 +351,7 @@ def _report(
         cache_hit=cache_hit,
         latency_ms=round((time.perf_counter() - started) * 1000.0, 3),
         manual_evidence_available=manual_evidence_available,
+        model_invoked=model_invoked,
         fallback_reason=fallback_reason,
     )
 
@@ -355,7 +394,12 @@ def _sanitize_evidence(item: Mapping[str, object] | object, index: int) -> dict[
     else:
         warnings = []
 
-    image_path = raw.get("image_path") or raw.get("keyframe_path") or raw.get("thumbnail_path") or ""
+    image_path = (
+        raw.get("image_path")
+        or raw.get("keyframe_path")
+        or raw.get("thumbnail_path")
+        or ""
+    )
     timestamp = raw.get("timestamp", 0.0)
     retrieval_score = raw.get("retrieval_score", raw.get("score", 0.0))
     try:
@@ -366,6 +410,54 @@ def _sanitize_evidence(item: Mapping[str, object] | object, index: int) -> dict[
         retrieval_score = float(retrieval_score)
     except (TypeError, ValueError):
         retrieval_score = 0.0
+    base_retrieval_score = raw.get("base_retrieval_score", retrieval_score)
+    constraint_score = raw.get("constraint_score", 0.0)
+    try:
+        base_retrieval_score = float(base_retrieval_score)
+    except (TypeError, ValueError):
+        base_retrieval_score = retrieval_score
+    try:
+        constraint_score = float(constraint_score)
+    except (TypeError, ValueError):
+        constraint_score = 0.0
+
+    matched_raw = raw.get("matched_constraints", ())
+    if isinstance(matched_raw, Mapping):
+        matched_constraints: object = {
+            str(key): (
+                [str(entry) for entry in value if str(entry).strip()]
+                if isinstance(value, Sequence) and not isinstance(value, str)
+                else str(value)
+            )
+            for key, value in matched_raw.items()
+        }
+    elif isinstance(matched_raw, Sequence) and not isinstance(matched_raw, str):
+        matched_constraints = [
+            str(value) for value in matched_raw if str(value).strip()
+        ]
+    else:
+        matched_constraints = []
+
+    def optional_int(name: str) -> int | None:
+        value = raw.get(name)
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def optional_float(name: str) -> float | None:
+        value = raw.get(name)
+        if value is None or value == "":
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
 
     # Keep this allowlist explicit.  In particular, ASR/transcript fields are
     # intentionally excluded from both prompting and cache identity.
@@ -381,6 +473,18 @@ def _sanitize_evidence(item: Mapping[str, object] | object, index: int) -> dict[
         "objects": objects,
         "source_modalities": modalities,
         "retrieval_score": retrieval_score,
+        "base_retrieval_score": base_retrieval_score,
+        "constraint_score": constraint_score,
+        "matched_constraints": matched_constraints,
+        "temporal_event_index": optional_int("temporal_event_index"),
+        "temporal_match_rank": optional_int("temporal_match_rank"),
+        "temporal_match_mode": str(raw.get("temporal_match_mode") or ""),
+        "temporal_chain_id": str(raw.get("temporal_chain_id") or ""),
+        "temporal_event_query": " ".join(
+            str(raw.get("temporal_event_query") or "").split()
+        ),
+        "temporal_event_role": str(raw.get("temporal_event_role") or ""),
+        "temporal_chain_score": optional_float("temporal_chain_score"),
         "warnings": warnings,
     }
 
@@ -560,6 +664,9 @@ def build_grounded_prompt(
     """Build the deterministic JSON-only prompt used by the local runner."""
 
     evidence_text: list[str] = []
+    has_temporal_lineage = any(
+        item.get("temporal_event_index") is not None for item in evidence
+    )
     for item in evidence:
         evidence_text.append(
             json.dumps(
@@ -567,21 +674,37 @@ def build_grounded_prompt(
                     "evidence_id": item["evidence_id"],
                     "video_id": item.get("video_id", ""),
                     "frame_id": item.get("frame_id", ""),
+                    "shot_id": item.get("shot_id", ""),
                     "timestamp": item.get("timestamp", 0.0),
                     "caption": item.get("caption", ""),
                     "ocr_text": item.get("ocr_text", ""),
                     "objects": item.get("objects", []),
+                    "temporal_event_index": item.get("temporal_event_index"),
+                    "temporal_match_rank": item.get("temporal_match_rank"),
+                    "temporal_match_mode": item.get("temporal_match_mode", ""),
+                    "temporal_chain_id": item.get("temporal_chain_id", ""),
+                    "temporal_event_query": item.get("temporal_event_query", ""),
+                    "temporal_event_role": item.get("temporal_event_role", ""),
+                    "temporal_chain_score": item.get("temporal_chain_score"),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
             )
         )
     joined = "\n".join(evidence_text)
+    temporal_instruction = (
+        " Evidence entries form one strict temporal chain; respect ascending "
+        "temporal_event_index, temporal_event_query, and temporal_event_role; "
+        "answer from answer_target evidence (or the whole_chain proposition) "
+        "without collapsing separate events."
+        if has_temporal_lineage
+        else ""
+    )
     return (
         "Answer the question using only the supplied visual evidence. "
         "Never use outside knowledge. If the evidence does not directly support an answer, "
         "return status=insufficient_evidence and answer=null. Cite only supplied evidence_id "
-        "values. Return strict JSON only with exactly these fields: "
+        f"values.{temporal_instruction} Return strict JSON only with exactly these fields: "
         '{"status":"answered|insufficient_evidence","answer":"string|null",'
         '"answer_type":"string","confidence":0.0,"evidence_ids":["E001"]}.\n'
         f"Expected answer_type: {answer_type}\n"
