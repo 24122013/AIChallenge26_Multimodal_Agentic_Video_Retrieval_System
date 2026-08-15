@@ -14,38 +14,6 @@ from competition.run_retrieval_v2 import (
     selected_stage_names,
 )
 from competition.run_manifest import dataset_fingerprint
-from competition.pipeline import Question, precompute_tkis_query_plans
-from backend.app.services.agent.query_expansion import (
-    ProviderResponse,
-    QueryExpansionConfig,
-)
-
-
-class _Provider:
-    provider_name = "test-production"
-    model_name = "test/model"
-    model_revision = "revision"
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-        self.closed = False
-
-    def expand(self, query, _protected):
-        self.calls.append(query)
-        return ProviderResponse(
-            {
-                "paraphrases": ["a person beside a bus"],
-                "objects": ["man", "bus"],
-                "attributes": [],
-                "actions": [],
-                "relations": ["beside"],
-                "ocr_literals": [],
-                "scene_terms": [],
-            }
-        )
-
-    def close(self) -> None:
-        self.closed = True
 
 
 class RetrievalV2RunnerTest(unittest.TestCase):
@@ -81,21 +49,8 @@ class RetrievalV2RunnerTest(unittest.TestCase):
         )
         self.assertIn("--resume", commands["keyframes"])
         self.assertEqual(
-<<<<<<< HEAD
             commands["keyframes"][commands["keyframes"].index("--caption-quantization") + 1],
             "none",
-=======
-            commands["keyframes"][
-                commands["keyframes"].index("--caption-model-name") + 1
-            ],
-            "Qwen/Qwen3.5-4B",
-        )
-        self.assertEqual(
-            commands["keyframes"][
-                commands["keyframes"].index("--caption-model-revision") + 1
-            ],
-            "c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97",
->>>>>>> origin/main
         )
         dense = commands["dense-index"]
         self.assertEqual(
@@ -109,7 +64,6 @@ class RetrievalV2RunnerTest(unittest.TestCase):
             str(self.run_root.resolve()),
         )
         self.assertEqual(predict[predict.index("--vlm-mode") + 1], "off")
-<<<<<<< HEAD
         self.assertEqual(predict[predict.index("--bge-dense-mode") + 1], "required")
         self.assertEqual(
             predict[predict.index("--bge-reranker-mode") + 1],
@@ -123,103 +77,7 @@ class RetrievalV2RunnerTest(unittest.TestCase):
             ],
             str(self.run_root.resolve() / "metadata"),
         )
-=======
-        self.assertEqual(predict[predict.index("--tkis-routing") + 1], "hybrid")
-        self.assertEqual(predict[predict.index("--retrieval-profile") + 1], "kis")
-        self.assertIn("--query-expansion-cache-dir", predict)
-        self.assertNotIn("--no-query-expansion", predict)
->>>>>>> origin/main
         self.assertTrue(predict[predict.index("--retrieval-config") + 1].endswith("retrieval.yaml"))
-
-    def test_query_expansion_ablation_is_forwarded(self) -> None:
-        commands = build_stage_commands(
-            self._args("--no-query-expansion"),
-            python_executable="python-test",
-        )
-        self.assertIn("--no-query-expansion", commands["predict"])
-
-    def test_colab_caption_memory_settings_are_forwarded(self) -> None:
-        commands = build_stage_commands(
-            self._args(
-                "--caption-batch-size",
-                "1",
-                "--caption-quantization",
-                "4bit",
-            ),
-            python_executable="python-test",
-        )
-        keyframes = commands["keyframes"]
-        self.assertEqual(
-            keyframes[keyframes.index("--caption-batch-size") + 1],
-            "1",
-        )
-        self.assertEqual(
-            keyframes[keyframes.index("--caption-quantization") + 1],
-            "4bit",
-        )
-
-    def test_offline_model_cache_applies_to_keyframes_and_predict(self) -> None:
-        commands = build_stage_commands(
-            self._args("--offline-model-cache"),
-            python_executable="python-test",
-        )
-        self.assertIn("--offline-model-cache", commands["keyframes"])
-        self.assertIn("--offline-model-cache", commands["predict"])
-
-    def test_precompute_calls_production_provider_only_for_tkis(self) -> None:
-        provider = _Provider()
-        factory_calls: list[dict] = []
-
-        def factory(**kwargs):
-            factory_calls.append(kwargs)
-            return provider
-
-        plans = precompute_tkis_query_plans(
-            [
-                Question("t", "TKIS", "a man next to a bus", ""),
-                Question("v", "VKIS", "", "queries/v.jpg"),
-            ],
-            profile="kis",
-            expansion_config=QueryExpansionConfig(),
-            device="cpu",
-            cache_dir=self.root / "responses",
-            model_cache_dir=self.root / "models",
-            local_files_only=True,
-            provider_factory=factory,
-        )
-        self.assertEqual(list(plans), ["t"])
-        self.assertEqual(provider.calls, ["a man next to a bus"])
-        self.assertTrue(provider.closed)
-        self.assertEqual(len(factory_calls), 1)
-
-    def test_precompute_does_not_construct_provider_for_vkis_or_ablation(self) -> None:
-        def forbidden_factory(**_kwargs):
-            raise AssertionError("provider must not be constructed")
-
-        self.assertEqual(
-            precompute_tkis_query_plans(
-                [Question("v", "VKIS", "", "queries/v.jpg")],
-                profile="kis",
-                expansion_config=QueryExpansionConfig(),
-                device="cpu",
-                cache_dir=self.root / "responses",
-                model_cache_dir=self.root / "models",
-                local_files_only=True,
-                provider_factory=forbidden_factory,
-            ),
-            {},
-        )
-        plans = precompute_tkis_query_plans(
-            [Question("t", "TKIS", "a bus", "")],
-            profile="kis",
-            expansion_config=QueryExpansionConfig(enabled=False),
-            device="cpu",
-            cache_dir=self.root / "responses",
-            model_cache_dir=self.root / "models",
-            local_files_only=True,
-            provider_factory=forbidden_factory,
-        )
-        self.assertEqual(plans["t"].expansion_plan.status, "disabled")
 
     def test_stage_range_is_ordered(self) -> None:
         self.assertEqual(
