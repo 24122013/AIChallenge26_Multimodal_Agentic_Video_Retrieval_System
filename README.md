@@ -65,13 +65,17 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-PaddlePaddle phải được cài riêng theo môi trường. Ví dụ CPU:
+PaddlePaddle phải được cài riêng theo môi trường. Repo đã được kiểm thử với
+PaddlePaddle `3.2.2`; không cài đồng thời wheel CPU và GPU. Ví dụ CPU:
 
 ```powershell
-python -m pip install paddlepaddle
+python -m pip install paddlepaddle==3.2.2
 ```
 
-Với CUDA, cài đúng wheel `paddlepaddle-gpu` tương ứng và không giữ đồng thời wheel CPU.
+Với CUDA, cài `paddlepaddle-gpu==3.2.2` từ index chính thức tương ứng kiến trúc GPU.
+Blackwell `sm_120` (RTX 5090/5080/5070) dùng index `cu129` hoặc mới hơn; không dùng
+wheel `cu118`, vì wheel đó không chứa mã cho `sm_120`. Luôn chạy smoke test Torch và
+Paddle trước khi tải model hoặc bắt đầu Phase 3.
 Kiểm tra FFmpeg:
 
 ```powershell

@@ -240,6 +240,79 @@ class EndToEndRunnerTest(unittest.TestCase):
         self.assertEqual(report["resolved_device"], "cuda")
         self.assertEqual(report["device_name"], "Fake GPU")
 
+    @mock.patch("competition.run_end_to_end.shutil.which", return_value="available")
+    def test_cuda_preflight_rejects_cpu_only_paddle(self, _which: mock.Mock) -> None:
+        fake_torch = SimpleNamespace(
+            __version__="2.13.0+cu130",
+            version=SimpleNamespace(cuda="13.0"),
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                get_device_name=lambda _index: "Fake GPU",
+            ),
+        )
+        fake_paddle = SimpleNamespace(
+            __version__="3.2.2",
+            device=SimpleNamespace(is_compiled_with_cuda=lambda: False),
+        )
+
+        with self.assertRaisesRegex(ValueError, "CUDA-enabled PaddlePaddle wheel"):
+            runtime_preflight(
+                device="cuda",
+                require_ffmpeg=True,
+                require_paddle=True,
+                torch_module=fake_torch,
+                paddle_module=fake_paddle,
+            )
+
+    @mock.patch("competition.run_end_to_end.shutil.which", return_value="available")
+    @mock.patch("competition.run_end_to_end.importlib.import_module")
+    def test_cuda_preflight_smokes_full_model_stack(
+        self,
+        import_mock: mock.Mock,
+        _which: mock.Mock,
+    ) -> None:
+        class FakeTensor:
+            def numpy(self):
+                return [1.0]
+
+        fake_torch = SimpleNamespace(
+            __version__="2.13.0+cu130",
+            version=SimpleNamespace(cuda="13.0"),
+            ones=lambda *_args, **_kwargs: FakeTensor(),
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                get_device_name=lambda _index: "Fake GPU",
+                synchronize=lambda: None,
+            ),
+        )
+        fake_paddle = SimpleNamespace(
+            __version__="3.2.2",
+            ones=lambda *_args, **_kwargs: FakeTensor(),
+            device=SimpleNamespace(
+                is_compiled_with_cuda=lambda: True,
+                set_device=lambda _device: None,
+                cuda=SimpleNamespace(empty_cache=lambda: None),
+            ),
+        )
+        import_mock.side_effect = [
+            SimpleNamespace(PaddleOCR=object()),
+            SimpleNamespace(YOLOE=object()),
+            SimpleNamespace(AutoModelForMultimodalLM=object()),
+            SimpleNamespace(TransNetV2=object()),
+        ]
+
+        report = runtime_preflight(
+            device="cuda",
+            require_ffmpeg=False,
+            require_paddle=True,
+            torch_module=fake_torch,
+            paddle_module=fake_paddle,
+        )
+
+        self.assertTrue(report["torch_cuda_smoke_tested"])
+        self.assertTrue(report["paddle_cuda_smoke_tested"])
+        self.assertEqual(len(report["model_stack_imports"]), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

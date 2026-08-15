@@ -31,7 +31,7 @@ class ColabRetrievalNotebookTest(unittest.TestCase):
             "GIT_BRANCH = 'feat/query-expansion'",
             "CAPTION_BATCH_SIZE = 1",
             "CAPTION_QUANTIZATION = '4bit'",
-            "PADDLE_PACKAGE = 'paddlepaddle-gpu==3.3.0'",
+            "PADDLE_PACKAGE = 'paddlepaddle-gpu==3.2.2'",
             "paddle.device.is_compiled_with_cuda()",
             "GPU_MEMORY_MIB < 14000",
             "source_size_bytes",

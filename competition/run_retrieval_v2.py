@@ -557,6 +557,7 @@ def run(args: argparse.Namespace) -> Path:
         preflight = runtime_preflight(
             device=args.device,
             require_ffmpeg="keyframes" in selected,
+            require_paddle="keyframes" in selected,
         )
         update_run_manifest(run_root, runtime=preflight)
         print("Runtime preflight:\n" + json.dumps(preflight, indent=2), flush=True)

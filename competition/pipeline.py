@@ -567,6 +567,95 @@ def _phase3_exact_frame_artifact(
     return True
 
 
+def _phase3_frame_artifact_failure_summary(
+    records: Sequence[Mapping[str, object]],
+    candidate_ids: Sequence[str],
+    *,
+    name: str,
+    path: Path,
+) -> str:
+    """Return compact, actionable diagnostics for a rejected hard modality."""
+
+    identities: list[str] = []
+    identity_errors = 0
+    for record in records:
+        try:
+            identities.append(_phase3_record_candidate_id(record))
+        except RuntimeError:
+            identity_errors += 1
+    expected = set(candidate_ids)
+    actual = set(identities)
+    error_records = [
+        record for record in records if record.get("status", "success") != "success"
+    ]
+    sample = ""
+    if error_records:
+        record = error_records[0]
+        candidate_id = record.get("candidate_id") or record.get("frame_id") or "unknown"
+        error = " ".join(str(record.get("error", "unspecified error")).split())
+        sample = f", first_error={candidate_id}: {error[:240]}"
+    return (
+        f"{name}(records={len(records)}, errors={len(error_records)}, "
+        f"missing={len(expected - actual)}, unexpected={len(actual - expected)}, "
+        f"duplicates={len(identities) - len(actual)}, invalid_ids={identity_errors}, "
+        f"path={path}{sample})"
+    )
+
+
+def _phase3_require_hard_feature_success(
+    *,
+    pipeline: str,
+    video: CorpusVideo,
+    report: Mapping[str, object],
+    report_path: Path,
+    allow_partial_features: bool,
+) -> None:
+    """Stop Phase 3 after the first failed hard-modality video."""
+
+    if allow_partial_features:
+        return
+    try:
+        error_count = int(report.get("error_count", 0))
+        input_count = int(report.get("input_record_count", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid {pipeline} report for {video.video_id}: {report_path}"
+        ) from exc
+    if error_count:
+        raise RuntimeError(
+            f"{pipeline} hard-feature extraction failed for {video.video_id}: "
+            f"{error_count}/{input_count} records failed; see {report_path}"
+        )
+
+
+def _phase3_require_modality_progress(
+    *,
+    pipeline: str,
+    video: CorpusVideo,
+    report: Mapping[str, object],
+    report_path: Path,
+    allow_partial_features: bool,
+) -> None:
+    """Stop a systematic backend failure before it repeats across the corpus."""
+
+    if allow_partial_features:
+        return
+    try:
+        input_count = int(report.get("input_record_count", 0))
+        skipped_count = int(report.get("skipped_count", 0))
+        error_count = int(report.get("error_count", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid {pipeline} report for {video.video_id}: {report_path}"
+        ) from exc
+    pending_count = input_count - skipped_count
+    if pending_count > 0 and error_count >= pending_count:
+        raise RuntimeError(
+            f"{pipeline} made no progress for {video.video_id}: all "
+            f"{pending_count} pending records failed; see {report_path}"
+        )
+
+
 def _phase3_artifact_entry(path: Path) -> dict[str, object]:
     return {
         "path": path.as_posix(),
@@ -631,9 +720,30 @@ def _phase3_load_and_validate_features(
     if not caption_complete:
         raise RuntimeError("caption artifact identities do not match candidate pool")
     if (not ocr_complete or not object_complete) and not allow_partial_features:
+        failures = []
+        if not ocr_complete:
+            failures.append(
+                _phase3_frame_artifact_failure_summary(
+                    ocr,
+                    candidate_ids,
+                    name="ocr",
+                    path=paths.ocr,
+                )
+            )
+        if not object_complete:
+            failures.append(
+                _phase3_frame_artifact_failure_summary(
+                    objects,
+                    candidate_ids,
+                    name="objects",
+                    path=paths.objects,
+                )
+            )
         raise RuntimeError(
-            "OCR/object hard-feature extraction is incomplete; rerun Phase 3 or "
-            "use --allow-partial-features for an explicit degraded run"
+            f"Phase 3 hard-feature extraction is incomplete for {video.video_id}: "
+            + "; ".join(failures)
+            + "; rerun Phase 3 after fixing the reported backend error, or use "
+            "--allow-partial-features for an explicit degraded run"
         )
 
     hard_feature_complete = ocr_complete and object_complete
@@ -824,7 +934,7 @@ def _phase3_release_model_memory(*owners: object) -> None:
                 owner.to("cpu")
             except Exception:  # noqa: BLE001 - cleanup must not hide stage errors.
                 pass
-        for attribute in ("_model", "_reader", "_processor"):
+        for attribute in ("_model", "_reader", "_processor", "_pipeline"):
             if not hasattr(owner, attribute):
                 continue
             value = getattr(owner, attribute, None)
@@ -845,6 +955,12 @@ def _phase3_release_model_memory(*owners: object) -> None:
             torch.cuda.empty_cache()
     except ImportError:  # pragma: no cover - SigLIP already requires torch in production.
         pass
+    paddle = sys.modules.get("paddle")
+    if paddle is not None:
+        try:
+            paddle.device.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - CPU builds and old Paddle releases may differ.
+            pass
 
 
 def _sha256_file(path: Path) -> str:
@@ -1811,7 +1927,7 @@ def _phase3_generate_features(
                 start=1,
             ):
                 print(f"[caption {number}/{len(caption_pending)}] {video.filename}")
-                run_caption_file(
+                caption_report = run_caption_file(
                     paths.candidate_metadata,
                     output_path=paths.captions,
                     report_path=paths.caption_report,
@@ -1826,6 +1942,13 @@ def _phase3_generate_features(
                     dtype=args.caption_dtype,
                     quantization=args.caption_quantization,
                     model_cache_dir=args.model_cache_root / "caption",
+                )
+                _phase3_require_modality_progress(
+                    pipeline="caption",
+                    video=video,
+                    report=caption_report,
+                    report_path=paths.caption_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(caption_backend)
@@ -1875,7 +1998,7 @@ def _phase3_generate_features(
         try:
             for number, (video, paths, _contract) in enumerate(ocr_pending, start=1):
                 print(f"[ocr {number}/{len(ocr_pending)}] {video.filename}")
-                run_ocr_file(
+                ocr_report = run_ocr_file(
                     paths.candidate_metadata,
                     output_path=paths.ocr,
                     report_path=paths.ocr_report,
@@ -1888,6 +2011,13 @@ def _phase3_generate_features(
                     recognition_model=args.ocr_recognition_model,
                     revision=args.ocr_model_revision,
                     model_cache_dir=args.model_cache_root / "ocr",
+                )
+                _phase3_require_hard_feature_success(
+                    pipeline="OCR",
+                    video=video,
+                    report=ocr_report,
+                    report_path=paths.ocr_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(ocr_backend)
@@ -1941,7 +2071,7 @@ def _phase3_generate_features(
         try:
             for number, (video, paths, _contract) in enumerate(object_pending, start=1):
                 print(f"[objects {number}/{len(object_pending)}] {video.filename}")
-                run_object_file(
+                object_report = run_object_file(
                     paths.candidate_metadata,
                     output_path=paths.objects,
                     report_path=paths.object_report,
@@ -1956,6 +2086,13 @@ def _phase3_generate_features(
                     model_cache_dir=object_cache,
                     vocabulary=args.object_vocabulary,
                     prompt_mode=args.object_prompt_mode,
+                )
+                _phase3_require_hard_feature_success(
+                    pipeline="object detection",
+                    video=video,
+                    report=object_report,
+                    report_path=paths.object_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(object_backend)

@@ -7,6 +7,7 @@ duplicating orchestration logic from :mod:`competition.pipeline`.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import shutil
@@ -189,7 +190,9 @@ def runtime_preflight(
     *,
     device: str,
     require_ffmpeg: bool,
+    require_paddle: bool = False,
     torch_module: object | None = None,
+    paddle_module: object | None = None,
 ) -> dict[str, object]:
     """Fail early for the environment errors that otherwise appear mid-video."""
 
@@ -202,8 +205,8 @@ def runtime_preflight(
     if torch_module is None:
         try:
             import torch as torch_module  # type: ignore[no-redef]
-        except ImportError as exc:
-            raise ValueError("PyTorch is not installed in the active environment") from exc
+        except Exception as exc:
+            raise ValueError(f"PyTorch failed to import: {exc}") from exc
 
     torch_version = str(getattr(torch_module, "__version__", "unknown"))
     version_info = getattr(torch_module, "version", None)
@@ -225,12 +228,79 @@ def runtime_preflight(
 
     resolved_device = "cuda" if device in {"auto", "cuda"} and cuda_available else "cpu"
     device_name: str | None = None
+    torch_cuda_smoke_tested = False
     if resolved_device == "cuda":
         device_name = str(cuda_api.get_device_name(0))
+        tensor_factory = getattr(torch_module, "ones", None)
+        if callable(tensor_factory):
+            try:
+                smoke_tensor = tensor_factory((1,), device="cuda")
+                synchronize = getattr(cuda_api, "synchronize", None)
+                if callable(synchronize):
+                    synchronize()
+                del smoke_tensor
+                torch_cuda_smoke_tested = True
+            except Exception as exc:
+                raise ValueError(f"PyTorch CUDA smoke test failed: {exc}") from exc
+
+    paddle_version: str | None = None
+    paddle_cuda_build: bool | None = None
+    paddle_cuda_smoke_tested = False
+    model_stack_imports: list[str] = []
+    if require_paddle:
+        if paddle_module is None:
+            try:
+                import paddle as paddle_module  # type: ignore[no-redef]
+            except Exception as exc:
+                raise ValueError(f"PaddlePaddle failed to import: {exc}") from exc
+        paddle_version = str(getattr(paddle_module, "__version__", "unknown"))
+        paddle_device = getattr(paddle_module, "device", None)
+        compiled_check = getattr(paddle_device, "is_compiled_with_cuda", None)
+        paddle_cuda_build = bool(callable(compiled_check) and compiled_check())
+        if resolved_device == "cuda" and not paddle_cuda_build:
+            raise ValueError(
+                f"--device cuda requires a CUDA-enabled PaddlePaddle wheel, but "
+                f"paddle {paddle_version} reports is_compiled_with_cuda=False"
+            )
+        if resolved_device == "cuda":
+            try:
+                paddle_device.set_device("gpu:0")
+                smoke_tensor = paddle_module.ones([1])
+                to_numpy = getattr(smoke_tensor, "numpy", None)
+                if callable(to_numpy):
+                    to_numpy()
+                del smoke_tensor
+                paddle_device.cuda.empty_cache()
+                paddle_cuda_smoke_tested = True
+            except Exception as exc:
+                raise ValueError(f"PaddlePaddle CUDA smoke test failed: {exc}") from exc
+        required_model_apis = (
+            ("paddleocr", "PaddleOCR"),
+            ("ultralytics", "YOLOE"),
+            ("transformers", "AutoModelForMultimodalLM"),
+            ("transnetv2_pytorch", "TransNetV2"),
+        )
+        for module_name, attribute in required_model_apis:
+            try:
+                module = importlib.import_module(module_name)
+            except Exception as exc:
+                raise ValueError(
+                    f"Required model backend {module_name} failed to import: {exc}"
+                ) from exc
+            if not hasattr(module, attribute):
+                raise ValueError(
+                    f"Required model backend {module_name} does not expose {attribute}"
+                )
+            model_stack_imports.append(f"{module_name}.{attribute}")
     return {
         "torch_version": torch_version,
         "torch_cuda_build": cuda_build,
         "cuda_available": cuda_available,
+        "torch_cuda_smoke_tested": torch_cuda_smoke_tested,
+        "paddle_version": paddle_version,
+        "paddle_cuda_build": paddle_cuda_build,
+        "paddle_cuda_smoke_tested": paddle_cuda_smoke_tested,
+        "model_stack_imports": model_stack_imports,
         "resolved_device": resolved_device,
         "device_name": device_name,
         "ffmpeg_available": shutil.which("ffmpeg") is not None,
@@ -370,6 +440,7 @@ def run(args: argparse.Namespace) -> Path:
             preflight = runtime_preflight(
                 device=args.device,
                 require_ffmpeg="keyframes" in stages,
+                require_paddle="keyframes" in stages,
             )
             print(
                 "Runtime preflight:\n"

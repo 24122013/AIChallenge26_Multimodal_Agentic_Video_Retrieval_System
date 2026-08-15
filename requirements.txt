@@ -1,4 +1,4 @@
-numpy>=1.26
+numpy>=1.26,<2.4
 opencv-python>=4.9.0
 open-clip-torch>=2.24.0
 faiss-cpu>=1.8.0

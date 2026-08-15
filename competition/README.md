@@ -60,14 +60,18 @@ Cài FFmpeg và kiểm tra:
 ffmpeg -version
 ```
 
-PaddlePaddle phải khớp môi trường CPU/CUDA. Ví dụ CPU:
+PaddlePaddle phải khớp môi trường CPU/CUDA. Repo đã được kiểm thử với phiên bản
+`3.2.2`; không cài đồng thời wheel CPU và GPU. Ví dụ CPU:
 
 ```powershell
-python -m pip install paddlepaddle
+python -m pip install paddlepaddle==3.2.2
 ```
 
-Với CUDA, cài wheel `paddlepaddle-gpu` tương ứng từ hướng dẫn PaddlePaddle. Không giữ
-đồng thời wheel CPU và GPU. `bitsandbytes` chỉ được dùng cho quantization Qwen trên CUDA.
+Với CUDA, cài `paddlepaddle-gpu==3.2.2` từ index PaddlePaddle tương ứng. Blackwell
+`sm_120` (RTX 5090/5080/5070) cần index `cu129` hoặc mới hơn; wheel `cu118` không hỗ
+trợ kiến trúc này. Không giữ đồng thời wheel CPU và GPU. `bitsandbytes` chỉ được dùng
+cho quantization Qwen trên CUDA. Runner sẽ smoke-test cả Torch và Paddle GPU trước khi
+khởi động stage keyframes để lỗi runtime dừng trước khi tải model lớn.
 
 ## 4. Chạy end-to-end — đường khuyến nghị
 

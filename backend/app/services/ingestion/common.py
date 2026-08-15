@@ -161,7 +161,9 @@ def resumable_ids(
     """Return compatible IDs and whether an existing artifact must be replaced.
 
     A model or explicitly requested revision change invalidates the complete
-    modality artifact. Unrelated historical files are never touched.
+    modality artifact. Failed/incomplete records also invalidate the artifact
+    so resume never mistakes an error checkpoint for completed inference.
+    Unrelated historical files are never touched.
     """
     if not output_path.exists():
         return set(), False
@@ -179,7 +181,7 @@ def resumable_ids(
             )
         elif model_revision is not None:
             compatible = compatible and record.get("model_revision") == model_revision
-        if compatible:
+        if compatible and record.get("status") == "success":
             ids.add(str(value))
         else:
             incompatible = True

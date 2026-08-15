@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Sequence
+from unittest import mock
 
+import numpy as np
 from PIL import Image
 
 from backend.app.services.ingestion.caption_pipeline import (
@@ -17,13 +21,15 @@ from backend.app.services.ingestion.caption_pipeline import (
     run_caption_file,
 )
 from backend.app.services.ingestion.run_caption import build_parser as build_caption_parser
-from backend.app.services.ingestion.common import read_jsonl
+from backend.app.services.ingestion.common import read_jsonl, resumable_ids
 from backend.app.services.ingestion.object_pipeline import (
+    YoloEBackend,
     deterministic_class_id,
     normalize_detections,
     run_object_file,
 )
 from backend.app.services.ingestion.ocr_pipeline import (
+    PaddleOcrBackend,
     normalize_regions,
     normalize_text,
     run_ocr_file,
@@ -292,6 +298,30 @@ class MultimodalIngestionTest(unittest.TestCase):
         self.assertEqual(normalize_text("a\x00  b"), "a b")
         self.assertEqual(unaccent_text("Đường phố"), "Duong pho")
 
+    def test_ppocr_normalization_accepts_numpy_polygon(self) -> None:
+        regions = normalize_regions(
+            {
+                "res": {
+                    "rec_polys": [
+                        np.asarray(
+                            [[0, 0], [10, 0], [10, 5], [0, 5]],
+                            dtype=np.float32,
+                        )
+                    ],
+                    "rec_texts": ["screen text"],
+                    "rec_scores": np.asarray([0.95], dtype=np.float32),
+                }
+            },
+            0.3,
+        )
+
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(
+            regions[0]["polygon"],
+            [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]],
+        )
+        self.assertEqual(regions[0]["text"], "screen text")
+
     def test_ocr_pipeline_image_size_and_resume_provenance(self) -> None:
         output = self.root / "ocr.jsonl"
         backend = FakeOcrBackend()
@@ -316,8 +346,85 @@ class MultimodalIngestionTest(unittest.TestCase):
             device="cpu",
             backend=backend,
         )
-        self.assertEqual(backend.calls, calls)
-        self.assertEqual(resumed["skipped_count"], 3)
+        self.assertGreater(backend.calls, calls)
+        self.assertEqual(resumed["skipped_count"], 0)
+        self.assertEqual(resumed["error_count"], 1)
+
+    def test_resume_invalidates_compatible_error_records(self) -> None:
+        output = self.root / "failed.jsonl"
+        output.write_text(
+            json.dumps(
+                {
+                    "frame_id": "FRAME_1",
+                    "model_name": "test-model",
+                    "model_revision": "revision-1",
+                    "status": "error",
+                    "error": "synthetic inference failure",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        processed, stale = resumable_ids(
+            output,
+            "frame_id",
+            model_name="test-model",
+            model_revision="revision-1",
+        )
+
+        self.assertEqual(processed, set())
+        self.assertTrue(stale)
+
+    def test_paddle_backend_explicitly_disables_mkldnn(self) -> None:
+        captured: dict[str, Any] = {}
+        paddleocr = ModuleType("paddleocr")
+
+        def fake_paddle_ocr(**kwargs: Any) -> object:
+            captured.update(kwargs)
+            return object()
+
+        paddleocr.PaddleOCR = fake_paddle_ocr  # type: ignore[attr-defined]
+        backend = PaddleOcrBackend(device="cuda", cache_dir=self.root / "ocr-cache")
+        with (
+            mock.patch.dict(sys.modules, {"paddleocr": paddleocr}),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PADDLE_PDX_CACHE_HOME": "stale-cache",
+                    "PADDLE_HOME": "stale-cache",
+                },
+            ),
+        ):
+            backend._load()
+            expected_cache = str((self.root / "ocr-cache").resolve())
+            self.assertEqual(os.environ["PADDLE_PDX_CACHE_HOME"], expected_cache)
+            self.assertEqual(os.environ["PADDLE_HOME"], expected_cache)
+
+        self.assertEqual(captured["device"], "gpu:0")
+        self.assertIs(captured["enable_mkldnn"], False)
+
+    def test_yoloe_backend_uses_explicit_cache_path_on_first_load(self) -> None:
+        model_refs: list[str] = []
+        configured_classes: list[list[str]] = []
+        ultralytics = ModuleType("ultralytics")
+
+        class FakeYoloE:
+            def __init__(self, model_ref: str) -> None:
+                model_refs.append(model_ref)
+
+            def set_classes(self, classes: list[str]) -> None:
+                configured_classes.append(classes)
+
+        ultralytics.YOLOE = FakeYoloE  # type: ignore[attr-defined]
+        ultralytics.settings = {}  # type: ignore[attr-defined]
+        cache_dir = self.root / "objects-cache"
+        backend = YoloEBackend(cache_dir=cache_dir, vocabulary=("person", "bus"))
+        with mock.patch.dict(sys.modules, {"ultralytics": ultralytics}):
+            backend._load()
+
+        self.assertEqual(model_refs, [str((cache_dir / backend.model_name).resolve())])
+        self.assertEqual(configured_classes, [["person", "bus"]])
 
     def test_yoloe_normalization_bbox_confidence_and_identity(self) -> None:
         first, size = normalize_detections(
@@ -347,6 +454,19 @@ class MultimodalIngestionTest(unittest.TestCase):
         self.assertEqual(first[0]["bbox_xyxy"], [1.0, 2.0, 30.0, 40.0])
         self.assertEqual(first[0]["class_id"], second[0]["class_id"])
         self.assertEqual(first[0]["class_id"], deterministic_class_id("traffic light"))
+
+        numpy_bbox, _ = normalize_detections(
+            {
+                "objects": [
+                    {
+                        "class_name": "screen",
+                        "confidence": 0.75,
+                        "bbox_xyxy": np.asarray([2, 3, 20, 30], dtype=np.float32),
+                    }
+                ]
+            }
+        )
+        self.assertEqual(numpy_bbox[0]["bbox_xyxy"], [2.0, 3.0, 20.0, 30.0])
 
         output = self.root / "objects.jsonl"
         run_object_file(
