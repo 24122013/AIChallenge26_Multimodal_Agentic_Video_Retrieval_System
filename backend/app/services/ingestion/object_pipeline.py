@@ -109,10 +109,12 @@ class YoloEBackend:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         settings.update({"weights_dir": str(self.cache_dir.resolve())})
         model_path = Path(self.model_name)
-        cached_path = self.cache_dir / model_path.name
-        # A bare official checkpoint name lets Ultralytics download it into
-        # weights_dir. Once cached, use the explicit local path deterministically.
-        model_ref = str(cached_path if cached_path.is_file() else model_path)
+        cached_path = (self.cache_dir / model_path.name).resolve()
+        # Pass the intended cache filename even on the first run. Ultralytics'
+        # asset downloader otherwise downloads a missing bare checkpoint into
+        # the process working directory, which dirties the repository and
+        # invalidates immutable-run fingerprints.
+        model_ref = str(model_path.resolve() if model_path.is_file() else cached_path)
         self._model = YOLOE(model_ref)
         if self.prompt_mode == "text":
             self._model.set_classes(list(self.vocabulary))
@@ -159,7 +161,11 @@ def normalize_detections(raw: Any) -> tuple[list[dict[str, Any]], list[int]]:
     normalized: list[dict[str, Any]] = []
     for item in detections:
         value = dict(item)
-        bbox = value.get("bbox_xyxy") or value.get("bbox")
+        bbox = value.get("bbox_xyxy")
+        if bbox is None:
+            bbox = value.get("bbox")
+        if hasattr(bbox, "tolist"):
+            bbox = bbox.tolist()
         if not isinstance(bbox, Sequence) or len(bbox) != 4:
             raise ValueError("object bbox_xyxy must contain exactly four coordinates")
         class_name = " ".join(str(value["class_name"]).split())

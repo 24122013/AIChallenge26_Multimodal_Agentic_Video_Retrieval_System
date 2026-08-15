@@ -72,12 +72,11 @@ class PaddleOcrBackend:
             return
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         # Set cache roots before importing PaddleOCR/PaddleX so their module
-        # initialization observes them. Preserve explicit operator settings.
-        os.environ.setdefault(
-            "PADDLE_PDX_CACHE_HOME",
-            str(self.cache_dir.resolve()),
-        )
-        os.environ.setdefault("PADDLE_HOME", str(self.cache_dir.resolve()))
+        # initialization observes the cache_dir explicitly selected by this
+        # run instead of writing a second copy under a stale process setting.
+        cache_root = str(self.cache_dir.resolve())
+        os.environ["PADDLE_PDX_CACHE_HOME"] = cache_root
+        os.environ["PADDLE_HOME"] = cache_root
         try:
             from paddleocr import PaddleOCR
         except ImportError as exc:
@@ -89,6 +88,12 @@ class PaddleOcrBackend:
             text_detection_model_name=self.detection_model,
             text_recognition_model_name=self.recognition_model,
             device="gpu:0" if self.device == "cuda" else "cpu",
+            # PaddlePaddle 3.3.x has a PIR -> oneDNN regression that fails on
+            # PP-OCRv5 ArrayAttribute<DoubleAttribute> values.  PaddleX may
+            # still route individual operators through its CPU predictor even
+            # when the pipeline device is CUDA, so make the safe backend choice
+            # explicit instead of relying on a process environment flag.
+            enable_mkldnn=False,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
@@ -187,7 +192,9 @@ def normalize_regions(raw: Any, threshold: float) -> list[dict[str, Any]]:
     regions: list[dict[str, Any]] = []
     for item in items:
         if isinstance(item, Mapping):
-            polygon = item.get("polygon") or item.get("bbox")
+            polygon = item.get("polygon")
+            if polygon is None:
+                polygon = item.get("bbox")
             raw_text = str(item.get("raw_text", item.get("text", "")))
             confidence = float(item.get("confidence", item.get("score", 0.0)))
             language = item.get("language")
@@ -196,6 +203,8 @@ def normalize_regions(raw: Any, threshold: float) -> list[dict[str, Any]]:
             raw_text = str(raw_text)
             confidence = float(confidence)
             language = None
+        if hasattr(polygon, "tolist"):
+            polygon = polygon.tolist()
         if confidence < threshold:
             continue
         if not isinstance(polygon, Sequence) or len(polygon) < 4:

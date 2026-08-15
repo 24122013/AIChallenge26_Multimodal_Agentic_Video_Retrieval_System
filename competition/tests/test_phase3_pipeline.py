@@ -32,6 +32,8 @@ from competition.pipeline import (
     _phase3_frame_modality_artifacts_current,
     _phase3_load_and_validate_features,
     _phase3_publish_video,
+    _phase3_require_hard_feature_success,
+    _phase3_require_modality_progress,
     _phase3_release_model_memory,
     _phase3_siglip_artifacts_current,
     _phase3_selection_config,
@@ -301,6 +303,11 @@ class Phase3PipelineIntegrationTest(unittest.TestCase):
     def test_keyframes_defaults_stop_at_hard_coverage_and_require_hard_features(self) -> None:
         args = build_parser().parse_args(["keyframes"])
 
+        self.assertEqual(args.caption_model_name, "Qwen/Qwen3.5-4B")
+        self.assertEqual(
+            args.caption_model_revision,
+            "c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97",
+        )
         self.assertIsNone(args.target_keyframes)
         self.assertIsNone(args.hard_max_keyframes)
         self.assertFalse(args.allow_partial_features)
@@ -322,6 +329,7 @@ class Phase3PipelineIntegrationTest(unittest.TestCase):
             def __init__(self) -> None:
                 self._model = FakeModel()
                 self._processor = object()
+                self._pipeline = object()
 
         direct = FakeModel()
         backend = FakeBackend()
@@ -333,6 +341,7 @@ class Phase3PipelineIntegrationTest(unittest.TestCase):
         self.assertEqual(nested.devices, ["cpu"])
         self.assertIsNone(backend._model)
         self.assertIsNone(backend._processor)
+        self.assertIsNone(backend._pipeline)
 
     def test_modality_checkpoints_require_exact_reports(self) -> None:
         (
@@ -457,6 +466,88 @@ class Phase3PipelineIntegrationTest(unittest.TestCase):
                 allow_partial_features=False,
                 require_manifest=True,
             )
+
+    def test_feature_loader_reports_the_exact_failed_hard_modality(self) -> None:
+        (
+            paths,
+            candidate_report,
+            candidates,
+            _embeddings,
+            _caption_records,
+            feature_config,
+            _features,
+        ) = self._write_phase3_fixture()
+        ocr_records = read_jsonl(paths.ocr)
+        ocr_records[0]["status"] = "error"
+        ocr_records[0]["error"] = "synthetic oneDNN failure"
+        atomic_write_jsonl(paths.ocr, ocr_records)
+
+        with self.assertRaises(RuntimeError) as raised:
+            _phase3_load_and_validate_features(
+                video=self.video,
+                paths=paths,
+                candidate_report=candidate_report,
+                candidate_records=candidates,
+                feature_config=feature_config,
+                allow_partial_features=False,
+                require_manifest=False,
+            )
+
+        message = str(raised.exception)
+        self.assertIn(f"for {VIDEO_ID}: ocr(", message)
+        self.assertIn("errors=1", message)
+        self.assertIn("synthetic oneDNN failure", message)
+        self.assertNotIn("objects(", message)
+
+    def test_hard_feature_generation_fails_after_first_bad_video(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"OCR hard-feature extraction failed for video001: 3/10",
+        ):
+            _phase3_require_hard_feature_success(
+                pipeline="OCR",
+                video=self.video,
+                report={"input_record_count": 10, "error_count": 3},
+                report_path=self.root / "ocr_report.json",
+                allow_partial_features=False,
+            )
+
+        _phase3_require_hard_feature_success(
+            pipeline="OCR",
+            video=self.video,
+            report={"input_record_count": 10, "error_count": 3},
+            report_path=self.root / "ocr_report.json",
+            allow_partial_features=True,
+        )
+
+    def test_caption_generation_stops_on_systemic_backend_failure(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"caption made no progress for video001: all 8 pending records failed",
+        ):
+            _phase3_require_modality_progress(
+                pipeline="caption",
+                video=self.video,
+                report={
+                    "input_record_count": 10,
+                    "skipped_count": 2,
+                    "error_count": 8,
+                },
+                report_path=self.root / "caption_report.json",
+                allow_partial_features=False,
+            )
+
+        _phase3_require_modality_progress(
+            pipeline="caption",
+            video=self.video,
+            report={
+                "input_record_count": 10,
+                "skipped_count": 2,
+                "error_count": 1,
+            },
+            report_path=self.root / "caption_report.json",
+            allow_partial_features=False,
+        )
 
     def test_publish_creates_valid_canonical_subset_and_commit_marker(self) -> None:
         (

@@ -4,7 +4,7 @@ Backend cung cấp ingestion metadata, indexing và retrieval API.
 
 ## Ingestion
 
-- `run_caption.py`: Qwen3.5-9B multimodal, JSON retrieval schema, lazy loading,
+- `run_caption.py`: Qwen3.5-4B multimodal, JSON retrieval schema, lazy loading,
   batch, dtype và quantization.
 - `run_ocr.py`: PP-OCRv5 detection + Latin recognition cho tiếng Việt/Anh,
   polygon/confidence và Unicode normalization.

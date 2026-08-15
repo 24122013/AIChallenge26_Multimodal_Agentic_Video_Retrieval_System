@@ -38,6 +38,10 @@ from competition.run_manifest import (
     sha256_file,
     update_run_manifest,
 )
+from backend.app.services.ingestion.caption_pipeline import (
+    DEFAULT_MODEL_NAME as DEFAULT_CAPTION_MODEL_NAME,
+    DEFAULT_MODEL_REVISION as DEFAULT_CAPTION_MODEL_REVISION,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -94,6 +98,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--neighbor-window-seconds", type=float, default=5.0)
     parser.add_argument("--model-cache-root", type=Path, default=None)
     parser.add_argument("--offline-model-cache", action="store_true")
+    parser.add_argument("--caption-model-name", default=DEFAULT_CAPTION_MODEL_NAME)
+    parser.add_argument(
+        "--caption-model-revision",
+        default=DEFAULT_CAPTION_MODEL_REVISION,
+    )
+    parser.add_argument(
+        "--caption-batch-size",
+        type=int,
+        default=2,
+        help="Qwen caption batch size used by the keyframe stage.",
+    )
+    parser.add_argument(
+        "--caption-quantization",
+        choices=("none", "8bit", "4bit"),
+        default="none",
+        help="Qwen caption quantization used by the keyframe stage.",
+    )
+    parser.add_argument(
+        "--no-query-expansion",
+        action="store_true",
+        help="Explicit TKIS ablation: keep only the original query.",
+    )
     parser.add_argument("--retrieval-config", type=Path, default=DEFAULT_RETRIEVAL_CONFIG)
     parser.add_argument("--search-depth", type=int, default=300)
     parser.add_argument("--coarse-top-n", type=int, default=50)
@@ -208,9 +234,19 @@ def build_stage_commands(
         str(model_cache_dir),
         "--model-cache-root",
         str(cache_root),
+        "--caption-model-name",
+        args.caption_model_name,
+        "--caption-model-revision",
+        args.caption_model_revision,
+        "--caption-batch-size",
+        str(args.caption_batch_size),
+        "--caption-quantization",
+        args.caption_quantization,
     ]
     if not args.fresh:
         keyframes.append("--resume")
+    if args.offline_model_cache:
+        keyframes.append("--offline-model-cache")
     if args.no_autocast:
         keyframes.append("--no-autocast")
     if args.allow_partial_features:
@@ -241,7 +277,13 @@ def build_stage_commands(
         "--search-depth",
         str(args.search_depth),
         "--tkis-routing",
-        "auto-temporal",
+        "hybrid",
+        "--retrieval-profile",
+        "kis",
+        "--query-expansion-cache-dir",
+        str(cache_root / "query_expansion"),
+        "--query-expansion-model-cache-dir",
+        str(cache_root / "caption"),
         "--coarse-top-n",
         str(args.coarse_top_n),
         "--dense-global-top-k",
@@ -297,6 +339,8 @@ def build_stage_commands(
     ]
     if args.offline_model_cache:
         predict.append("--offline-model-cache")
+    if args.no_query_expansion:
+        predict.append("--no-query-expansion")
     if args.no_autocast:
         predict.append("--no-autocast")
 
@@ -375,6 +419,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("values must be positive: " + ", ".join(invalid))
     if args.num_workers < 0 or args.native_retries < 0:
         raise ValueError("workers and retry counts must be non-negative")
+    if args.caption_batch_size <= 0:
+        raise ValueError("caption batch size must be positive")
     if not 0.0 <= args.dedup_similarity_threshold <= 1.0:
         raise ValueError("dedup similarity threshold must be within [0, 1]")
     if args.search_depth < 100:
@@ -558,6 +604,10 @@ def run(args: argparse.Namespace) -> Path:
             "target_density_per_second": args.target_density_per_second,
             "dedup_similarity_threshold": args.dedup_similarity_threshold,
             "endpoint_protection": args.endpoint_protection == "on",
+            "caption_model_name": args.caption_model_name,
+            "caption_model_revision": args.caption_model_revision,
+            "caption_batch_size": args.caption_batch_size,
+            "caption_quantization": args.caption_quantization,
         }
         manifest = initialize_run_manifest(
             run_root=run_root,
@@ -599,6 +649,7 @@ def run(args: argparse.Namespace) -> Path:
         preflight = runtime_preflight(
             device=args.device,
             require_ffmpeg="keyframes" in selected,
+            require_paddle="keyframes" in selected,
         )
         update_run_manifest(run_root, runtime=preflight)
         print("Runtime preflight:\n" + json.dumps(preflight, indent=2), flush=True)

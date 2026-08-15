@@ -30,8 +30,8 @@ from backend.app.services.ingestion.common import (
 )
 
 
-DEFAULT_MODEL_NAME = "Qwen/Qwen3.5-9B"
-DEFAULT_MODEL_REVISION = "c202236"
+DEFAULT_MODEL_NAME = "Qwen/Qwen3.5-4B"
+DEFAULT_MODEL_REVISION = "c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97"
 DEFAULT_PROMPT = """Describe this video keyframe specifically for multimedia retrieval.
 
 Focus only on visually observable information.
@@ -189,6 +189,7 @@ class QwenCaptionBackend:
             inputs = self._processor.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
+                enable_thinking=False,
                 tokenize=True,
                 return_dict=True,
                 return_tensors="pt",

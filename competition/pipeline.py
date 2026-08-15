@@ -22,7 +22,7 @@ import time
 from dataclasses import asdict
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import cv2
 import numpy as np
@@ -97,6 +97,9 @@ from backend.app.services.ingestion.ocr_pipeline import (
     run_ocr_file,
 )
 from backend.app.services.metadata.metadata_store import FrameRecord, MetadataStore
+from backend.app.services.agent.query_expansion import (
+    build_production_query_expansion_provider,
+)
 from backend.app.services.retrieval.hybrid_search import (
     HybridSearchConfig,
     HybridSearchEngine,
@@ -119,11 +122,15 @@ from backend.app.services.retrieval.advanced_search import (
     advanced_vector_search,
 )
 from backend.app.services.retrieval.advanced_rerank import AdvancedRankedFrame
+<<<<<<< HEAD
 from backend.app.services.retrieval.bge_dense import BgeM3DenseSearchEngine
 from backend.app.services.retrieval.bge_reranker import (
     LazyBgeReranker,
     rerank_with_bge,
 )
+=======
+from backend.app.services.retrieval.query_plan import QueryPlan, build_query_plan
+>>>>>>> origin/main
 from backend.app.services.retrieval.vlm_reranker import (
     DEFAULT_VLM_MODEL,
     VLM_MODES,
@@ -568,6 +575,95 @@ def _phase3_exact_frame_artifact(
     return True
 
 
+def _phase3_frame_artifact_failure_summary(
+    records: Sequence[Mapping[str, object]],
+    candidate_ids: Sequence[str],
+    *,
+    name: str,
+    path: Path,
+) -> str:
+    """Return compact, actionable diagnostics for a rejected hard modality."""
+
+    identities: list[str] = []
+    identity_errors = 0
+    for record in records:
+        try:
+            identities.append(_phase3_record_candidate_id(record))
+        except RuntimeError:
+            identity_errors += 1
+    expected = set(candidate_ids)
+    actual = set(identities)
+    error_records = [
+        record for record in records if record.get("status", "success") != "success"
+    ]
+    sample = ""
+    if error_records:
+        record = error_records[0]
+        candidate_id = record.get("candidate_id") or record.get("frame_id") or "unknown"
+        error = " ".join(str(record.get("error", "unspecified error")).split())
+        sample = f", first_error={candidate_id}: {error[:240]}"
+    return (
+        f"{name}(records={len(records)}, errors={len(error_records)}, "
+        f"missing={len(expected - actual)}, unexpected={len(actual - expected)}, "
+        f"duplicates={len(identities) - len(actual)}, invalid_ids={identity_errors}, "
+        f"path={path}{sample})"
+    )
+
+
+def _phase3_require_hard_feature_success(
+    *,
+    pipeline: str,
+    video: CorpusVideo,
+    report: Mapping[str, object],
+    report_path: Path,
+    allow_partial_features: bool,
+) -> None:
+    """Stop Phase 3 after the first failed hard-modality video."""
+
+    if allow_partial_features:
+        return
+    try:
+        error_count = int(report.get("error_count", 0))
+        input_count = int(report.get("input_record_count", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid {pipeline} report for {video.video_id}: {report_path}"
+        ) from exc
+    if error_count:
+        raise RuntimeError(
+            f"{pipeline} hard-feature extraction failed for {video.video_id}: "
+            f"{error_count}/{input_count} records failed; see {report_path}"
+        )
+
+
+def _phase3_require_modality_progress(
+    *,
+    pipeline: str,
+    video: CorpusVideo,
+    report: Mapping[str, object],
+    report_path: Path,
+    allow_partial_features: bool,
+) -> None:
+    """Stop a systematic backend failure before it repeats across the corpus."""
+
+    if allow_partial_features:
+        return
+    try:
+        input_count = int(report.get("input_record_count", 0))
+        skipped_count = int(report.get("skipped_count", 0))
+        error_count = int(report.get("error_count", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid {pipeline} report for {video.video_id}: {report_path}"
+        ) from exc
+    pending_count = input_count - skipped_count
+    if pending_count > 0 and error_count >= pending_count:
+        raise RuntimeError(
+            f"{pipeline} made no progress for {video.video_id}: all "
+            f"{pending_count} pending records failed; see {report_path}"
+        )
+
+
 def _phase3_artifact_entry(path: Path) -> dict[str, object]:
     return {
         "path": path.as_posix(),
@@ -632,9 +728,30 @@ def _phase3_load_and_validate_features(
     if not caption_complete:
         raise RuntimeError("caption artifact identities do not match candidate pool")
     if (not ocr_complete or not object_complete) and not allow_partial_features:
+        failures = []
+        if not ocr_complete:
+            failures.append(
+                _phase3_frame_artifact_failure_summary(
+                    ocr,
+                    candidate_ids,
+                    name="ocr",
+                    path=paths.ocr,
+                )
+            )
+        if not object_complete:
+            failures.append(
+                _phase3_frame_artifact_failure_summary(
+                    objects,
+                    candidate_ids,
+                    name="objects",
+                    path=paths.objects,
+                )
+            )
         raise RuntimeError(
-            "OCR/object hard-feature extraction is incomplete; rerun Phase 3 or "
-            "use --allow-partial-features for an explicit degraded run"
+            f"Phase 3 hard-feature extraction is incomplete for {video.video_id}: "
+            + "; ".join(failures)
+            + "; rerun Phase 3 after fixing the reported backend error, or use "
+            "--allow-partial-features for an explicit degraded run"
         )
 
     hard_feature_complete = ocr_complete and object_complete
@@ -825,7 +942,7 @@ def _phase3_release_model_memory(*owners: object) -> None:
                 owner.to("cpu")
             except Exception:  # noqa: BLE001 - cleanup must not hide stage errors.
                 pass
-        for attribute in ("_model", "_reader", "_processor"):
+        for attribute in ("_model", "_reader", "_processor", "_pipeline"):
             if not hasattr(owner, attribute):
                 continue
             value = getattr(owner, attribute, None)
@@ -846,6 +963,12 @@ def _phase3_release_model_memory(*owners: object) -> None:
             torch.cuda.empty_cache()
     except ImportError:  # pragma: no cover - SigLIP already requires torch in production.
         pass
+    paddle = sys.modules.get("paddle")
+    if paddle is not None:
+        try:
+            paddle.device.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - CPU builds and old Paddle releases may differ.
+            pass
 
 
 def _sha256_file(path: Path) -> str:
@@ -1812,7 +1935,7 @@ def _phase3_generate_features(
                 start=1,
             ):
                 print(f"[caption {number}/{len(caption_pending)}] {video.filename}")
-                run_caption_file(
+                caption_report = run_caption_file(
                     paths.candidate_metadata,
                     output_path=paths.captions,
                     report_path=paths.caption_report,
@@ -1827,6 +1950,13 @@ def _phase3_generate_features(
                     dtype=args.caption_dtype,
                     quantization=args.caption_quantization,
                     model_cache_dir=args.model_cache_root / "caption",
+                )
+                _phase3_require_modality_progress(
+                    pipeline="caption",
+                    video=video,
+                    report=caption_report,
+                    report_path=paths.caption_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(caption_backend)
@@ -1876,7 +2006,7 @@ def _phase3_generate_features(
         try:
             for number, (video, paths, _contract) in enumerate(ocr_pending, start=1):
                 print(f"[ocr {number}/{len(ocr_pending)}] {video.filename}")
-                run_ocr_file(
+                ocr_report = run_ocr_file(
                     paths.candidate_metadata,
                     output_path=paths.ocr,
                     report_path=paths.ocr_report,
@@ -1889,6 +2019,13 @@ def _phase3_generate_features(
                     recognition_model=args.ocr_recognition_model,
                     revision=args.ocr_model_revision,
                     model_cache_dir=args.model_cache_root / "ocr",
+                )
+                _phase3_require_hard_feature_success(
+                    pipeline="OCR",
+                    video=video,
+                    report=ocr_report,
+                    report_path=paths.ocr_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(ocr_backend)
@@ -1942,7 +2079,7 @@ def _phase3_generate_features(
         try:
             for number, (video, paths, _contract) in enumerate(object_pending, start=1):
                 print(f"[objects {number}/{len(object_pending)}] {video.filename}")
-                run_object_file(
+                object_report = run_object_file(
                     paths.candidate_metadata,
                     output_path=paths.objects,
                     report_path=paths.object_report,
@@ -1957,6 +2094,13 @@ def _phase3_generate_features(
                     model_cache_dir=object_cache,
                     vocabulary=args.object_vocabulary,
                     prompt_mode=args.object_prompt_mode,
+                )
+                _phase3_require_hard_feature_success(
+                    pipeline="object detection",
+                    video=video,
+                    report=object_report,
+                    report_path=paths.object_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(object_backend)
@@ -3514,6 +3658,7 @@ def promote_run_command(args: argparse.Namespace) -> None:
     print(json.dumps(active, ensure_ascii=False, indent=2))
 
 
+<<<<<<< HEAD
 def _advanced_as_retrieval_result(item: AdvancedRankedFrame) -> RetrievalResult:
     """Project one advanced candidate onto the shared BGE reranker contract."""
 
@@ -3605,6 +3750,46 @@ def _rerank_advanced_with_bge(
         if key not in promoted_keys:
             promoted.append(item)
     return promoted, report.to_dict()
+=======
+def precompute_tkis_query_plans(
+    questions: Sequence[Question],
+    *,
+    profile: str,
+    expansion_config,
+    device: str,
+    cache_dir: Path,
+    model_cache_dir: Path,
+    local_files_only: bool,
+    provider_factory: Callable[..., object] | None = None,
+) -> dict[str, QueryPlan]:
+    """Expand TKIS queries once before SigLIP allocation; VKIS never calls it."""
+    tkis_questions = [question for question in questions if question.task == "TKIS"]
+    if not tkis_questions:
+        return {}
+    factory = provider_factory or build_production_query_expansion_provider
+    provider = None
+    if expansion_config.enabled:
+        provider = factory(
+            config=expansion_config,
+            device=device,
+            cache_dir=cache_dir,
+            model_cache_dir=model_cache_dir,
+            local_files_only=local_files_only,
+        )
+    try:
+        return {
+            question.query_id: build_query_plan(
+                question.text,
+                profile=profile,
+                expansion_provider=provider,
+                expansion_config=expansion_config,
+            )
+            for question in tkis_questions
+        }
+    finally:
+        if provider is not None:
+            provider.close()
+>>>>>>> origin/main
 
 
 def predict_command(args: argparse.Namespace) -> None:
@@ -3637,6 +3822,7 @@ def predict_command(args: argparse.Namespace) -> None:
     columns = submission_columns(public_root)
     paths = competition_index_paths(output_root)
     runtime = load_retrieval_runtime_config(args.retrieval_config)
+    resolved_device = choose_device(args.device)
 
     _require_current_index_lineage(
         corpus=corpus,
@@ -3649,8 +3835,27 @@ def predict_command(args: argparse.Namespace) -> None:
         public_root=public_root,
         output_root=output_root,
     )
+    query_plans: dict[str, QueryPlan] = {}
+    if advanced_mode:
+        expansion_config = replace(
+            runtime.query_expansion,
+            enabled=(
+                runtime.query_expansion.enabled
+                and not args.no_query_expansion
+                and not args.no_query_plan
+            ),
+        )
+        query_plans = precompute_tkis_query_plans(
+            questions,
+            profile=args.retrieval_profile,
+            expansion_config=expansion_config,
+            device=resolved_device,
+            cache_dir=args.query_expansion_cache_dir,
+            model_cache_dir=args.query_expansion_model_cache_dir,
+            local_files_only=args.offline_model_cache,
+        )
+        gc.collect()
     contract = load_encoder_contract(paths["manifest"])
-    resolved_device = choose_device(args.device)
     model, processor = load_siglip2_model_processor(
         model_name=contract.model_name,
         model_revision=contract.model_revision,
@@ -3742,6 +3947,7 @@ def predict_command(args: argparse.Namespace) -> None:
             dense_rescue_enabled=not args.no_dense_rescue,
             cses_enabled=not args.no_cses,
             deterministic_rerank_enabled=not args.no_deterministic_rerank,
+            query_expansion=expansion_config,
         )
 
     bge_dense_engine: BgeM3DenseSearchEngine | None = None
@@ -3794,6 +4000,7 @@ def predict_command(args: argparse.Namespace) -> None:
         if advanced_mode:
             assert dense_index is not None and advanced_config is not None
             if question.task == "TKIS":
+<<<<<<< HEAD
                 try:
                     response = advanced_text_search(
                         question.text,
@@ -3820,6 +4027,17 @@ def predict_command(args: argparse.Namespace) -> None:
                         profile=args.retrieval_profile,
                         config=advanced_config,
                     )
+=======
+                response = advanced_text_search(
+                    question.text,
+                    hybrid_engine=hybrid_engine,
+                    text_encoder=text_encoder,
+                    dense_index=dense_index,
+                    profile=args.retrieval_profile,
+                    config=advanced_config,
+                    plan=query_plans[question.query_id],
+                )
+>>>>>>> origin/main
             else:
                 vector = vkis_vectors.get(question.query_id)
                 if vector is None:
@@ -4572,6 +4790,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Refuse network access and load the resolved SigLIP2 revision from cache.",
     )
+    predict_parser.add_argument(
+        "--query-expansion-cache-dir",
+        type=Path,
+        default=Path("data/model_cache/query_expansion"),
+        help="Cache for the production TKIS paraphrase provider.",
+    )
+    predict_parser.add_argument(
+        "--query-expansion-model-cache-dir",
+        type=Path,
+        default=Path("data/model_cache/caption"),
+        help="Hugging Face cache shared with the Qwen caption stage.",
+    )
     predict_parser.add_argument("--search-depth", type=int, default=200)
     predict_parser.add_argument(
         "--tkis-routing",
@@ -4693,6 +4923,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("data/model_cache/bge_m3"),
     )
     predict_parser.add_argument("--no-query-plan", action="store_true")
+    predict_parser.add_argument(
+        "--no-query-expansion",
+        action="store_true",
+        help="Explicit TKIS ablation: use the original query only.",
+    )
     predict_parser.add_argument("--no-rrf", action="store_true")
     predict_parser.add_argument("--no-dense-rescue", action="store_true")
     predict_parser.add_argument("--no-cses", action="store_true")
