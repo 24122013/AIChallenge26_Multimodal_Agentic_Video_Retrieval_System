@@ -55,6 +55,7 @@ STAGES = (
     "neighbors",
     "segments",
     "text-index",
+    "bge-text-index",
     "dense-index",
     "predict",
     "validate-submission",
@@ -77,6 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--batch-size", type=_batch_size, default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--caption-batch-size", type=int, default=2)
+    parser.add_argument(
+        "--caption-quantization",
+        choices=("none", "8bit", "4bit"),
+        default="none",
+    )
+    parser.add_argument("--ocr-batch-size", type=int, default=4)
+    parser.add_argument("--object-batch-size", type=int, default=8)
     parser.add_argument("--candidate-interval-sec", type=float, default=0.5)
     parser.add_argument("--max-gap-seconds", type=float, default=2.0)
     parser.add_argument("--target-density-per-second", type=float, default=0.5)
@@ -129,6 +138,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vlm-model-revision", default="main")
     parser.add_argument("--vlm-top-m", type=int, default=20)
     parser.add_argument("--vlm-timeout-seconds", type=float, default=120.0)
+    parser.add_argument(
+        "--bge-dense-mode",
+        choices=("off", "optional", "required"),
+        default="required",
+    )
+    parser.add_argument(
+        "--bge-reranker-mode",
+        choices=("off", "optional", "required"),
+        default="required",
+    )
+    parser.add_argument("--bge-m3-model-name", default="BAAI/bge-m3")
+    parser.add_argument("--bge-m3-model-revision", default="main")
+    parser.add_argument(
+        "--bge-reranker-model-name",
+        default="BAAI/bge-reranker-v2-m3",
+    )
+    parser.add_argument("--bge-reranker-model-revision", default="main")
+    parser.add_argument("--bge-reranker-alpha", type=float, default=0.5)
+    parser.add_argument("--bge-batch-size", type=int, default=16)
     parser.add_argument("--start-at", choices=STAGES, default=STAGES[0])
     parser.add_argument("--stop-after", choices=STAGES, default=STAGES[-1])
     parser.add_argument("--fresh", action="store_true")
@@ -184,6 +212,14 @@ def build_stage_commands(
         str(args.batch_size),
         "--num-workers",
         str(args.num_workers),
+        "--caption-batch-size",
+        str(args.caption_batch_size),
+        "--caption-quantization",
+        args.caption_quantization,
+        "--ocr-batch-size",
+        str(args.ocr_batch_size),
+        "--object-batch-size",
+        str(args.object_batch_size),
         "--candidate-interval-sec",
         str(args.candidate_interval_sec),
         "--max-gap-seconds",
@@ -280,6 +316,26 @@ def build_stage_commands(
         str(args.vlm_top_m),
         "--vlm-timeout-seconds",
         str(args.vlm_timeout_seconds),
+        "--bge-dense-mode",
+        args.bge_dense_mode,
+        "--bge-text-index-root",
+        str(run_root / "indexes" / "bge_m3"),
+        "--bge-m3-model-name",
+        args.bge_m3_model_name,
+        "--bge-m3-model-revision",
+        args.bge_m3_model_revision,
+        "--bge-reranker-mode",
+        args.bge_reranker_mode,
+        "--bge-reranker-model-name",
+        args.bge_reranker_model_name,
+        "--bge-reranker-model-revision",
+        args.bge_reranker_model_revision,
+        "--bge-reranker-alpha",
+        str(args.bge_reranker_alpha),
+        "--bge-batch-size",
+        str(args.bge_batch_size),
+        "--bge-model-cache-dir",
+        str(cache_root / "bge_m3"),
     ]
     if args.offline_model_cache:
         predict.append("--offline-model-cache")
@@ -306,6 +362,26 @@ def build_stage_commands(
         ],
         "segments": [*module, "segments", *common, "--strategy", "auto"],
         "text-index": [*module, "text-index", *common],
+        "bge-text-index": [
+            python,
+            "-m",
+            "backend.app.services.indexing.build_bge_m3_index",
+            "--metadata",
+            str(run_root / "metadata"),
+            "--canonical-only",
+            "--output-root",
+            str(run_root / "indexes" / "bge_m3"),
+            "--model-name",
+            args.bge_m3_model_name,
+            "--model-revision",
+            args.bge_m3_model_revision,
+            "--batch-size",
+            str(args.bge_batch_size),
+            "--device",
+            args.device,
+            "--cache-dir",
+            str(cache_root / "bge_m3"),
+        ],
         "dense-index": [
             *module,
             "dense-index",
@@ -357,9 +433,25 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.dense_frames_per_clip,
         args.rrf_k,
         args.vlm_top_m,
+        args.bge_batch_size,
+        args.caption_batch_size,
+        args.ocr_batch_size,
+        args.object_batch_size,
     )
     if any(value < 0 for value in counts):
         raise ValueError("retrieval cardinalities must be non-negative")
+    if any(
+        value < 1
+        for value in (
+            args.bge_batch_size,
+            args.caption_batch_size,
+            args.ocr_batch_size,
+            args.object_batch_size,
+        )
+    ):
+        raise ValueError("model batch sizes must be positive")
+    if not 0.0 <= float(args.bge_reranker_alpha) <= 1.0:
+        raise ValueError("BGE reranker alpha must be within [0, 1]")
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -566,6 +658,25 @@ def run(args: argparse.Namespace) -> Path:
         for position, stage in enumerate(selected, start=1):
             command = commands[stage]
             print(f"\n[{position}/{len(selected)}] {stage}", flush=True)
+            if (
+                stage == "bge-text-index"
+                and args.bge_dense_mode == "off"
+                and not args.dry_run
+            ):
+                print("BGE-M3 dense retrieval disabled; stage recorded as passed/skipped.")
+                stage_durations[stage] = 0.0
+                update_run_manifest(
+                    run_root,
+                    stages={
+                        stage: {
+                            "status": "passed",
+                            "elapsed_seconds": 0.0,
+                            "outcome": "disabled",
+                            "command": command,
+                        }
+                    },
+                )
+                continue
             print(subprocess.list2cmdline(command), flush=True)
             stage_started = time.perf_counter()
             try:
@@ -580,6 +691,26 @@ def run(args: argparse.Namespace) -> Path:
                         _collect_offline_lineage(run_root)
             except BaseException as exc:
                 elapsed = time.perf_counter() - stage_started
+                if (
+                    stage == "bge-text-index"
+                    and args.bge_dense_mode == "optional"
+                    and not args.dry_run
+                ):
+                    stage_durations[stage] = elapsed
+                    update_run_manifest(
+                        run_root,
+                        stages={
+                            stage: {
+                                "status": "passed",
+                                "elapsed_seconds": round(elapsed, 3),
+                                "outcome": "fallback",
+                                "command": command,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        },
+                    )
+                    print(f"Optional BGE-M3 build failed; continuing: {exc}")
+                    continue
                 if not args.dry_run:
                     update_run_manifest(
                         run_root,

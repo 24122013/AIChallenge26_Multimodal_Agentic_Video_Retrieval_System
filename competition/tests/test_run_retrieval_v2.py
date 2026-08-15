@@ -81,6 +81,10 @@ class RetrievalV2RunnerTest(unittest.TestCase):
         )
         self.assertIn("--resume", commands["keyframes"])
         self.assertEqual(
+<<<<<<< HEAD
+            commands["keyframes"][commands["keyframes"].index("--caption-quantization") + 1],
+            "none",
+=======
             commands["keyframes"][
                 commands["keyframes"].index("--caption-model-name") + 1
             ],
@@ -91,6 +95,7 @@ class RetrievalV2RunnerTest(unittest.TestCase):
                 commands["keyframes"].index("--caption-model-revision") + 1
             ],
             "c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97",
+>>>>>>> origin/main
         )
         dense = commands["dense-index"]
         self.assertEqual(
@@ -104,10 +109,26 @@ class RetrievalV2RunnerTest(unittest.TestCase):
             str(self.run_root.resolve()),
         )
         self.assertEqual(predict[predict.index("--vlm-mode") + 1], "off")
+<<<<<<< HEAD
+        self.assertEqual(predict[predict.index("--bge-dense-mode") + 1], "required")
+        self.assertEqual(
+            predict[predict.index("--bge-reranker-mode") + 1],
+            "required",
+        )
+        self.assertIn("--model-revision", commands["bge-text-index"])
+        self.assertIn("--canonical-only", commands["bge-text-index"])
+        self.assertEqual(
+            commands["bge-text-index"][
+                commands["bge-text-index"].index("--metadata") + 1
+            ],
+            str(self.run_root.resolve() / "metadata"),
+        )
+=======
         self.assertEqual(predict[predict.index("--tkis-routing") + 1], "hybrid")
         self.assertEqual(predict[predict.index("--retrieval-profile") + 1], "kis")
         self.assertIn("--query-expansion-cache-dir", predict)
         self.assertNotIn("--no-query-expansion", predict)
+>>>>>>> origin/main
         self.assertTrue(predict[predict.index("--retrieval-config") + 1].endswith("retrieval.yaml"))
 
     def test_query_expansion_ablation_is_forwarded(self) -> None:

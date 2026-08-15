@@ -14,6 +14,30 @@ submission cho HCMC AI Challenge nằm riêng tại
 ## Kiến trúc tổng thể
 
 ```text
+<<<<<<< HEAD
+video -> dense keyframes -> SigLIP2 embeddings -> FAISS
+                         -> Qwen3.5-9B captions
+                         -> PP-OCRv5 vi/en
+                         -> YOLOE open-vocabulary evidence
+                         -> segment metadata -> BM25 text index
+query -> visual/text/temporal retrieval -> hybrid rerank -> evidence
+      -> BGE-M3 dense text -> BGE cross-encoder -> grounded QA (Qwen3.5)
+```
+
+- Visual: SigLIP2, giữ nguyên embedding/index contract hiện có.
+- Caption: `Qwen/Qwen3.5-9B` revision `c202236`, output JSON có cấu trúc và
+  caption fallback.
+- OCR: `PP-OCRv5_server_det` + `latin_PP-OCRv5_mobile_rec`, hỗ trợ tiếng Việt
+  và tiếng Anh.
+- Object evidence: `yoloe-26l-seg.pt`, vocabulary cấu hình được. Kết quả chỉ là
+  bằng chứng mềm; không dùng làm hard filter loại candidate.
+- Text retrieval: caption, OCR và objects.
+- Dense text: `BAAI/bge-m3` (1024 chiều, FAISS IP); BM25 vẫn được giữ để bắt
+  exact keyword/OCR.
+- QA rerank: `BAAI/bge-reranker-v2-m3`; grounded answer dùng
+  `Qwen/Qwen3.5-9B@c202236235762e1c871ad0ccb60c8ee5ba337b9a`, mặc định
+  tắt và chỉ load khi chạy QA.
+=======
 Raw videos
   -> shot/keyframe extraction
   -> SigLIP2 visual embeddings
@@ -53,6 +77,7 @@ data/              raw data và artifact mặc định
 docs/              architecture, schema và API contract
 competition/       pipeline thi đấu tách biệt
 ```
+>>>>>>> origin/main
 
 ## Cài đặt
 
@@ -65,6 +90,31 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+<<<<<<< HEAD
+Lệnh trên cài đầy đủ runtime CPU, bao gồm PaddlePaddle cho PP-OCRv5. Với NVIDIA
+GPU, không cài `requirements.txt`; cài dependency chung trước rồi chọn đúng một
+PaddlePaddle profile theo driver/runtime:
+
+```powershell
+python -m pip install -r requirements-core.txt
+python -m pip install -r requirements-gpu-cu118.txt
+# hoặc
+python -m pip install -r requirements-core.txt
+python -m pip install -r requirements-gpu-cu126.txt
+```
+
+Không cài đồng thời `paddlepaddle` và `paddlepaddle-gpu`. Máy NVIDIA 50-series
+trên Windows có thể cần wheel chuyên biệt theo Python/driver từ hướng dẫn chính
+thức của PaddlePaddle thay vì hai profile trên. PyTorch/CUDA vẫn phải tương thích
+với driver của máy. Quantization caption 4/8-bit cần CUDA và `bitsandbytes`
+tương thích.
+
+Kiểm tra các runtime model sau khi cài:
+
+```powershell
+python -c "import torch, transformers, accelerate, paddle, paddleocr, ultralytics; print({'torch': torch.__version__, 'cuda': torch.cuda.is_available(), 'transformers': transformers.__version__, 'accelerate': accelerate.__version__, 'paddle': paddle.__version__, 'paddle_cuda': paddle.is_compiled_with_cuda(), 'paddleocr': paddleocr.__version__, 'ultralytics': ultralytics.__version__})"
+```
+=======
 PaddlePaddle phải được cài riêng theo môi trường. Repo đã được kiểm thử với
 PaddlePaddle `3.2.2`; không cài đồng thời wheel CPU và GPU. Ví dụ CPU:
 
@@ -77,6 +127,7 @@ Blackwell `sm_120` (RTX 5090/5080/5070) dùng index `cu129` hoặc mới hơn; k
 wheel `cu118`, vì wheel đó không chứa mã cho `sm_120`. Luôn chạy smoke test Torch và
 Paddle trước khi tải model hoặc bắt đầu Phase 3.
 Kiểm tra FFmpeg:
+>>>>>>> origin/main
 
 ```powershell
 ffmpeg -version
@@ -203,6 +254,100 @@ Neighbor index:
 
 Segment metadata kết hợp caption/OCR/objects:
 
+<<<<<<< HEAD
+## Colab end-to-end và contract submission
+
+Notebook low-memory [`notebooks/E2E.ipynb`](notebooks/E2E.ipynb) và notebook
+full precision [`notebooks/E2E_FULL_PRECISION.ipynb`](notebooks/E2E_FULL_PRECISION.ipynb)
+đều chạy đủ 10 stage, build BGE-M3 index, dùng BGE reranker cho TKIS rồi tạo
+`results/submission.csv`. Output public **không đổi**: đúng 100 query trong
+`questions.csv` (50 TKIS + 50 VKIS), mỗi query 100 answer theo đúng thứ tự và
+header của `sample_submission.csv`.
+
+Profile low-memory dành cho T4/L4 và quantize Qwen caption 4-bit; caption có thể
+khác nhẹ. Profile full precision giữ cấu hình cũ nhưng cần GPU tối thiểu khoảng
+24 GB, khuyến nghị A100 40 GB. Dùng `RUN_ID` riêng cho từng profile khi benchmark.
+
+Public dataset hiện không có QA. Vì vậy notebook chạy KIS/AVS/QA smoke riêng
+sau submission và ghi `results/task_smoke.json`; QA không được thêm vào
+`submission.csv`. Trong notebook, hai BGE mode và Qwen QA mode được đặt
+`required`: model lỗi thì cell fail thay vì âm thầm fallback sang pipeline cũ.
+
+## Test riêng KIS, AVS và QA
+
+Trước khi chạy, trỏ service vào artifacts của một `run_root` đã hoàn tất. Ví dụ
+PowerShell (đổi `$runRoot` theo máy):
+
+```powershell
+$runRoot = "E:\runs\new-model-001"
+$env:RETRIEVAL_INDEX_PATH = "$runRoot\indexes\siglip2_so400m_patch16_384_flat_ip.faiss"
+$env:RETRIEVAL_FRAME_MAP_PATH = "$runRoot\metadata\siglip2_so400m_patch16_384_frame_map.json"
+$env:RETRIEVAL_MANIFEST_PATH = "$runRoot\metadata\siglip2_so400m_patch16_384_faiss_manifest.json"
+$env:RETRIEVAL_TEXT_INDEX_PATH = "$runRoot\indexes\retrieval_text_index.json"
+$env:QA_BGE_DENSE_ENABLED = "true"
+$env:QA_BGE_RERANKER_ENABLED = "true"
+$env:QA_BGE_INDEX_ROOT = "$runRoot\indexes\bge_m3"
+$env:QA_BGE_DEVICE = "cuda"
+$env:QA_BGE_MODEL_CACHE_DIR = "data\model_cache\bge_m3"
+$env:QA_ANSWER_MODEL_CACHE_DIR = "data\model_cache\qa_answer"
+```
+
+KIS và AVS dừng ở evidence, không load Qwen:
+
+```powershell
+python -m backend.app.services.retrieval.run_task_smoke --task kis --top-k 5
+python -m backend.app.services.retrieval.run_task_smoke --task avs --top-k 5
+```
+
+QA end-to-end có grounded answer:
+
+```powershell
+$env:QA_ANSWER_MODE = "required"
+$env:QA_ANSWER_DEVICE = "cuda"
+$env:QA_ANSWER_QUANTIZATION = "4bit"
+python -m backend.app.services.retrieval.run_task_smoke `
+  --task qa --top-k 5 `
+  --qa-query "Người phụ nữ áo đỏ đang cầm gì?" `
+  --output "$runRoot\results\qa_smoke.json"
+```
+
+Chạy cả ba task:
+
+```powershell
+python -m backend.app.services.retrieval.run_task_smoke `
+  --task all --top-k 5 `
+  --output "$runRoot\results\task_smoke.json"
+```
+
+`QA_ANSWER_MODE=off|optional|required` chỉ điều khiển answerer. Parser, router,
+evidence bundle, BGE dense và BGE reranker có feature flag riêng. Smoke chỉ xác
+nhận checkpoint/artifact/contract chạy được; muốn so chất lượng phải dùng dev
+labels, và locked test chỉ được mở một lần theo policy trong
+`competition/evaluation/`.
+
+BGE-M3 chỉ index metadata của keyframe semantic/canonical đã được chọn; dense
+candidate frames không thuộc source contract này. Với QA non-temporal, answerer
+nhận tối đa Top-3 evidence. Với temporal, chỉ chain `strict` đầy đủ (tối đa 5
+event) mới được gọi Qwen; `relaxed_gap` và `sparse_compat` chỉ trả chain để audit
+và abstain.
+
+## Schema metadata chính
+
+Caption record chứa `caption`, `structured_caption`, `caption_parse_status` và
+provenance. `structured_caption` có các khóa:
+
+```json
+{
+  "scene": "",
+  "people": [{"type": "", "attributes": []}],
+  "objects": [],
+  "actions": [],
+  "relationships": [],
+  "colors": [],
+  "visible_text": [],
+  "caption": ""
+}
+=======
 ```powershell
 .\.venv\Scripts\python.exe -m backend.app.services.indexing.extract_segments `
   --input data\metadata `
@@ -211,6 +356,7 @@ Segment metadata kết hợp caption/OCR/objects:
   --objects data\metadata `
   --output data\metadata\segments_all.jsonl `
   --strategy auto
+>>>>>>> origin/main
 ```
 
 ### 5. Build visual FAISS index

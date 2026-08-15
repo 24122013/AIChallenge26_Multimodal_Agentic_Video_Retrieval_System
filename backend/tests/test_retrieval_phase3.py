@@ -171,6 +171,16 @@ class Phase3RetrievalTest(unittest.TestCase):
             ["người đàn ông vào bếp", "bắt đầu nấu ăn"],
         )
 
+    def test_temporal_query_does_not_split_spatial_next_to(self) -> None:
+        events = decompose_temporal_query(
+            "What is the woman next to the window doing?"
+        )
+
+        self.assertEqual(
+            [event.text for event in events],
+            ["What is the woman next to the window doing?"],
+        )
+
     def test_match_ordered_events_requires_same_video_and_order(self) -> None:
         first_event = [
             _result("enter", video_id="V001", timestamp=10.0, score=0.8),
@@ -191,6 +201,10 @@ class Phase3RetrievalTest(unittest.TestCase):
             [event.frame_id for event in matches[0].events],
             ["enter", "cook"],
         )
+        self.assertEqual(matches[0].match_mode, "strict")
+        self.assertEqual(matches[0].warnings, ())
+        self.assertTrue(matches[0].chain_id.startswith("TC-"))
+        self.assertEqual(matches[0].to_dict()["chain_id"], matches[0].chain_id)
 
     def test_temporal_matching_prefers_complete_event_semantics(self) -> None:
         first_event = [
@@ -269,6 +283,22 @@ class Phase3RetrievalTest(unittest.TestCase):
             [event.frame_id for event in matches[0].events],
             ["only", "only"],
         )
+        self.assertEqual(matches[0].match_mode, "sparse_compat")
+        self.assertIn("temporal_sparse_compatibility", matches[0].warnings)
+
+    def test_temporal_matching_labels_relaxed_gap_fallback(self) -> None:
+        matches = match_ordered_events(
+            [
+                [_result("enter", timestamp=10.0, score=0.8)],
+                [_result("sit", timestamp=500.0, score=0.7)],
+            ],
+            max_gap_seconds=60.0,
+            event_queries=["person enters", "person sits"],
+        )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].match_mode, "relaxed_gap")
+        self.assertIn("temporal_gap_relaxed", matches[0].warnings)
 
 
 if __name__ == "__main__":

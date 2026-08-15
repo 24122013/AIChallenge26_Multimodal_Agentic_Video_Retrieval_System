@@ -10,17 +10,21 @@ from backend.app.services.retrieval.retrieval_manager import (
     search_hybrid,
     search_object,
     search_ocr,
+    search_qa,
     search_qa_evidence,
     search_temporal,
     search_visual,
 )
+from backend.app.services.retrieval.qa_pipeline import RequiredQaPipelineError
 
 try:  # pragma: no cover - depends on optional API runtime.
     from fastapi import APIRouter, HTTPException
+    from fastapi.responses import JSONResponse
     from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover
     APIRouter = None
     HTTPException = None
+    JSONResponse = None
     BaseModel = object
     Field = None
 
@@ -31,6 +35,12 @@ if APIRouter is not None:
     class VisualSearchBody(BaseModel):
         query: str
         top_k: int = Field(default=20, ge=1, le=200)
+
+    class QaSearchBody(BaseModel):
+        query: str
+        top_k: int = Field(default=5, ge=1, le=5)
+        task_mode: str = "qa"
+        expanded_queries: list[str] = Field(default_factory=list, max_length=20)
 
     @router.post("/visual")
     def visual_search_endpoint(body: VisualSearchBody) -> dict:
@@ -71,6 +81,17 @@ if APIRouter is not None:
             lambda: search_qa_evidence(body.query, body.top_k)
         )
 
+    @router.post("/qa")
+    def qa_search_endpoint(body: QaSearchBody) -> dict:
+        return _response(
+            lambda: search_qa(
+                body.query,
+                body.top_k,
+                task_mode=body.task_mode,
+                expanded_queries=body.expanded_queries,
+            )
+        )
+
     def _response(callable_) -> dict:
         try:
             return {
@@ -78,6 +99,15 @@ if APIRouter is not None:
                 "data": callable_(),
                 "message": None,
             }
+        except RequiredQaPipelineError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "data": exc.response,
+                    "message": str(exc),
+                },
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
@@ -118,3 +148,18 @@ def temporal_search(query: str, top_k: int = 20) -> list[dict]:
 
 def qa_evidence_search(question: str, top_k: int = 10) -> dict:
     return search_qa_evidence(question=question, top_k=top_k)
+
+
+def qa_search(
+    query: str,
+    top_k: int = 5,
+    *,
+    task_mode: str = "qa",
+    expanded_queries: list[str] | None = None,
+) -> dict:
+    return search_qa(
+        query=query,
+        top_k=top_k,
+        task_mode=task_mode,
+        expanded_queries=expanded_queries or [],
+    )

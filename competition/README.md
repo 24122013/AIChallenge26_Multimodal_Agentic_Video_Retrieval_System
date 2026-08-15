@@ -6,16 +6,65 @@ process riêng để giải phóng model/GPU và lưu checkpoint bền vững.
 
 ## 1. Phạm vi
 
+<<<<<<< HEAD
+| Modality | Mặc định | Artifact |
+|---|---|---|
+| Visual | SigLIP2 hiện có | `siglip2.npy`, embedding metadata |
+| Caption | `Qwen/Qwen3.5-9B` @ `c202236` | `captions.jsonl` |
+| OCR | `PP-OCRv5_server_det` + `latin_PP-OCRv5_mobile_rec` | `ocr.jsonl` |
+| Objects | `yoloe-26l-seg.pt` | `objects.jsonl` |
+| Dense text | `BAAI/bge-m3` | `bge_m3_flat_ip.faiss` + map + manifest |
+| Text rerank | `BAAI/bge-reranker-v2-m3` | query trace/report |
+=======
 - TKIS: text-to-video KIS, query expansion bật mặc định.
 - VKIS: image-to-video KIS, không tạo paraphrase.
 - Temporal/TRAKE: chưa thực hiện trong chiến thuật này.
 - Audio: không được đọc hoặc xử lý.
+>>>>>>> origin/main
 
 Pipeline offline tạo keyframe, visual embedding, caption, OCR và object evidence. Pipeline
 online tạo query plan, truy hồi coarse+dense, rerank và ghi submission.
 
 ## 2. Input contract
 
+<<<<<<< HEAD
+Runner v2 dưới đây giữ output submission cũ nhưng thêm stage BGE text index và
+BGE rerank. Competition profile mặc định bắt buộc cả hai BGE mode ở
+`required`; chỉ hạ xuống `off`/`optional` khi chủ động chạy local/dev:
+
+```powershell
+.\.venv\Scripts\python.exe -m competition.run_retrieval_v2 `
+  --public-root data\public `
+  --run-root competition\artifacts\new-model-run `
+  --device cuda `
+  --bge-dense-mode required `
+  --bge-reranker-mode required `
+  --bge-m3-model-revision main `
+  --bge-reranker-model-revision main
+```
+
+Runner có 10 stage:
+
+```text
+validate-input -> keyframes -> index -> neighbors -> segments -> text-index
+-> bge-text-index -> dense-index -> predict -> validate-submission
+```
+
+`bge-text-index` chỉ đọc metadata đã có, không extract video lại, và chỉ nhận
+keyframe semantic/canonical đã được chọn. Dense candidate frames bị loại khỏi
+source contract. BGE-M3 và reranker chỉ áp dụng cho TKIS trong submission; VKIS
+vẫn đi qua visual query.
+Kết quả vẫn là 100 query x 100 answer. Với benchmark chính thức, thay revision
+`main` bằng commit hash đã khóa.
+
+Runner cũ vẫn khả dụng nếu chỉ cần pipeline metadata/offline:
+
+```powershell
+.\.venv\Scripts\python.exe -m competition.run_end_to_end `
+  --public-root data\public `
+  --output-root competition\artifacts `
+  --device cuda
+=======
 Thư mục `data\public` phải có:
 
 ```text
@@ -25,6 +74,7 @@ data/public/
   sample_submission.csv
   <video files referenced by corpus.csv>
   <query images referenced by questions.csv>
+>>>>>>> origin/main
 ```
 
 Contract được kiểm tra fail-closed:
@@ -272,7 +322,100 @@ Runner ở mục 4 nên được ưu tiên. Khi debug, dùng các command mà ru
 Để tránh bỏ sót flag/lineage ở `predict`, dùng `--dry-run` của runner rồi sao chép command
 được in ra thay vì tự dựng một command cũ.
 
+<<<<<<< HEAD
+Các tùy chọn quan trọng của `keyframes` và `enrich`:
+
+```text
+--caption-model-name Qwen/Qwen3.5-9B
+--caption-model-revision c202236
+--caption-batch-size 2
+--caption-max-new-tokens 384
+--caption-dtype auto|bfloat16|float16|float32
+--caption-quantization none|8bit|4bit
+
+--ocr-detection-model PP-OCRv5_server_det
+--ocr-recognition-model latin_PP-OCRv5_mobile_rec
+--ocr-model-revision PP-OCRv5
+--ocr-batch-size 4
+--ocr-conf-threshold 0.3
+
+--object-model-name yoloe-26l-seg.pt
+--object-model-revision ultralytics-official
+--object-prompt-mode text|internal
+--object-vocabulary <class ...>
+--object-batch-size 8
+--object-conf-threshold 0.25
+--object-iou-threshold 0.7
+```
+
+Ví dụ chỉ tạo lại metadata hiện hành:
+
+```powershell
+.\.venv\Scripts\python.exe -m competition.pipeline enrich `
+  --public-root data\public `
+  --output-root competition\artifacts `
+  --modalities caption ocr objects `
+  --device cuda --overwrite
+```
+
+## Resume và provenance
+
+- Model chỉ load khi modality thực sự có work pending.
+- Một backend được tái sử dụng cho toàn corpus và được giải phóng trước modality
+  kế tiếp.
+- Checkpoint chỉ hợp lệ khi identity/order, report, model/revision, config và
+  hash artifact khớp.
+- Artifact lỗi không được xem là hoàn tất đối với OCR/objects, trừ khi operator
+  chủ động bật `--allow-partial-features`.
+- Thay model/revision chỉ làm stale artifact tương ứng; pipeline không xóa các
+  file dữ liệu ngoài workspace hiện hành.
+
+## Retrieval
+
+Text index v3 chỉ gồm `caption`, `ocr`, `objects`. Hybrid retrieval kết hợp các
+modality này với visual SigLIP2; temporal retrieval vẫn giữ cùng kiến trúc
+same-video ordered matching.
+
+Query parser/router/evidence và grounded QA là online task path riêng. Có thể
+kiểm tra từng task bằng:
+
+```powershell
+python -m backend.app.services.retrieval.run_task_smoke --task kis
+python -m backend.app.services.retrieval.run_task_smoke --task avs
+$env:QA_ANSWER_MODE = "required"
+$env:QA_BGE_DENSE_ENABLED = "true"
+$env:QA_BGE_RERANKER_ENABLED = "true"
+python -m backend.app.services.retrieval.run_task_smoke --task qa
+```
+
+Các lệnh này cần `RETRIEVAL_*` và `QA_BGE_*` trỏ tới artifacts của run; xem
+biến môi trường đầy đủ ở README gốc. KIS/AVS không gọi Qwen answerer. QA
+non-temporal dùng tối đa Top-3 evidence. QA temporal chạy retrieval theo từng
+event, giữ toàn bộ strict chain tối đa 5 evidence; chain `relaxed_gap` hoặc
+`sparse_compat` chỉ phục vụ audit và trả `insufficient_evidence` mà không gọi
+Qwen. Không có ASR; external whole-query expansion bị bỏ qua ở temporal route
+và được ghi trong trace.
+
+Object labels là prompt-dependent evidence. Khi đổi vocabulary phải rebuild
+object artifacts, segment metadata và text index để lineage nhất quán.
+
+## Tài nguyên GPU
+
+Checkpoint Qwen 9B ở BF16 cần khoảng 19 GB chỉ cho weights; tổng runtime thường
+cần khoảng 22–28 GB tùy ảnh/output/batch. Khuyến nghị ban đầu:
+
+- RTX 5090 32 GB: caption batch 1–2 BF16.
+- A100 40 GB: caption batch 2–4 BF16.
+- A100 80 GB: caption batch 4–8 BF16 sau profiling.
+
+Nếu OOM, giảm caption batch trước; sau đó cân nhắc 4-bit. Quantization có thể làm
+thay đổi chất lượng output và cần được đánh giá retrieval riêng. OCR/YOLOE có
+batch độc lập và chạy sau khi Qwen đã được giải phóng.
+
+## Kiểm thử
+=======
 ## 9. Kiểm thử
+>>>>>>> origin/main
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s backend\tests -v
