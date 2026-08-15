@@ -1,5 +1,8 @@
 # Competition Experiments
 
+> **Historical log:** một số run cũ bên dưới có trường ASR. Kiến trúc/runtime
+> hiện tại đã loại ASR; các dòng đó chỉ được giữ để bảo toàn bằng chứng thí nghiệm.
+
 Lịch sử benchmark append-only cho pipeline TKIS/VKIS. Scoreboard chỉ được ghi
 khi có số liệu được cung cấp rõ ràng; metric local được thu từ artifact và không
 được xem là ground-truth retrieval quality.

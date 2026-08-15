@@ -41,6 +41,27 @@ def _artifact_map(paths: Mapping[str, Path]) -> dict[str, dict[str, object]]:
     }
 
 
+def _portable_identity(value: Any) -> Any:
+    """Drop only location fields from checksum-bound artifact entries.
+
+    Phase-4 manifests created before portable paths were introduced contain
+    absolute host paths.  Size and SHA-256 are the artifact identity; the path
+    is only its location and legitimately changes when a complete run is moved
+    between Linux and Windows.
+    """
+
+    if isinstance(value, Mapping):
+        checksum_bound = "sha256" in value
+        return {
+            key: _portable_identity(item)
+            for key, item in value.items()
+            if not (checksum_bound and key == "path")
+        }
+    if isinstance(value, list):
+        return [_portable_identity(item) for item in value]
+    return value
+
+
 def build_stage_manifest(
     *,
     stage: str,
@@ -127,10 +148,12 @@ def validate_stage_manifest(
         raise RuntimeError(f"{stage} lineage manifest is outdated; rerun {stage}")
 
     canonical = [dict(source) for source in canonical_sources]
-    if (
-        manifest.get("canonical_sources_sha256") != sha256_json(canonical)
-        or manifest.get("canonical_sources") != canonical
-    ):
+    stored_canonical = manifest.get("canonical_sources")
+    if not isinstance(stored_canonical, list):
+        raise RuntimeError(f"{stage} lineage manifest has invalid canonical sources")
+    if manifest.get("canonical_sources_sha256") != sha256_json(stored_canonical):
+        raise RuntimeError(f"{stage} lineage manifest canonical checksum is invalid")
+    if _portable_identity(stored_canonical) != _portable_identity(canonical):
         raise RuntimeError(
             f"{stage} artifacts are stale for current canonical keyframes; rerun {stage}"
         )
@@ -139,9 +162,9 @@ def validate_stage_manifest(
         current_outputs = _artifact_map(output_paths)
     except (FileNotFoundError, OSError) as exc:
         raise RuntimeError(f"{stage} artifacts are missing; rerun {stage}") from exc
-    if manifest.get("inputs") != current_inputs:
+    if _portable_identity(manifest.get("inputs")) != _portable_identity(current_inputs):
         raise RuntimeError(f"{stage} inputs changed; rerun {stage}")
-    if manifest.get("outputs") != current_outputs:
+    if _portable_identity(manifest.get("outputs")) != _portable_identity(current_outputs):
         raise RuntimeError(f"{stage} outputs changed; rerun {stage}")
     return manifest
 

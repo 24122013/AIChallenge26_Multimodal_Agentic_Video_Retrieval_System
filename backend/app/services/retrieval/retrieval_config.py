@@ -225,9 +225,15 @@ def load_retrieval_runtime_config(
             expansion_raw.get("max_new_tokens"),
             QueryExpansionConfig.max_new_tokens,
         ),
-        dtype=str(expansion_raw.get("dtype") or QueryExpansionConfig.dtype),
+        dtype=str(
+            os.getenv("RETRIEVAL_QUERY_EXPANSION_DTYPE")
+            or expansion_raw.get("dtype")
+            or QueryExpansionConfig.dtype
+        ),
         quantization=str(
-            expansion_raw.get("quantization") or QueryExpansionConfig.quantization
+            os.getenv("RETRIEVAL_QUERY_EXPANSION_QUANTIZATION")
+            or expansion_raw.get("quantization")
+            or QueryExpansionConfig.quantization
         ),
     )
     return RetrievalRuntimeConfig(

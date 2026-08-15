@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from backend.app.models.retrieval import VisualSearchResponse
+from backend.app.services.agent.query_expansion import (
+    QueryExpansionProvider,
+    build_production_query_expansion_provider,
+)
 from backend.app.services.retrieval.hybrid_search import HybridSearchEngine
+from backend.app.services.retrieval.planned_hybrid import planned_hybrid_search
+from backend.app.services.retrieval.query_plan import build_query_plan
 from backend.app.services.retrieval.qa_evidence import (
     BgeCandidateReranker,
     QaEvidenceSearchEngine,
@@ -33,6 +39,9 @@ from backend.app.services.retrieval.search_visual import (
     VisualSearchEngine,
 )
 from backend.app.services.retrieval.temporal_search import TemporalMatch
+
+
+_query_expansion_provider_instance: QueryExpansionProvider | None = None
 
 
 def _path_from_env(name: str, default: Path) -> Path:
@@ -138,6 +147,33 @@ def load_visual_search_config() -> VisualSearchConfig:
 @lru_cache(maxsize=1)
 def get_runtime_config() -> RetrievalRuntimeConfig:
     return load_retrieval_runtime_config()
+
+
+@lru_cache(maxsize=1)
+def get_query_expansion_provider() -> QueryExpansionProvider | None:
+    """Return one lazy production provider for the current runtime config."""
+    global _query_expansion_provider_instance
+    config = get_runtime_config().query_expansion
+    if not config.enabled:
+        return None
+    provider = build_production_query_expansion_provider(
+        config=config,
+        device=os.getenv("QUERY_EXPANSION_DEVICE", "cpu"),
+        cache_dir=_path_from_env(
+            "QUERY_EXPANSION_CACHE_DIR",
+            Path("data/cache/query_expansion"),
+        ),
+        model_cache_dir=_path_from_env(
+            "QUERY_EXPANSION_MODEL_CACHE_DIR",
+            Path("data/model_cache/query_expansion"),
+        ),
+        local_files_only=_bool_from_env(
+            "QUERY_EXPANSION_LOCAL_FILES_ONLY",
+            False,
+        ),
+    )
+    _query_expansion_provider_instance = provider
+    return provider
 
 
 @lru_cache(maxsize=1)
@@ -347,6 +383,10 @@ def get_qa_runtime_lineage() -> dict[str, Any]:
 
 def clear_retrieval_caches() -> None:
     """Clear cached engines after changing environment paths in tests or tools."""
+    global _query_expansion_provider_instance
+    if _query_expansion_provider_instance is not None:
+        _query_expansion_provider_instance.close()
+        _query_expansion_provider_instance = None
     for cached in (
         get_qa_search_pipeline,
         get_qa_evidence_search_engine,
@@ -355,6 +395,7 @@ def clear_retrieval_caches() -> None:
         get_ocr_search_engine,
         get_caption_search_engine,
         get_visual_search_engine,
+        get_query_expansion_provider,
         get_runtime_config,
     ):
         cached.cache_clear()
@@ -392,7 +433,26 @@ def search_hybrid(
     query: str,
     top_k: int | None = None,
 ) -> VisualSearchResponse:
-    return get_hybrid_search_engine().search(query=query, top_k=top_k)
+    runtime = get_runtime_config()
+    provider = (
+        get_query_expansion_provider()
+        if runtime.query_expansion.enabled
+        else None
+    )
+    plan = build_query_plan(
+        query,
+        profile="auto",
+        expansion_provider=provider,
+        expansion_config=runtime.query_expansion,
+    )
+    return planned_hybrid_search(
+        get_hybrid_search_engine(),
+        plan,
+        top_k=top_k,
+        max_expansion_contribution=(
+            runtime.query_expansion.max_expansion_contribution
+        ),
+    )
 
 
 def search_temporal(

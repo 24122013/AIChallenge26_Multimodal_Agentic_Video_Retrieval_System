@@ -9,7 +9,7 @@ lý âm thanh.
 | Modality | Mặc định | Artifact |
 |---|---|---|
 | Visual | SigLIP2 hiện có | `siglip2.npy`, embedding metadata |
-| Caption | `Qwen/Qwen3.5-9B` @ `c202236` | `captions.jsonl` |
+| Caption | `Qwen/Qwen3.5-4B` @ `c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97` | `captions.jsonl` |
 | OCR | `PP-OCRv5_server_det` + `latin_PP-OCRv5_mobile_rec` | `ocr.jsonl` |
 | Objects | `yoloe-26l-seg.pt` | `objects.jsonl` |
 | Dense text | `BAAI/bge-m3` | `bge_m3_flat_ip.faiss` + map + manifest |
@@ -81,15 +81,49 @@ Hoặc chạy từng stage:
 
 .\.venv\Scripts\python.exe -m competition.pipeline text-index `
   --public-root data\public --output-root competition\artifacts
+
+.\.venv\Scripts\python.exe -m competition.pipeline predict `
+  --public-root data\public `
+  --output-root competition\artifacts `
+  --submission-path competition\artifacts\results\submission.csv `
+  --device cuda
 ```
+
+### Chạy `predict` từ run đã chuyển giữa Linux và Windows
+
+Không cần chạy lại các stage offline khi đã sao chép nguyên vẹn run directory.
+Ví dụ với `competition/runs/retrieval-v2-5090`:
+
+```powershell
+$runRoot = "competition\runs\retrieval-v2-5090"
+
+.\.venv\Scripts\python.exe -m competition.pipeline predict `
+  --public-root data\public `
+  --output-root $runRoot `
+  --retrieval-mode advanced `
+  --run-root $runRoot `
+  --dense-run-root $runRoot `
+  --submission-path "$runRoot\results\submission.csv" `
+  --device cuda `
+  --offline-model-cache `
+  --vlm-mode off `
+  --bge-dense-mode off `
+  --bge-reranker-mode off
+```
+
+Predict tự ánh xạ các đường dẫn tuyệt đối cũ trong metadata/manifest về
+`$runRoot` và `data\public` hiện tại. Việc ánh xạ chỉ được bật khi SHA-256 của
+toàn bộ public dataset khớp `run_manifest.json`; checksum và kích thước của từng
+artifact vẫn phải khớp. Vì vậy chuyển ổ đĩa hoặc chuyển Linux/Windows không làm
+mất lineage, nhưng dữ liệu thực sự khác vẫn bị từ chối.
 
 ## Tùy chỉnh metadata model
 
 Các tùy chọn quan trọng của `keyframes` và `enrich`:
 
 ```text
---caption-model-name Qwen/Qwen3.5-9B
---caption-model-revision c202236
+--caption-model-name Qwen/Qwen3.5-4B
+--caption-model-revision c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97
 --caption-batch-size 2
 --caption-max-new-tokens 384
 --caption-dtype auto|bfloat16|float16|float32
@@ -138,20 +172,47 @@ Text index v3 chỉ gồm `caption`, `ocr`, `objects`. Hybrid retrieval kết h�
 modality này với visual SigLIP2; temporal retrieval vẫn giữ cùng kiến trúc
 same-video ordered matching.
 
-Query parser/router/evidence và grounded QA là online task path riêng. Có thể
-kiểm tra từng task bằng:
+Query parser/router/evidence và grounded QA là online task path riêng.
+`run_task_smoke` là CLI không tương tác: nếu không truyền `--kis-query`,
+`--avs-query` hoặc `--qa-query`, nó dùng query mẫu khai báo sẵn trong
+`run_task_smoke.py`.
+
+Đây là strict smoke. KIS, AVS và QA đều phải chứng minh BGE-M3 dense retrieval và
+BGE cross-encoder đã chạy thật, nên đặt các biến sau trước mọi lệnh smoke:
 
 ```powershell
-python -m backend.app.services.retrieval.run_task_smoke --task kis
-python -m backend.app.services.retrieval.run_task_smoke --task avs
-$env:QA_ANSWER_MODE = "required"
 $env:QA_BGE_DENSE_ENABLED = "true"
 $env:QA_BGE_RERANKER_ENABLED = "true"
-python -m backend.app.services.retrieval.run_task_smoke --task qa
+$env:QA_BGE_INDEX_ROOT = "data/indexes/bge_m3"
+$env:QA_BGE_DEVICE = "cuda"
 ```
 
-Các lệnh này cần `RETRIEVAL_*` và `QA_BGE_*` trỏ tới artifacts của run; xem
-biến môi trường đầy đủ ở README gốc. KIS/AVS không gọi Qwen answerer. QA
+Thư mục `QA_BGE_INDEX_ROOT` phải chứa index, frame map và manifest được build với
+canonical-only source contract. Các lệnh cần `RETRIEVAL_*` và `QA_BGE_*` trỏ tới
+artifacts của đúng run; xem biến môi trường đầy đủ ở README gốc.
+
+Ví dụ dùng query tự chọn:
+
+```powershell
+python -m backend.app.services.retrieval.run_task_smoke `
+  --task kis `
+  --kis-query "một người đàn ông mặc áo xanh đang cầm điện thoại" `
+  --top-k 20
+
+python -m backend.app.services.retrieval.run_task_smoke `
+  --task avs `
+  --avs-query "tất cả cảnh có xe máy đi qua đường" `
+  --top-k 20
+
+$env:QA_ANSWER_MODE = "required"
+python -m backend.app.services.retrieval.run_task_smoke `
+  --task qa `
+  --qa-query "Người phụ nữ đang cầm vật gì?" `
+  --top-k 5
+```
+
+Nếu bỏ tham số query, CLI dùng query mặc định thay vì hỏi input trong terminal.
+KIS/AVS không gọi Qwen answerer. QA
 non-temporal dùng tối đa Top-3 evidence. QA temporal chạy retrieval theo từng
 event, giữ toàn bộ strict chain tối đa 5 evidence; chain `relaxed_gap` hoặc
 `sparse_compat` chỉ phục vụ audit và trả `insufficient_evidence` mà không gọi
@@ -163,8 +224,8 @@ object artifacts, segment metadata và text index để lineage nhất quán.
 
 ## Tài nguyên GPU
 
-Checkpoint Qwen 9B ở BF16 cần khoảng 19 GB chỉ cho weights; tổng runtime thường
-cần khoảng 22–28 GB tùy ảnh/output/batch. Khuyến nghị ban đầu:
+Caption checkpoint Qwen 4B ở BF16 cần khoảng 8 GB chỉ cho weights; peak runtime
+còn phụ thuộc ảnh/output/batch và phải được profile trên máy đích. Khuyến nghị ban đầu:
 
 - RTX 5090 32 GB: caption batch 1–2 BF16.
 - A100 40 GB: caption batch 2–4 BF16.

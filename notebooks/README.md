@@ -45,8 +45,8 @@ model mới không thể âm thầm biến thành baseline cũ.
 4. Chạy tuần tự toàn bộ cell.
 5. Lần đầu cần mạng và đủ dung lượng Drive cho video artifacts/checkpoint.
 
-Hai notebook cài `requirements-core.txt` cộng đúng một GPU profile; không cài
-`requirements.txt` CPU. Sau install, cell preflight bắt buộc cả Torch và Paddle
+Hai notebook giữ PyTorch CUDA của Colab, cài `requirements.txt` và đúng một
+PaddlePaddle GPU wheel. Sau install, cell preflight bắt buộc cả Torch và Paddle
 nhìn thấy CUDA.
 
 ## Resume

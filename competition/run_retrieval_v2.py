@@ -78,12 +78,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--batch-size", type=_batch_size, default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--caption-batch-size", type=int, default=2)
-    parser.add_argument(
-        "--caption-quantization",
-        choices=("none", "8bit", "4bit"),
-        default="none",
-    )
     parser.add_argument("--ocr-batch-size", type=int, default=4)
     parser.add_argument("--object-batch-size", type=int, default=8)
     parser.add_argument("--candidate-interval-sec", type=float, default=0.5)
@@ -212,10 +206,6 @@ def build_stage_commands(
         str(args.batch_size),
         "--num-workers",
         str(args.num_workers),
-        "--caption-batch-size",
-        str(args.caption_batch_size),
-        "--caption-quantization",
-        args.caption_quantization,
         "--ocr-batch-size",
         str(args.ocr_batch_size),
         "--object-batch-size",

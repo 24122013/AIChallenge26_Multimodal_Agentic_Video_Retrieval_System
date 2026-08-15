@@ -413,7 +413,7 @@ def assessment(doc):
         ["Nhận định trong chat", "Đối chiếu baseline", "Quyết định"],
         [
             ("SigLIP2 So400m đủ mạnh", "Đúng; visual contract và FAISS đã ổn định", "Giữ, chỉ benchmark"),
-            ("Qwen3.5-9B caption là upgrade lớn", "Đúng; revision c202236 đã có", "Giữ caption path"),
+            ("Qwen3.5 caption là upgrade lớn", "Caption hiện dùng Qwen3.5-4B revision đã pin", "Giữ caption path"),
             ("PP-OCRv5 nên giữ", "Đúng; detector + Latin recognizer hiện hữu", "Giữ BM25 exact OCR"),
             ("YOLOE mask có thể nặng", "Hợp lý nhưng chưa có bằng chứng thay model", "Không đổi trong scope"),
             ("ASR là P0 bắt buộc", "Đúng cho speech query, trái quyết định resource hiện tại", "Loại khỏi vòng test"),
@@ -691,7 +691,7 @@ def dependencies(doc, bullets):
         ["Vai trò", "Model / revision", "Artifact hoặc runtime impact"],
         [
             ("Visual", "google/siglip2-so400m-patch16-384", "Giữ visual artifacts"),
-            ("Caption + QA", "Qwen/Qwen3.5-9B @ c202236", "QA cache/model path riêng"),
+            ("Caption + QA", "Caption Qwen3.5-4B; QA Qwen3.5-9B", "QA cache/model path riêng"),
             ("OCR", "PP-OCRv5 server det + Latin mobile rec", "Giữ OCR JSON/BM25"),
             ("Object", "YOLOE-26l", "Giữ object metadata/BM25"),
             ("Dense text", "BAAI/bge-m3 @ resolved revision", "Thêm 3 BGE artifacts"),
@@ -702,8 +702,8 @@ def dependencies(doc, bullets):
     )
     heading(doc, "Requirements", 2)
     for text in (
-        "requirements-core.txt đã có torch, transformers, accelerate, bitsandbytes, faiss-cpu, numpy, FastAPI/Pydantic và extractor dependencies.",
-        "requirements.txt là CPU default; GPU Paddle profiles cu118/cu126 giữ đúng thay đổi có trước task.",
+        "requirements.txt là manifest chuẩn cho dependency dùng chung, backend, competition và script báo cáo.",
+        "PyTorch và PaddlePaddle được cài riêng theo đúng một profile CPU/CUDA để tránh wheel xung đột.",
         "BGE dùng Transformers/FAISS sẵn có, không cần FlagEmbedding hoặc sentence-transformers.",
         "Không có faster-whisper, ctranslate2 hoặc dependency ASR mới.",
     ):

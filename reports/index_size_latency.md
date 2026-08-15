@@ -1,5 +1,9 @@
 # Báo cáo index size và latency
 
+> **Historical report:** tài liệu này ghi lại benchmark của kiến trúc cũ có ASR.
+> Runtime hiện tại không có ASR/transcript; không dùng schema/lệnh ASR bên dưới
+> làm hướng dẫn vận hành. Xem `docs/PIPELINE_AUDIT.md` và README gốc.
+
 ## Phạm vi và giả định
 
 Báo cáo này chỉ đánh giá tầng build index và metadata. Không thay đổi query

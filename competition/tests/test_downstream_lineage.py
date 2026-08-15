@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from competition.downstream_lineage import (
+    artifact_entry,
     validate_stage_manifest,
     write_stage_manifest,
 )
@@ -86,6 +87,48 @@ class DownstreamLineageTest(unittest.TestCase):
                     input_paths={"segments": source},
                     output_paths={"text_index": output},
                 )
+
+    def test_validation_accepts_relocated_checksum_identical_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old_root = root / "linux-run"
+            old_root.mkdir()
+            source = old_root / "segments.jsonl"
+            output = old_root / "text_index.json"
+            manifest = old_root / "text_index_manifest.json"
+            source.write_text('{"segment_id":"S0"}\n', encoding="utf-8")
+            output.write_text('{"version":2}', encoding="utf-8")
+            canonical = [{
+                "video_id": "V0",
+                "keyframe_metadata": artifact_entry(source),
+            }]
+            write_stage_manifest(
+                manifest,
+                stage="text-index",
+                canonical_sources=canonical,
+                input_paths={"segments": source},
+                output_paths={"text_index": output},
+                config={"text_index_version": 2},
+            )
+
+            moved_root = root / "windows-run"
+            old_root.rename(moved_root)
+            moved_source = moved_root / source.name
+            moved_output = moved_root / output.name
+            moved_manifest = moved_root / manifest.name
+            moved_canonical = [{
+                "video_id": "V0",
+                "keyframe_metadata": artifact_entry(moved_source),
+            }]
+
+            validated = validate_stage_manifest(
+                moved_manifest,
+                stage="text-index",
+                canonical_sources=moved_canonical,
+                input_paths={"segments": moved_source},
+                output_paths={"text_index": moved_output},
+            )
+            self.assertEqual(validated["status"], "passed")
 
 
 if __name__ == "__main__":

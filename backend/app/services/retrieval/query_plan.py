@@ -6,6 +6,13 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
+from backend.app.services.agent.query_expansion import (
+    QueryExpansionConfig,
+    QueryExpansionPlan,
+    QueryExpansionProvider,
+    build_query_expansion_plan,
+)
+
 
 SUPPORTED_PROFILES = ("auto", "kis", "avs", "qa", "temporal")
 QA_ANSWER_TYPES = (
@@ -257,6 +264,7 @@ class QueryPlan:
     expansions: tuple[str, ...]
     modality_queries: tuple[tuple[str, str], ...]
     reasons: tuple[str, ...]
+    expansion_plan: QueryExpansionPlan
     task_mode: str = ""
     answer_type: str = "unknown"
     retrieval_statement: str = ""
@@ -310,6 +318,7 @@ class QueryPlan:
             "modality_hints": list(self.modality_hints),
             "quoted_phrases": list(self.quoted_phrases),
             "expansions": list(self.expansions),
+            "expansion_plan": self.expansion_plan.to_dict(),
             "modality_queries": dict(self.modality_queries),
             "reasons": list(self.reasons),
             "task_mode": self.task_mode or self.profile,
@@ -328,6 +337,9 @@ def build_query_plan(
     profile: str = "auto",
     *,
     task_mode: str | None = None,
+    expansion_provider: QueryExpansionProvider | None = None,
+    expansion_config: QueryExpansionConfig | None = None,
+    expansion_plan: QueryExpansionPlan | None = None,
 ) -> QueryPlan:
     original = " ".join(str(query).split())
     if not original or re.search(r"\w", original, re.UNICODE) is None:
@@ -399,18 +411,55 @@ def build_query_plan(
         resolved, source = "kis", "default"
         reasons.append("default exact-instance search")
 
-    # QA owns no translation, synonym generation, or query expansion.  External
-    # expanded queries are accepted later by the QA router.
-    expansion_terms = [] if resolved == "qa" else _expand(normalized)
-    base_retrieval_query = retrieval_statement if resolved == "qa" else normalized
-    retrieval_query = " ".join(dict.fromkeys([base_retrieval_query, *expansion_terms]))
-    quoted_query = " ".join(quoted)
-    modality_queries = (
-        ("visual", retrieval_query),
-        ("caption", retrieval_query),
-        ("objects", retrieval_query),
-        ("ocr", quoted_query if quoted_query and "ocr" in hints else retrieval_query),
+    # Explicit KIS/AVS plans do not silently become temporal executions. QA
+    # retains parsed events because its router owns temporal evidence chains.
+    if resolved not in {"temporal", "qa"}:
+        events = (normalized,)
+        relation = "none"
+
+    # Query expansion belongs to advanced KIS/AVS retrieval. QA receives any
+    # caller-provided expansions later at the router boundary and therefore
+    # always builds an original-only plan here.
+    effective_expansion_config = expansion_config
+    effective_expansion_provider = expansion_provider
+    if resolved == "qa" and expansion_plan is None:
+        effective_expansion_config = QueryExpansionConfig(enabled=False)
+        effective_expansion_provider = None
+    resolved_expansion = expansion_plan or build_query_expansion_plan(
+        original,
+        provider=effective_expansion_provider,
+        config=effective_expansion_config,
     )
+    accepted_paraphrases = tuple(
+        value.text
+        for value in resolved_expansion.accepted_variants
+        if value.type == "paraphrase"
+    )
+    retrieval_query = retrieval_statement if resolved == "qa" else normalized
+    if resolved == "qa":
+        quoted_query = " ".join(quoted)
+        modality_queries = (
+            ("visual", retrieval_query),
+            ("caption", retrieval_query),
+            ("objects", retrieval_query),
+            ("ocr", quoted_query if quoted_query and "ocr" in hints else retrieval_query),
+        )
+    else:
+        decomposition = resolved_expansion.decomposition
+        object_query = " ".join(decomposition.objects)
+        ocr_query = " ".join(decomposition.ocr_literals)
+        if decomposition.ocr_literals and "ocr" not in hints:
+            hints.append("ocr")
+            reasons.append("protected OCR literal")
+        if decomposition.objects and "objects" not in hints:
+            hints.append("objects")
+            reasons.append("decomposed object cue")
+        modality_queries = (
+            ("visual", retrieval_query),
+            ("caption", retrieval_query),
+            ("objects", object_query),
+            ("ocr", ocr_query),
+        )
     return QueryPlan(
         original_query=original,
         normalized_query=normalized,
@@ -422,9 +471,10 @@ def build_query_plan(
         temporal_events=events,
         modality_hints=tuple(dict.fromkeys(hints)),
         quoted_phrases=quoted,
-        expansions=tuple(expansion_terms),
+        expansions=accepted_paraphrases,
         modality_queries=modality_queries,
         reasons=tuple(reasons),
+        expansion_plan=resolved_expansion,
         task_mode=resolved,
         # Answer semantics belong to the question, not to the execution profile.
         # In particular a temporal QA route must not erase the answer slot.

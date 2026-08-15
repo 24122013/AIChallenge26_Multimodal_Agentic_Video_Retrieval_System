@@ -176,9 +176,11 @@ from competition.keyframe_phase5 import (
     write_split_manifest,
 )
 from competition.run_manifest import (
+    dataset_fingerprint,
     initialize_run_manifest,
     git_fingerprint,
     promote_active_run,
+    read_run_manifest,
     record_leaderboard_score,
     record_submission,
     set_active_baseline,
@@ -568,6 +570,95 @@ def _phase3_exact_frame_artifact(
     return True
 
 
+def _phase3_frame_artifact_failure_summary(
+    records: Sequence[Mapping[str, object]],
+    candidate_ids: Sequence[str],
+    *,
+    name: str,
+    path: Path,
+) -> str:
+    """Return compact, actionable diagnostics for a rejected hard modality."""
+
+    identities: list[str] = []
+    identity_errors = 0
+    for record in records:
+        try:
+            identities.append(_phase3_record_candidate_id(record))
+        except RuntimeError:
+            identity_errors += 1
+    expected = set(candidate_ids)
+    actual = set(identities)
+    error_records = [
+        record for record in records if record.get("status", "success") != "success"
+    ]
+    sample = ""
+    if error_records:
+        record = error_records[0]
+        candidate_id = record.get("candidate_id") or record.get("frame_id") or "unknown"
+        error = " ".join(str(record.get("error", "unspecified error")).split())
+        sample = f", first_error={candidate_id}: {error[:240]}"
+    return (
+        f"{name}(records={len(records)}, errors={len(error_records)}, "
+        f"missing={len(expected - actual)}, unexpected={len(actual - expected)}, "
+        f"duplicates={len(identities) - len(actual)}, invalid_ids={identity_errors}, "
+        f"path={path}{sample})"
+    )
+
+
+def _phase3_require_hard_feature_success(
+    *,
+    pipeline: str,
+    video: CorpusVideo,
+    report: Mapping[str, object],
+    report_path: Path,
+    allow_partial_features: bool,
+) -> None:
+    """Stop Phase 3 after the first failed hard-modality video."""
+
+    if allow_partial_features:
+        return
+    try:
+        error_count = int(report.get("error_count", 0))
+        input_count = int(report.get("input_record_count", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid {pipeline} report for {video.video_id}: {report_path}"
+        ) from exc
+    if error_count:
+        raise RuntimeError(
+            f"{pipeline} hard-feature extraction failed for {video.video_id}: "
+            f"{error_count}/{input_count} records failed; see {report_path}"
+        )
+
+
+def _phase3_require_modality_progress(
+    *,
+    pipeline: str,
+    video: CorpusVideo,
+    report: Mapping[str, object],
+    report_path: Path,
+    allow_partial_features: bool,
+) -> None:
+    """Stop a systematic backend failure before it repeats across the corpus."""
+
+    if allow_partial_features:
+        return
+    try:
+        input_count = int(report.get("input_record_count", 0))
+        skipped_count = int(report.get("skipped_count", 0))
+        error_count = int(report.get("error_count", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid {pipeline} report for {video.video_id}: {report_path}"
+        ) from exc
+    pending_count = input_count - skipped_count
+    if pending_count > 0 and error_count >= pending_count:
+        raise RuntimeError(
+            f"{pipeline} made no progress for {video.video_id}: all "
+            f"{pending_count} pending records failed; see {report_path}"
+        )
+
+
 def _phase3_artifact_entry(path: Path) -> dict[str, object]:
     return {
         "path": path.as_posix(),
@@ -632,9 +723,30 @@ def _phase3_load_and_validate_features(
     if not caption_complete:
         raise RuntimeError("caption artifact identities do not match candidate pool")
     if (not ocr_complete or not object_complete) and not allow_partial_features:
+        failures = []
+        if not ocr_complete:
+            failures.append(
+                _phase3_frame_artifact_failure_summary(
+                    ocr,
+                    candidate_ids,
+                    name="ocr",
+                    path=paths.ocr,
+                )
+            )
+        if not object_complete:
+            failures.append(
+                _phase3_frame_artifact_failure_summary(
+                    objects,
+                    candidate_ids,
+                    name="objects",
+                    path=paths.objects,
+                )
+            )
         raise RuntimeError(
-            "OCR/object hard-feature extraction is incomplete; rerun Phase 3 or "
-            "use --allow-partial-features for an explicit degraded run"
+            f"Phase 3 hard-feature extraction is incomplete for {video.video_id}: "
+            + "; ".join(failures)
+            + "; rerun Phase 3 after fixing the reported backend error, or use "
+            "--allow-partial-features for an explicit degraded run"
         )
 
     hard_feature_complete = ocr_complete and object_complete
@@ -825,7 +937,7 @@ def _phase3_release_model_memory(*owners: object) -> None:
                 owner.to("cpu")
             except Exception:  # noqa: BLE001 - cleanup must not hide stage errors.
                 pass
-        for attribute in ("_model", "_reader", "_processor"):
+        for attribute in ("_model", "_reader", "_processor", "_pipeline"):
             if not hasattr(owner, attribute):
                 continue
             value = getattr(owner, attribute, None)
@@ -846,6 +958,12 @@ def _phase3_release_model_memory(*owners: object) -> None:
             torch.cuda.empty_cache()
     except ImportError:  # pragma: no cover - SigLIP already requires torch in production.
         pass
+    paddle = sys.modules.get("paddle")
+    if paddle is not None:
+        try:
+            paddle.device.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - CPU builds and old Paddle releases may differ.
+            pass
 
 
 def _sha256_file(path: Path) -> str:
@@ -871,7 +989,12 @@ def _frame_ids_sha256(records: Sequence[Mapping[str, object]]) -> str:
     return digest.hexdigest()
 
 
-def _keyframe_images_sha256(records: Sequence[Mapping[str, object]]) -> str:
+def _keyframe_images_sha256(
+    records: Sequence[Mapping[str, object]],
+    *,
+    output_root: Path | None = None,
+    public_root: Path | None = None,
+) -> str:
     digest = hashlib.sha256()
     for offset, record in enumerate(records):
         frame_id = record.get("frame_id")
@@ -880,7 +1003,16 @@ def _keyframe_images_sha256(records: Sequence[Mapping[str, object]]) -> str:
             raise RuntimeError(f"Invalid keyframe record at metadata row {offset}")
         digest.update(frame_id.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(_sha256_file(Path(keyframe_path)).encode("ascii"))
+        resolved_path = (
+            _resolve_relocated_artifact_path(
+                keyframe_path,
+                output_root=output_root,
+                public_root=public_root,
+            )
+            if output_root is not None
+            else Path(keyframe_path)
+        )
+        digest.update(_sha256_file(resolved_path).encode("ascii"))
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -888,6 +1020,86 @@ def _keyframe_images_sha256(records: Sequence[Mapping[str, object]]) -> str:
 def _file_stat_fingerprint(path: Path) -> dict[str, int]:
     stat = path.stat()
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _resolve_relocated_artifact_path(
+    reference: str,
+    *,
+    output_root: Path,
+    public_root: Path | None = None,
+) -> Path:
+    """Resolve an artifact reference after a run directory changes hosts.
+
+    Older stage artifacts store absolute paths.  When the direct path no longer
+    exists, rebase only a suffix anchored by the current run name or public-data
+    directory.  Every rebased candidate is constrained to one of those roots.
+    """
+
+    direct = Path(reference)
+    if direct.is_file():
+        return direct
+
+    normalized = reference.replace("\\", "/")
+    candidates: list[tuple[Path, str]] = []
+    resolved_output_root = output_root.resolve()
+    run_marker = f"/{resolved_output_root.name}/"
+    if run_marker in normalized:
+        candidates.append(
+            (resolved_output_root, normalized.rsplit(run_marker, 1)[1])
+        )
+    if not direct.is_absolute() and not normalized.startswith("/"):
+        candidates.append((resolved_output_root, normalized))
+
+    if public_root is not None:
+        resolved_public_root = public_root.resolve()
+        for marker in (
+            f"/data/{resolved_public_root.name}/",
+            f"/{resolved_public_root.name}/",
+        ):
+            if marker in normalized:
+                candidates.append(
+                    (resolved_public_root, normalized.rsplit(marker, 1)[1])
+                )
+                break
+
+    for base, suffix in candidates:
+        candidate = (base / Path(suffix)).resolve()
+        try:
+            candidate.relative_to(base)
+        except ValueError:
+            continue
+        if candidate.is_file():
+            return candidate
+    return direct
+
+
+def _source_fingerprint_matches(
+    path: Path,
+    stored: object,
+    *,
+    allow_relocated_mtime: bool,
+) -> bool:
+    current = _file_stat_fingerprint(path)
+    if stored == current:
+        return True
+    return bool(
+        allow_relocated_mtime
+        and isinstance(stored, Mapping)
+        and stored.get("size") == current["size"]
+    )
+
+
+def _require_portable_run_dataset(run_root: Path, public_root: Path) -> None:
+    """Authorize relocation only when the full content fingerprint matches."""
+
+    manifest = read_run_manifest(run_root)
+    stored = manifest.get("dataset")
+    current = dataset_fingerprint(public_root)
+    if stored != current:
+        raise RuntimeError(
+            "Run dataset does not match --public-root by content; refusing to "
+            "rebase Linux/Windows artifact paths"
+        )
 
 
 def _read_json_object(path: Path) -> dict:
@@ -972,6 +1184,8 @@ def _require_keyframe_metadata_integrity(
     video: CorpusVideo,
     metadata_path: Path,
     report: Mapping[str, object],
+    output_root: Path | None = None,
+    public_root: Path | None = None,
 ) -> list[dict]:
     records = load_jsonl(metadata_path)
     expected_count = report.get("keyframe_count")
@@ -993,10 +1207,19 @@ def _require_keyframe_metadata_integrity(
             raise RuntimeError(f"Duplicate keyframe frame_id for {video.video_id}: {frame_id}")
         frame_ids.add(frame_id)
         keyframe_path = record.get("keyframe_path")
-        if not isinstance(keyframe_path, str) or not Path(keyframe_path).is_file():
+        resolved_keyframe_path = (
+            _resolve_relocated_artifact_path(
+                keyframe_path,
+                output_root=output_root,
+                public_root=public_root,
+            )
+            if isinstance(keyframe_path, str) and output_root is not None
+            else Path(keyframe_path or "")
+        )
+        if not isinstance(keyframe_path, str) or not resolved_keyframe_path.is_file():
             raise RuntimeError(
                 f"Missing keyframe image for {video.video_id} at row {offset}: "
-                f"{keyframe_path!r}"
+                f"{keyframe_path!r} (resolved as {resolved_keyframe_path})"
             )
     return records
 
@@ -1008,6 +1231,9 @@ def _load_valid_extraction_report(
     metadata_path: Path,
     report_path: Path,
     requested_config: Mapping[str, object] | None = None,
+    output_root: Path | None = None,
+    public_root: Path | None = None,
+    allow_relocated_source: bool = False,
 ) -> dict:
     if not metadata_path.is_file() or not report_path.is_file():
         raise FileNotFoundError(
@@ -1022,19 +1248,29 @@ def _load_valid_extraction_report(
         raise RuntimeError(f"Extraction config changed for {video.video_id}")
     if report.get("extractor_contract_version") != EXTRACTOR_CONTRACT_VERSION:
         raise RuntimeError(f"Extractor contract version mismatch for {video.video_id}")
-    if report.get("source_video_fingerprint") != _file_stat_fingerprint(video_path):
+    if not _source_fingerprint_matches(
+        video_path,
+        report.get("source_video_fingerprint"),
+        allow_relocated_mtime=allow_relocated_source,
+    ):
         raise RuntimeError(f"Source video changed for {video.video_id}")
     _require_extractor_report_contract(report, stored_config, report_path)
     records = _require_keyframe_metadata_integrity(
         video=video,
         metadata_path=metadata_path,
         report=report,
+        output_root=output_root,
+        public_root=public_root,
     )
     if report.get("keyframe_metadata_sha256") != _sha256_file(metadata_path):
         raise RuntimeError(f"Keyframe metadata changed for {video.video_id}")
     if report.get("keyframe_frame_ids_sha256") != _frame_ids_sha256(records):
         raise RuntimeError(f"Keyframe identities changed for {video.video_id}")
-    if report.get("keyframe_images_sha256") != _keyframe_images_sha256(records):
+    if report.get("keyframe_images_sha256") != _keyframe_images_sha256(
+        records,
+        output_root=output_root,
+        public_root=public_root,
+    ):
         raise RuntimeError(f"Keyframe image content changed for {video.video_id}")
     return report
 
@@ -1495,6 +1731,7 @@ def _require_current_index_lineage(
     public_root: Path,
     output_root: Path,
     manifest_path: Path,
+    allow_relocated_paths: bool = False,
 ) -> None:
     manifest = _read_json_object(manifest_path)
     stored = manifest.get("competition_index_lineage")
@@ -1541,6 +1778,9 @@ def _require_current_index_lineage(
             video_path=public_root / video.relative_path,
             metadata_path=keyframe_metadata_path,
             report_path=extract_report_path,
+            output_root=output_root if allow_relocated_paths else None,
+            public_root=public_root if allow_relocated_paths else None,
+            allow_relocated_source=allow_relocated_paths,
         )
         _require_embedding_matches_extraction(
             video=video,
@@ -1812,7 +2052,7 @@ def _phase3_generate_features(
                 start=1,
             ):
                 print(f"[caption {number}/{len(caption_pending)}] {video.filename}")
-                run_caption_file(
+                caption_report = run_caption_file(
                     paths.candidate_metadata,
                     output_path=paths.captions,
                     report_path=paths.caption_report,
@@ -1827,6 +2067,13 @@ def _phase3_generate_features(
                     dtype=args.caption_dtype,
                     quantization=args.caption_quantization,
                     model_cache_dir=args.model_cache_root / "caption",
+                )
+                _phase3_require_modality_progress(
+                    pipeline="caption",
+                    video=video,
+                    report=caption_report,
+                    report_path=paths.caption_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(caption_backend)
@@ -1876,7 +2123,7 @@ def _phase3_generate_features(
         try:
             for number, (video, paths, _contract) in enumerate(ocr_pending, start=1):
                 print(f"[ocr {number}/{len(ocr_pending)}] {video.filename}")
-                run_ocr_file(
+                ocr_report = run_ocr_file(
                     paths.candidate_metadata,
                     output_path=paths.ocr,
                     report_path=paths.ocr_report,
@@ -1889,6 +2136,13 @@ def _phase3_generate_features(
                     recognition_model=args.ocr_recognition_model,
                     revision=args.ocr_model_revision,
                     model_cache_dir=args.model_cache_root / "ocr",
+                )
+                _phase3_require_hard_feature_success(
+                    pipeline="OCR",
+                    video=video,
+                    report=ocr_report,
+                    report_path=paths.ocr_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(ocr_backend)
@@ -1942,7 +2196,7 @@ def _phase3_generate_features(
         try:
             for number, (video, paths, _contract) in enumerate(object_pending, start=1):
                 print(f"[objects {number}/{len(object_pending)}] {video.filename}")
-                run_object_file(
+                object_report = run_object_file(
                     paths.candidate_metadata,
                     output_path=paths.objects,
                     report_path=paths.object_report,
@@ -1957,6 +2211,13 @@ def _phase3_generate_features(
                     model_cache_dir=object_cache,
                     vocabulary=args.object_vocabulary,
                     prompt_mode=args.object_prompt_mode,
+                )
+                _phase3_require_hard_feature_success(
+                    pipeline="object detection",
+                    video=video,
+                    report=object_report,
+                    report_path=paths.object_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(object_backend)
@@ -2700,6 +2961,7 @@ def _require_current_canonical_publish(
     *,
     public_root: Path,
     output_root: Path,
+    allow_relocated_paths: bool = False,
 ) -> list[dict[str, object]]:
     """Reject mixed/stale canonical files before downstream aggregation.
 
@@ -2719,6 +2981,9 @@ def _require_current_canonical_publish(
             video_path=public_root / video.relative_path,
             metadata_path=metadata_path,
             report_path=report_path,
+            output_root=output_root if allow_relocated_paths else None,
+            public_root=public_root if allow_relocated_paths else None,
+            allow_relocated_source=allow_relocated_paths,
         )
         source: dict[str, object] = {
             "video_id": video.video_id,
@@ -2737,7 +3002,15 @@ def _require_current_canonical_publish(
             str,
         ):
             raise RuntimeError(f"Phase 3 commit marker is incomplete: {report_path}")
-        manifest_path = Path(raw_manifest_path)
+        manifest_path = (
+            _resolve_relocated_artifact_path(
+                raw_manifest_path,
+                output_root=output_root,
+                public_root=public_root,
+            )
+            if allow_relocated_paths
+            else Path(raw_manifest_path)
+        )
         if not manifest_path.is_file() or _sha256_file(manifest_path) != expected_manifest_hash:
             raise RuntimeError(f"Phase 3 manifest is missing or stale: {manifest_path}")
         manifest = _read_json_object(manifest_path)
@@ -2774,7 +3047,15 @@ def _require_current_canonical_publish(
                 raise RuntimeError(
                     f"Incomplete canonical artifact entry {name!r}: {manifest_path}"
                 )
-            artifact_path = Path(raw_path)
+            artifact_path = (
+                _resolve_relocated_artifact_path(
+                    raw_path,
+                    output_root=output_root,
+                    public_root=public_root,
+                )
+                if allow_relocated_paths
+                else Path(raw_path)
+            )
             if (
                 not artifact_path.is_file()
                 or artifact_path.stat().st_size != expected_size
@@ -2832,6 +3113,7 @@ def _require_current_segments_lineage(
     corpus: Sequence[CorpusVideo],
     public_root: Path,
     output_root: Path,
+    allow_relocated_paths: bool = False,
 ) -> tuple[list[dict[str, object]], dict[str, Path]]:
     metadata_dir = output_root / "metadata"
     multimodal_paths = _require_multimodal_artifacts(corpus, metadata_dir)
@@ -2839,6 +3121,7 @@ def _require_current_segments_lineage(
         corpus,
         public_root=public_root,
         output_root=output_root,
+        allow_relocated_paths=allow_relocated_paths,
     )
     paths = competition_index_paths(output_root)
     validate_stage_manifest(
@@ -2856,11 +3139,13 @@ def _require_current_text_index_lineage(
     corpus: Sequence[CorpusVideo],
     public_root: Path,
     output_root: Path,
+    allow_relocated_paths: bool = False,
 ) -> None:
     canonical_sources, _ = _require_current_segments_lineage(
         corpus=corpus,
         public_root=public_root,
         output_root=output_root,
+        allow_relocated_paths=allow_relocated_paths,
     )
     paths = competition_index_paths(output_root)
     validate_stage_manifest(
@@ -3638,16 +3923,22 @@ def predict_command(args: argparse.Namespace) -> None:
     paths = competition_index_paths(output_root)
     runtime = load_retrieval_runtime_config(args.retrieval_config)
 
+    if advanced_mode:
+        assert run_root is not None
+        _require_portable_run_dataset(output_root, public_root)
+
     _require_current_index_lineage(
         corpus=corpus,
         public_root=public_root,
         output_root=output_root,
         manifest_path=paths["manifest"],
+        allow_relocated_paths=advanced_mode,
     )
     _require_current_text_index_lineage(
         corpus=corpus,
         public_root=public_root,
         output_root=output_root,
+        allow_relocated_paths=advanced_mode,
     )
     contract = load_encoder_contract(paths["manifest"])
     resolved_device = choose_device(args.device)
