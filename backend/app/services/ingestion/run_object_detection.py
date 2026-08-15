@@ -8,7 +8,12 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 from backend.app.services.ingestion.common import configure_logging, discover_files
-from backend.app.services.ingestion.object_pipeline import DEFAULT_MODEL_NAME, run_object_file
+from backend.app.services.ingestion.object_pipeline import (
+    DEFAULT_MODEL_NAME,
+    DEFAULT_MODEL_REVISION,
+    DEFAULT_VOCABULARY,
+    run_object_file,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,11 +23,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-path", type=Path, help="Only valid for one input file.")
     parser.add_argument("--report-path", type=Path, help="Only valid for one input file.")
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
+    parser.add_argument("--model-revision", default=DEFAULT_MODEL_REVISION)
     parser.add_argument("--model-cache-dir", type=Path, default=Path("data/model_cache/objects"))
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--conf-threshold", type=float, default=0.25)
     parser.add_argument("--iou-threshold", type=float, default=0.7)
+    parser.add_argument("--prompt-mode", choices=("text", "internal"), default="text")
+    parser.add_argument(
+        "--vocabulary",
+        nargs="+",
+        default=list(DEFAULT_VOCABULARY),
+        help="Text-prompt classes used by YOLOE (space-separated).",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -46,7 +59,10 @@ def main(argv: list[str] | None = None) -> int:
             iou_threshold=args.iou_threshold,
             overwrite=args.overwrite,
             model_name=args.model_name,
+            revision=args.model_revision,
             model_cache_dir=args.model_cache_dir,
+            vocabulary=args.vocabulary,
+            prompt_mode=args.prompt_mode,
         )
     return 0
 

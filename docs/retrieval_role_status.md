@@ -8,7 +8,7 @@ Retrieval Phase 1-3 is code-complete on the current working tree:
 
 - SigLIP2 visual search against FAISS and frame map.
 - Optional minimum visual score filtering.
-- Caption, OCR, ASR and object lexical search.
+- Caption, OCR and object lexical search.
 - Hybrid candidate merge, duplicate removal and weighted reranking.
 - Ordered temporal query decomposition and same-video matching.
 - Python wrappers and FastAPI router endpoints.
@@ -18,7 +18,7 @@ This does not mean production search is data-ready. The current workspace has:
 - 16 raw MP4 videos.
 - One keyframe metadata file, `keyframes_L27_V009.jsonl`, with 226 records.
 - No `segments_*.jsonl`.
-- No caption, OCR, ASR or object JSONL artifacts.
+- No caption, OCR or object JSONL artifacts.
 - No production FAISS index under `data/indexes`.
 
 The FAISS smoke index under `data/smoke` contains only two cloud/sunset frames.
@@ -63,7 +63,7 @@ PyTorch environment or a machine/job that can finish the production encode.
 
 Required:
 
-1. Generate caption, OCR, object and ASR JSONL artifacts.
+1. Generate caption, OCR and object JSONL artifacts.
 2. Build `segments_all.jsonl` or per-video `segments_*.jsonl`.
 3. Hand the artifacts to Retrieval, preserving `video_id`, frame/segment IDs,
    timestamps and keyframe paths.
@@ -121,7 +121,7 @@ raw videos
   -> keyframes
   -> SigLIP2 image embeddings
   -> production FAISS + frame map + manifest
-  -> caption/OCR/object/ASR
+  -> caption/OCR/object
   -> segment metadata
   -> Retrieval text index
   -> visual/hybrid/temporal query

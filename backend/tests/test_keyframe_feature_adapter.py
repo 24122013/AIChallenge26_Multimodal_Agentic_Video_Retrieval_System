@@ -203,7 +203,6 @@ class KeyframeFeatureAdapterTest(unittest.TestCase):
             object_weight=1.0,
             transition_weight=0.0,
             caption_weight=0.0,
-            asr_weight=0.0,
         )
 
         result = adapt_feature_records(
@@ -369,7 +368,7 @@ class KeyframeFeatureAdapterTest(unittest.TestCase):
             all(selected_ids.intersection(event.candidate_ids) for event in result.protected_events)
         )
 
-    def test_asr_is_half_open_and_caption_error_is_unavailable(self) -> None:
+    def test_caption_error_is_unavailable(self) -> None:
         candidates = [base_candidate(index, float(index), shot_index=1) for index in range(3)]
         captions = [
             {
@@ -385,44 +384,20 @@ class KeyframeFeatureAdapterTest(unittest.TestCase):
                 "caption": "",
             },
         ]
-        asr = [
-            {
-                "video_id": "VIDEO",
-                "status": "success",
-                "start": 0.0,
-                "end": 1.0,
-                "text": "hello world",
-                "confidence": 1.0,
-                "no_speech_probability": 0.0,
-            },
-            {
-                "candidate_id": "C2",
-                "video_id": "VIDEO",
-                "status": "success",
-                "start": 2.0,
-                "end": 2.5,
-                "text": "",
-            },
-        ]
         result = adapt_feature_records(
             candidates,
             caption_records=captions,
-            asr_records=asr,
             config=FeatureAdapterConfig(
                 ocr_weight=0.0,
                 object_weight=0.0,
                 transition_weight=0.0,
                 caption_weight=1.0,
-                asr_weight=1.0,
             ),
         )
         by_id = {value.candidate_id: value for value in result.candidate_scores}
 
-        self.assertIn("asr", by_id["C0"].available_modalities)
-        self.assertGreater(dict(by_id["C0"].component_scores)["asr"], 0.0)
-        self.assertEqual(dict(by_id["C1"].component_scores)["asr"], 0.0)
-        self.assertIn("asr", by_id["C2"].available_modalities)
-        self.assertEqual(dict(by_id["C2"].component_scores)["asr"], 0.0)
+        self.assertIn("caption", by_id["C0"].available_modalities)
+        self.assertGreater(dict(by_id["C0"].component_scores)["caption"], 0.0)
         self.assertNotIn("caption", by_id["C1"].available_modalities)
 
 

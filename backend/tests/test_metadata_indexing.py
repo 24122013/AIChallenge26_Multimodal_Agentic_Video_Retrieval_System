@@ -218,7 +218,6 @@ class SegmentMetadataTests(unittest.TestCase):
         self.assertEqual(first["keyframe_ids"], ["A0", "A1"])
         self.assertEqual(first["captions_aggregated"], "")
         self.assertEqual(first["ocr"], [])
-        self.assertEqual(first["asr"], [])
         self.assertEqual(first["objects"], [])
         self.assertEqual(records[-1]["keyframe_ids"], ["B0"])
 
@@ -226,7 +225,6 @@ class SegmentMetadataTests(unittest.TestCase):
         keyframes = self.root / "keyframes.jsonl"
         captions = self.root / "captions.jsonl"
         ocr = self.root / "ocr.jsonl"
-        asr = self.root / "asr.jsonl"
         objects = self.root / "objects.jsonl"
         output = self.root / "segments.jsonl"
         write_jsonl(keyframes, self._keyframes())
@@ -276,43 +274,6 @@ class SegmentMetadataTests(unittest.TestCase):
             ],
         )
         write_jsonl(
-            asr,
-            [
-                {
-                    "video_id": "A",
-                    "transcript_segment_id": "ASR_1",
-                    "start": 1.0,
-                    "end": 3.0,
-                    "text": "hello world",
-                    "status": "success",
-                },
-                {
-                    "video_id": "A",
-                    "transcript_segment_id": "ASR_1_DUP",
-                    "start": 2.0,
-                    "end": 3.5,
-                    "text": " hello  world ",
-                    "status": "success",
-                },
-                {
-                    "video_id": "A",
-                    "transcript_segment_id": "ASR_PARTIAL",
-                    "start": 4.8,
-                    "end": 5.5,
-                    "text": "crosses boundary",
-                    "status": "success",
-                },
-                {
-                    "video_id": "B",
-                    "transcript_segment_id": "ASR_B",
-                    "start": 0.0,
-                    "end": 2.0,
-                    "text": "other video",
-                    "status": "success",
-                },
-            ],
-        )
-        write_jsonl(
             objects,
             [
                 {
@@ -341,7 +302,6 @@ class SegmentMetadataTests(unittest.TestCase):
             output,
             captions_path=captions,
             ocr_path=ocr,
-            asr_path=asr,
             objects_path=objects,
         )
         first = read_jsonl(output)[0]
@@ -352,10 +312,6 @@ class SegmentMetadataTests(unittest.TestCase):
         self.assertEqual(first["ocr"][0]["first_seen"], 0.5)
         self.assertEqual(first["ocr"][0]["last_seen"], 4.5)
         self.assertEqual(first["ocr"][0]["source_ids"], ["A0", "A1"])
-        self.assertEqual(len(first["asr"]), 2)
-        self.assertEqual(first["asr"][0]["source_ids"], ["ASR_1", "ASR_1_DUP"])
-        self.assertEqual(len(first["asr"][0]["source_intervals"]), 2)
-        self.assertEqual(first["asr"][1]["text"], "crosses boundary")
         by_label = {item["label"]: item for item in first["objects"]}
         self.assertEqual(by_label["car"]["occurrence_count"], 2)
         self.assertEqual(

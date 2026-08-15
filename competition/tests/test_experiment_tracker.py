@@ -43,7 +43,6 @@ class ExperimentTrackerTest(unittest.TestCase):
             "captions.jsonl",
             "ocr.jsonl",
             "objects.jsonl",
-            "asr.jsonl",
             "feature_manifest.json",
         ):
             (work / name).write_bytes(b"artifact")

@@ -12,6 +12,7 @@ from yaml.nodes import MappingNode, Node, ScalarNode
 
 from backend.app.services.retrieval.hybrid_search import HybridSearchConfig
 from backend.app.services.retrieval.rerank import RerankConfig, RerankWeights
+from backend.app.services.agent.query_expansion import QueryExpansionConfig
 
 
 DEFAULT_RETRIEVAL_CONFIG_PATH = Path("configs/retrieval.yaml")
@@ -29,7 +30,6 @@ _CONFIG_SCHEMA = {
         "visual": "non-negative number",
         "caption": "non-negative number",
         "ocr": "non-negative number",
-        "asr": "non-negative number",
         "objects": "non-negative number",
         "temporal": "non-negative number",
     },
@@ -40,6 +40,21 @@ _CONFIG_SCHEMA = {
         "path": "non-empty string",
         "default_top_k": "positive integer",
         "max_top_k": "positive integer",
+    },
+    "query_expansion": {
+        "enabled": "boolean",
+        "max_paraphrases": "non-negative integer",
+        "original_weight": "non-negative number",
+        "paraphrase_weight": "non-negative number",
+        "max_expansion_contribution": "positive number",
+        "max_query_chars": "positive integer",
+        "hard_paraphrase_limit": "positive integer",
+        "model_name": "non-empty string",
+        "model_revision": "non-empty string",
+        "timeout_seconds": "positive number",
+        "max_new_tokens": "positive integer",
+        "dtype": "non-empty string",
+        "quantization": "non-empty string",
     },
 }
 
@@ -60,6 +75,7 @@ class RetrievalRuntimeConfig:
     hybrid: HybridSearchConfig = HybridSearchConfig()
     rerank: RerankConfig = RerankConfig()
     text_index: TextIndexConfig = TextIndexConfig()
+    query_expansion: QueryExpansionConfig = QueryExpansionConfig()
 
 
 def load_retrieval_runtime_config(
@@ -75,6 +91,7 @@ def load_retrieval_runtime_config(
     weights_raw = _section(raw, "weights")
     dedupe_raw = _section(raw, "dedupe")
     text_raw = _section(raw, "text_index")
+    expansion_raw = _section(raw, "query_expansion")
 
     hybrid = HybridSearchConfig(
         stage1_top_k=_int_env(
@@ -124,11 +141,6 @@ def load_retrieval_runtime_config(
             weights_raw.get("ocr"),
             RerankWeights.ocr,
         ),
-        asr=_float_env(
-            "RETRIEVAL_WEIGHT_ASR",
-            weights_raw.get("asr"),
-            RerankWeights.asr,
-        ),
         objects=_float_env(
             "RETRIEVAL_WEIGHT_OBJECTS",
             weights_raw.get("objects"),
@@ -157,6 +169,67 @@ def load_retrieval_runtime_config(
             TextIndexConfig.max_top_k,
         ),
     )
+    query_expansion = QueryExpansionConfig(
+        enabled=_bool_env(
+            "RETRIEVAL_QUERY_EXPANSION_ENABLED",
+            expansion_raw.get("enabled"),
+            QueryExpansionConfig.enabled,
+        ),
+        max_paraphrases=_non_negative_int_env(
+            "RETRIEVAL_QUERY_EXPANSION_MAX_PARAPHRASES",
+            expansion_raw.get("max_paraphrases"),
+            QueryExpansionConfig.max_paraphrases,
+        ),
+        original_weight=_float_env(
+            "RETRIEVAL_QUERY_EXPANSION_ORIGINAL_WEIGHT",
+            expansion_raw.get("original_weight"),
+            QueryExpansionConfig.original_weight,
+        ),
+        paraphrase_weight=_float_env(
+            "RETRIEVAL_QUERY_EXPANSION_PARAPHRASE_WEIGHT",
+            expansion_raw.get("paraphrase_weight"),
+            QueryExpansionConfig.paraphrase_weight,
+        ),
+        max_expansion_contribution=_float_env(
+            "RETRIEVAL_QUERY_EXPANSION_MAX_CONTRIBUTION",
+            expansion_raw.get("max_expansion_contribution"),
+            QueryExpansionConfig.max_expansion_contribution,
+        ),
+        max_query_chars=_int_env(
+            "RETRIEVAL_QUERY_EXPANSION_MAX_QUERY_CHARS",
+            expansion_raw.get("max_query_chars"),
+            QueryExpansionConfig.max_query_chars,
+        ),
+        hard_paraphrase_limit=_int_env(
+            "RETRIEVAL_QUERY_EXPANSION_HARD_LIMIT",
+            expansion_raw.get("hard_paraphrase_limit"),
+            QueryExpansionConfig.hard_paraphrase_limit,
+        ),
+        model_name=str(
+            os.getenv("RETRIEVAL_QUERY_EXPANSION_MODEL_NAME")
+            or expansion_raw.get("model_name")
+            or QueryExpansionConfig.model_name
+        ),
+        model_revision=str(
+            os.getenv("RETRIEVAL_QUERY_EXPANSION_MODEL_REVISION")
+            or expansion_raw.get("model_revision")
+            or QueryExpansionConfig.model_revision
+        ),
+        timeout_seconds=_float_env(
+            "RETRIEVAL_QUERY_EXPANSION_TIMEOUT_SECONDS",
+            expansion_raw.get("timeout_seconds"),
+            QueryExpansionConfig.timeout_seconds,
+        ),
+        max_new_tokens=_int_env(
+            "RETRIEVAL_QUERY_EXPANSION_MAX_NEW_TOKENS",
+            expansion_raw.get("max_new_tokens"),
+            QueryExpansionConfig.max_new_tokens,
+        ),
+        dtype=str(expansion_raw.get("dtype") or QueryExpansionConfig.dtype),
+        quantization=str(
+            expansion_raw.get("quantization") or QueryExpansionConfig.quantization
+        ),
+    )
     return RetrievalRuntimeConfig(
         hybrid=hybrid,
         rerank=RerankConfig(
@@ -168,6 +241,7 @@ def load_retrieval_runtime_config(
             ),
         ),
         text_index=text_index,
+        query_expansion=query_expansion,
     )
 
 
@@ -338,6 +412,8 @@ def _matches_expected_type(value: Any, expected: str) -> bool:
     )
     if expected == "positive integer":
         return not isinstance(value, bool) and isinstance(value, int) and value > 0
+    if expected == "non-negative integer":
+        return not isinstance(value, bool) and isinstance(value, int) and value >= 0
     if expected == "positive number":
         return is_number and value > 0
     if expected == "non-negative number":
@@ -378,6 +454,14 @@ def _int_env(name: str, value: Any, default: int) -> int:
 def _float_env(name: str, value: Any, default: float) -> float:
     raw = os.getenv(name)
     return float(raw if raw is not None else value if value is not None else default)
+
+
+def _non_negative_int_env(name: str, value: Any, default: int) -> int:
+    raw = os.getenv(name)
+    result = int(raw if raw is not None else value if value is not None else default)
+    if result < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return result
 
 
 def _bool_env(name: str, value: Any, default: bool) -> bool:

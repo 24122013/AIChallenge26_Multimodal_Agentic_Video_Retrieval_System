@@ -1,9 +1,4 @@
-"""Deterministic query planning for terminal retrieval experiments.
-
-This is a selective, dependency-light port of the tested task-aware planner
-from local commit ``26872dc3``.  It intentionally avoids an LLM so experiment
-results remain reproducible and callers can explicitly override every profile.
-"""
+"""Deterministic, dependency-light query planning."""
 from __future__ import annotations
 
 import re
@@ -11,11 +6,17 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
+from backend.app.services.agent.query_expansion import (
+    QueryExpansionConfig,
+    QueryExpansionPlan,
+    QueryExpansionProvider,
+    build_query_expansion_plan,
+)
+
 
 SUPPORTED_PROFILES = ("auto", "kis", "avs", "qa", "temporal")
-
 _TEMPORAL_SPLIT = re.compile(
-    r"\b(?:then|after\s+that|next|followed\s+by|sau\s+đó|tiếp\s+theo|rồi)\b",
+    r"\b(?:then|after\s+that|next(?!\s+to\b)|followed\s+by|sau\s+đó|tiếp\s+theo|rồi)\b",
     re.IGNORECASE,
 )
 _BEFORE = re.compile(r"\b(?:before|trước\s+khi)\b", re.IGNORECASE)
@@ -24,11 +25,6 @@ _QUOTED = re.compile(r'''["'“”‘’]([^"'“”‘’]+)["'“”‘’]'''
 _OCR = re.compile(
     r"\b(?:text|written|read|subtitle|sign|signboard|plate|menu|logo|qr)\b"
     r"|\b(?:chữ|văn\s+bản|ghi\s+gì|viết\s+gì|phụ\s+đề|biển\s+hiệu|biển\s+báo|biển\s+số|thực\s+đơn|mã\s+qr)\b",
-    re.IGNORECASE,
-)
-_ASR = re.compile(
-    r"\b(?:said|says|speak|speech|announce|heard|voice|audio|lyrics)\b"
-    r"|\b(?:nói|phát\s+biểu|thông\s+báo|nghe|giọng|âm\s+thanh|lời\s+bài\s+hát)\b",
     re.IGNORECASE,
 )
 _OBJECT = re.compile(
@@ -46,7 +42,6 @@ _QUESTION = re.compile(
     r"|\b(?:gì|khi\s+nào|ở\s+đâu|là\s+ai|bao\s+nhiêu|màu\s+gì|làm\s+gì)\b",
     re.IGNORECASE,
 )
-
 _COMMON_TYPOS = {
     "resturant": "restaurant",
     "restaraunt": "restaurant",
@@ -84,6 +79,7 @@ class QueryPlan:
     expansions: tuple[str, ...]
     modality_queries: tuple[tuple[str, str], ...]
     reasons: tuple[str, ...]
+    expansion_plan: QueryExpansionPlan
 
     def query_for(self, modality: str) -> str:
         return dict(self.modality_queries).get(modality, self.retrieval_query)
@@ -103,10 +99,18 @@ class QueryPlan:
             "expansions": list(self.expansions),
             "modality_queries": dict(self.modality_queries),
             "reasons": list(self.reasons),
+            "query_expansion": self.expansion_plan.to_dict(),
         }
 
 
-def build_query_plan(query: str, profile: str = "auto") -> QueryPlan:
+def build_query_plan(
+    query: str,
+    profile: str = "auto",
+    *,
+    expansion_provider: QueryExpansionProvider | None = None,
+    expansion_config: QueryExpansionConfig | None = None,
+    expansion_plan: QueryExpansionPlan | None = None,
+) -> QueryPlan:
     original = " ".join(str(query).split())
     if not original or re.search(r"\w", original, re.UNICODE) is None:
         raise ValueError("query must not be empty")
@@ -125,43 +129,58 @@ def build_query_plan(query: str, profile: str = "auto") -> QueryPlan:
     if _OCR.search(classification):
         hints.append("ocr")
         reasons.append("OCR/text cue")
-    if _ASR.search(classification):
-        hints.append("asr")
-        reasons.append("speech/audio cue")
     if _OBJECT.search(classification):
         hints.append("objects")
         reasons.append("object cue")
 
     if requested != "auto":
-        resolved = requested
-        source = "explicit"
+        resolved, source = requested, "explicit"
         reasons.append(f"explicit profile: {resolved}")
     elif len(events) > 1:
-        resolved = "temporal"
-        source = "inferred"
+        resolved, source = "temporal", "inferred"
         reasons.append("ordered temporal event chain")
     elif _QUESTION.search(classification):
-        resolved = "qa"
-        source = "inferred"
+        resolved, source = "qa", "inferred"
         reasons.append("question/evidence query")
     elif _AVS.search(classification):
-        resolved = "avs"
-        source = "inferred"
+        resolved, source = "avs", "inferred"
         reasons.append("broad multi-result query")
     else:
-        resolved = "kis"
-        source = "default"
+        resolved, source = "kis", "default"
         reasons.append("default exact-instance search")
 
-    expansion_terms = _expand(normalized)
-    retrieval_query = " ".join(dict.fromkeys([normalized, *expansion_terms]))
-    quoted_query = " ".join(quoted)
+    # Temporal chaining is a TRAKE/profile-temporal concern. An explicit TKIS,
+    # AVS, or QA profile must not silently execute temporal event retrieval just
+    # because its natural-language query contains words such as "then".
+    if resolved != "temporal":
+        events = (normalized,)
+        relation = "none"
+
+    resolved_expansion = expansion_plan or build_query_expansion_plan(
+        original,
+        provider=expansion_provider,
+        config=expansion_config,
+    )
+    accepted_paraphrases = tuple(
+        value.text
+        for value in resolved_expansion.accepted_variants
+        if value.type == "paraphrase"
+    )
+    retrieval_query = normalized
+    decomposition = resolved_expansion.decomposition
+    object_query = " ".join(decomposition.objects)
+    ocr_query = " ".join(decomposition.ocr_literals)
+    if decomposition.ocr_literals and "ocr" not in hints:
+        hints.append("ocr")
+        reasons.append("protected OCR literal")
+    if decomposition.objects and "objects" not in hints:
+        hints.append("objects")
+        reasons.append("decomposed object cue")
     modality_queries = (
         ("visual", retrieval_query),
         ("caption", retrieval_query),
-        ("objects", retrieval_query),
-        ("ocr", quoted_query if quoted_query and "ocr" in hints else retrieval_query),
-        ("asr", quoted_query if quoted_query and "asr" in hints else retrieval_query),
+        ("objects", object_query),
+        ("ocr", ocr_query),
     )
     return QueryPlan(
         original_query=original,
@@ -174,9 +193,10 @@ def build_query_plan(query: str, profile: str = "auto") -> QueryPlan:
         temporal_events=events,
         modality_hints=tuple(dict.fromkeys(hints)),
         quoted_phrases=quoted,
-        expansions=tuple(expansion_terms),
+        expansions=accepted_paraphrases,
         modality_queries=modality_queries,
         reasons=tuple(reasons),
+        expansion_plan=resolved_expansion,
     )
 
 

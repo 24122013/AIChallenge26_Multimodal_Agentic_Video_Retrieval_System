@@ -7,7 +7,11 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from backend.app.services.ingestion.caption_pipeline import DEFAULT_MODEL_NAME, run_caption_file
+from backend.app.services.ingestion.caption_pipeline import (
+    DEFAULT_MODEL_NAME,
+    DEFAULT_MODEL_REVISION,
+    run_caption_file,
+)
 from backend.app.services.ingestion.common import configure_logging, discover_files
 
 
@@ -18,8 +22,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-path", type=Path, help="Only valid for one input file.")
     parser.add_argument("--report-path", type=Path, help="Only valid for one input file.")
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
+    parser.add_argument("--model-revision", default=DEFAULT_MODEL_REVISION)
+    parser.add_argument("--model-cache-dir", type=Path, default=Path("data/model_cache/caption"))
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--max-new-tokens", type=int, default=384)
+    parser.add_argument(
+        "--dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default="auto",
+    )
+    parser.add_argument("--quantization", choices=("none", "8bit", "4bit"), default="none")
     parser.add_argument("--segment-caption", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -43,6 +56,11 @@ def main(argv: list[str] | None = None) -> int:
             overwrite=args.overwrite,
             include_segment_caption=args.segment_caption,
             model_name=args.model_name,
+            revision=args.model_revision,
+            model_cache_dir=args.model_cache_dir,
+            max_new_tokens=args.max_new_tokens,
+            dtype=args.dtype,
+            quantization=args.quantization,
         )
     return 0
 

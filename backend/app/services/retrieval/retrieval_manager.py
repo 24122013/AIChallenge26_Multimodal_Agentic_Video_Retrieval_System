@@ -13,7 +13,6 @@ from backend.app.services.retrieval.retrieval_config import (
     RetrievalRuntimeConfig,
     load_retrieval_runtime_config,
 )
-from backend.app.services.retrieval.search_asr import AsrSearchEngine
 from backend.app.services.retrieval.search_caption import CaptionSearchEngine
 from backend.app.services.retrieval.search_object import ObjectSearchEngine
 from backend.app.services.retrieval.search_ocr import OcrSearchEngine
@@ -113,11 +112,6 @@ def get_ocr_search_engine() -> OcrSearchEngine:
 
 
 @lru_cache(maxsize=1)
-def get_asr_search_engine() -> AsrSearchEngine:
-    return AsrSearchEngine(**_text_engine_kwargs())
-
-
-@lru_cache(maxsize=1)
 def get_object_search_engine() -> ObjectSearchEngine:
     return ObjectSearchEngine(**_text_engine_kwargs())
 
@@ -130,7 +124,6 @@ def get_hybrid_search_engine() -> HybridSearchEngine:
         text_engines = {
             "caption": get_caption_search_engine(),
             "ocr": get_ocr_search_engine(),
-            "asr": get_asr_search_engine(),
             "objects": get_object_search_engine(),
         }
     return HybridSearchEngine(
@@ -152,7 +145,6 @@ def clear_retrieval_caches() -> None:
         get_qa_evidence_search_engine,
         get_hybrid_search_engine,
         get_object_search_engine,
-        get_asr_search_engine,
         get_ocr_search_engine,
         get_caption_search_engine,
         get_visual_search_engine,
@@ -180,13 +172,6 @@ def search_ocr(
     top_k: int | None = None,
 ) -> VisualSearchResponse:
     return get_ocr_search_engine().search(query=query, top_k=top_k)
-
-
-def search_asr(
-    query: str,
-    top_k: int | None = None,
-) -> VisualSearchResponse:
-    return get_asr_search_engine().search(query=query, top_k=top_k)
 
 
 def search_object(

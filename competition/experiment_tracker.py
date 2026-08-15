@@ -107,7 +107,6 @@ def collect_local_metrics(
         "caption_video_count": "captions.jsonl",
         "ocr_video_count": "ocr.jsonl",
         "object_video_count": "objects.jsonl",
-        "asr_video_count": "asr.jsonl",
         "feature_manifest_count": "feature_manifest.json",
     }
     workspace_metrics: dict[str, object] = {
@@ -345,7 +344,6 @@ def _metric_rows(record: Mapping[str, object]) -> list[tuple[str, object]]:
         ("Caption videos", workspace.get("caption_video_count")),
         ("OCR videos", workspace.get("ocr_video_count")),
         ("Object videos", workspace.get("object_video_count")),
-        ("ASR videos", workspace.get("asr_video_count")),
         ("Complete feature manifests", workspace.get("feature_manifest_count")),
         ("Published videos", canonical.get("published_video_count")),
         ("Selected keyframes", canonical.get("selected_keyframe_count")),

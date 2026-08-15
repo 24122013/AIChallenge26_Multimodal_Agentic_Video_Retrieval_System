@@ -2,7 +2,7 @@
 
 This module deliberately contains only competition-specific orchestration:
 CSV contracts, artifact paths, multimodal stage wiring, VKIS frame refinement,
-and submission writing. Extraction, SigLIP2, FAISS, caption/OCR/object/ASR,
+and submission writing. Extraction, SigLIP2, FAISS, caption/OCR/object,
 segment/text indexing, hybrid reranking, and image MSE are delegated to the
 implementations already present under ``backend.app`` and ``src.indexing``.
 """
@@ -22,7 +22,7 @@ import time
 from dataclasses import asdict
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import cv2
 import numpy as np
@@ -75,24 +75,31 @@ from backend.app.services.indexing.normalize_keyframe_metadata import (
     mse,
 )
 from backend.app.services.indexing.validate_keyframes import validate_records
-from backend.app.services.ingestion.asr_pipeline import (
-    DEFAULT_MODEL_SIZE as DEFAULT_ASR_MODEL_SIZE,
-    WhisperBackend,
-    map_transcript_to_segments,
-    run_asr_file,
-)
 from backend.app.services.ingestion.caption_pipeline import (
     DEFAULT_MODEL_NAME as DEFAULT_CAPTION_MODEL_NAME,
-    BlipCaptionBackend,
+    DEFAULT_MODEL_REVISION as DEFAULT_CAPTION_MODEL_REVISION,
+    DEFAULT_PROMPT as DEFAULT_CAPTION_PROMPT,
+    QwenCaptionBackend,
     run_caption_file,
 )
 from backend.app.services.ingestion.object_pipeline import (
     DEFAULT_MODEL_NAME as DEFAULT_OBJECT_MODEL_NAME,
-    YoloBackend,
+    DEFAULT_MODEL_REVISION as DEFAULT_OBJECT_MODEL_REVISION,
+    DEFAULT_VOCABULARY as DEFAULT_OBJECT_VOCABULARY,
+    YoloEBackend,
     run_object_file,
 )
-from backend.app.services.ingestion.ocr_pipeline import EasyOcrBackend, run_ocr_file
+from backend.app.services.ingestion.ocr_pipeline import (
+    DEFAULT_DETECTION_MODEL as DEFAULT_OCR_DETECTION_MODEL,
+    DEFAULT_MODEL_REVISION as DEFAULT_OCR_MODEL_REVISION,
+    DEFAULT_RECOGNITION_MODEL as DEFAULT_OCR_RECOGNITION_MODEL,
+    PaddleOcrBackend,
+    run_ocr_file,
+)
 from backend.app.services.metadata.metadata_store import FrameRecord, MetadataStore
+from backend.app.services.agent.query_expansion import (
+    build_production_query_expansion_provider,
+)
 from backend.app.services.retrieval.hybrid_search import (
     HybridSearchConfig,
     HybridSearchEngine,
@@ -102,7 +109,6 @@ from backend.app.services.retrieval.retrieval_config import (
     DEFAULT_RETRIEVAL_CONFIG_PATH,
     load_retrieval_runtime_config,
 )
-from backend.app.services.retrieval.search_asr import AsrSearchEngine
 from backend.app.services.retrieval.search_caption import CaptionSearchEngine
 from backend.app.services.retrieval.search_object import ObjectSearchEngine
 from backend.app.services.retrieval.search_ocr import OcrSearchEngine
@@ -116,6 +122,7 @@ from backend.app.services.retrieval.advanced_search import (
     advanced_vector_search,
 )
 from backend.app.services.retrieval.advanced_rerank import AdvancedRankedFrame
+from backend.app.services.retrieval.query_plan import QueryPlan, build_query_plan
 from backend.app.services.retrieval.vlm_reranker import (
     DEFAULT_VLM_MODEL,
     VLM_MODES,
@@ -462,7 +469,6 @@ def _phase3_adapter_config(args: argparse.Namespace) -> FeatureAdapterConfig:
         object_min_confidence=args.object_event_min_confidence,
         transition_absolute_floor=args.transition_absolute_floor,
         transition_mad_multiplier=args.transition_mad_multiplier,
-        asr_event_min_quality=args.asr_protection_threshold,
     )
 
 
@@ -502,29 +508,30 @@ def _phase3_feature_config(
         },
         "caption": {
             "model_name": args.caption_model_name,
+            "model_revision": args.caption_model_revision,
             "batch_size": args.caption_batch_size,
+            "max_new_tokens": args.caption_max_new_tokens,
+            "dtype": args.caption_dtype,
+            "quantization": args.caption_quantization,
+            "prompt": DEFAULT_CAPTION_PROMPT,
             "segment_caption": not args.no_segment_caption,
         },
         "ocr": {
+            "detection_model": args.ocr_detection_model,
+            "recognition_model": args.ocr_recognition_model,
+            "model_revision": args.ocr_model_revision,
             "languages": ["vi", "en"],
             "batch_size": args.ocr_batch_size,
             "confidence_threshold": args.ocr_conf_threshold,
         },
         "objects": {
             "model_name": args.object_model_name,
+            "model_revision": args.object_model_revision,
+            "prompt_mode": args.object_prompt_mode,
+            "vocabulary": list(args.object_vocabulary),
             "batch_size": args.object_batch_size,
             "confidence_threshold": args.object_conf_threshold,
             "iou_threshold": args.object_iou_threshold,
-        },
-        "asr": {
-            "model_size": args.asr_model_size,
-            "backend": args.asr_backend,
-            "vad_filter": not args.no_vad,
-            "requested_device": resolved_device,
-            "timeout_seconds": args.asr_timeout_seconds,
-            "cpu_timeout_seconds": args.asr_cpu_timeout_seconds,
-            "retries": args.asr_retries,
-            "fallback_cpu": True,
         },
         "device": resolved_device,
     }
@@ -560,6 +567,95 @@ def _phase3_exact_frame_artifact(
     return True
 
 
+def _phase3_frame_artifact_failure_summary(
+    records: Sequence[Mapping[str, object]],
+    candidate_ids: Sequence[str],
+    *,
+    name: str,
+    path: Path,
+) -> str:
+    """Return compact, actionable diagnostics for a rejected hard modality."""
+
+    identities: list[str] = []
+    identity_errors = 0
+    for record in records:
+        try:
+            identities.append(_phase3_record_candidate_id(record))
+        except RuntimeError:
+            identity_errors += 1
+    expected = set(candidate_ids)
+    actual = set(identities)
+    error_records = [
+        record for record in records if record.get("status", "success") != "success"
+    ]
+    sample = ""
+    if error_records:
+        record = error_records[0]
+        candidate_id = record.get("candidate_id") or record.get("frame_id") or "unknown"
+        error = " ".join(str(record.get("error", "unspecified error")).split())
+        sample = f", first_error={candidate_id}: {error[:240]}"
+    return (
+        f"{name}(records={len(records)}, errors={len(error_records)}, "
+        f"missing={len(expected - actual)}, unexpected={len(actual - expected)}, "
+        f"duplicates={len(identities) - len(actual)}, invalid_ids={identity_errors}, "
+        f"path={path}{sample})"
+    )
+
+
+def _phase3_require_hard_feature_success(
+    *,
+    pipeline: str,
+    video: CorpusVideo,
+    report: Mapping[str, object],
+    report_path: Path,
+    allow_partial_features: bool,
+) -> None:
+    """Stop Phase 3 after the first failed hard-modality video."""
+
+    if allow_partial_features:
+        return
+    try:
+        error_count = int(report.get("error_count", 0))
+        input_count = int(report.get("input_record_count", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid {pipeline} report for {video.video_id}: {report_path}"
+        ) from exc
+    if error_count:
+        raise RuntimeError(
+            f"{pipeline} hard-feature extraction failed for {video.video_id}: "
+            f"{error_count}/{input_count} records failed; see {report_path}"
+        )
+
+
+def _phase3_require_modality_progress(
+    *,
+    pipeline: str,
+    video: CorpusVideo,
+    report: Mapping[str, object],
+    report_path: Path,
+    allow_partial_features: bool,
+) -> None:
+    """Stop a systematic backend failure before it repeats across the corpus."""
+
+    if allow_partial_features:
+        return
+    try:
+        input_count = int(report.get("input_record_count", 0))
+        skipped_count = int(report.get("skipped_count", 0))
+        error_count = int(report.get("error_count", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid {pipeline} report for {video.video_id}: {report_path}"
+        ) from exc
+    pending_count = input_count - skipped_count
+    if pending_count > 0 and error_count >= pending_count:
+        raise RuntimeError(
+            f"{pipeline} made no progress for {video.video_id}: all "
+            f"{pending_count} pending records failed; see {report_path}"
+        )
+
+
 def _phase3_artifact_entry(path: Path) -> dict[str, object]:
     return {
         "path": path.as_posix(),
@@ -584,9 +680,6 @@ def _phase3_load_and_validate_features(
         paths.captions,
         paths.ocr,
         paths.objects,
-        paths.asr,
-        paths.asr_segments,
-        paths.asr_report,
     )
     if any(not path.is_file() for path in required_paths):
         raise FileNotFoundError("one or more Phase 3 feature artifacts are missing")
@@ -606,7 +699,6 @@ def _phase3_load_and_validate_features(
     captions = read_phase3_jsonl(paths.captions)
     ocr = read_phase3_jsonl(paths.ocr)
     objects = read_phase3_jsonl(paths.objects)
-    asr = read_phase3_jsonl(paths.asr)
     caption_complete = _phase3_exact_frame_artifact(
         captions,
         candidate_ids,
@@ -627,21 +719,31 @@ def _phase3_load_and_validate_features(
     )
     if not caption_complete:
         raise RuntimeError("caption artifact identities do not match candidate pool")
-    asr_complete = bool(asr) and all(
-        record.get("video_id") == video.video_id
-        and record.get("status") in {"success", "skipped"}
-        and (
-            record.get("status") != "skipped"
-            or record.get("skip_reason") == "no_audio_stream"
-        )
-        for record in asr
-    )
-    if not asr_complete:
-        raise RuntimeError("ASR artifact is empty, failed, or belongs to another video")
     if (not ocr_complete or not object_complete) and not allow_partial_features:
+        failures = []
+        if not ocr_complete:
+            failures.append(
+                _phase3_frame_artifact_failure_summary(
+                    ocr,
+                    candidate_ids,
+                    name="ocr",
+                    path=paths.ocr,
+                )
+            )
+        if not object_complete:
+            failures.append(
+                _phase3_frame_artifact_failure_summary(
+                    objects,
+                    candidate_ids,
+                    name="objects",
+                    path=paths.objects,
+                )
+            )
         raise RuntimeError(
-            "OCR/object hard-feature extraction is incomplete; rerun Phase 3 or "
-            "use --allow-partial-features for an explicit degraded run"
+            f"Phase 3 hard-feature extraction is incomplete for {video.video_id}: "
+            + "; ".join(failures)
+            + "; rerun Phase 3 after fixing the reported backend error, or use "
+            "--allow-partial-features for an explicit degraded run"
         )
 
     hard_feature_complete = ocr_complete and object_complete
@@ -651,9 +753,6 @@ def _phase3_load_and_validate_features(
         "captions": paths.captions,
         "ocr": paths.ocr,
         "objects": paths.objects,
-        "asr": paths.asr,
-        "asr_segments": paths.asr_segments,
-        "asr_report": paths.asr_report,
     }
     artifacts = {
         name: _phase3_artifact_entry(path)
@@ -686,7 +785,6 @@ def _phase3_load_and_validate_features(
         "caption_records": captions,
         "ocr_records": ocr,
         "object_records": objects,
-        "asr_records": asr,
         "manifest": expected_manifest,
     }
 
@@ -712,7 +810,7 @@ def _phase3_siglip_artifacts_current(
 ) -> bool:
     """Validate the durable SigLIP2 sub-stage before reusing it.
 
-    The complete feature manifest is intentionally written only after ASR.  A
+    The complete feature manifest is written after all visual modalities.  A
     process-level CUDA/native crash during the earlier SigLIP2 sweep therefore
     needs this narrower checkpoint or every already-encoded video would be run
     again on resume.
@@ -825,255 +923,6 @@ def _phase3_frame_modality_artifacts_current(
     return True
 
 
-def _phase3_asr_artifacts_current(
-    *,
-    video: CorpusVideo,
-    video_path: Path,
-    paths: Phase3WorkspacePaths,
-    feature_config: Mapping[str, object],
-    require_policy: bool = True,
-) -> bool:
-    required = (paths.asr, paths.asr_segments, paths.asr_report)
-    if any(not path.is_file() for path in required):
-        return False
-    asr_config = feature_config.get("asr")
-    if not isinstance(asr_config, Mapping):
-        return False
-    try:
-        records = read_phase3_jsonl(paths.asr)
-        segment_records = read_phase3_jsonl(paths.asr_segments)
-        report = read_phase3_json(paths.asr_report)
-    except (OSError, UnicodeError, ValueError):
-        return False
-    if not records or any(
-        record.get("video_id") != video.video_id
-        or record.get("status") not in {"success", "skipped"}
-        or (
-            record.get("status") == "skipped"
-            and record.get("skip_reason") != "no_audio_stream"
-        )
-        for record in records
-    ):
-        return False
-    if any(record.get("video_id") != video.video_id for record in segment_records):
-        return False
-    expected_report = {
-        "pipeline": "asr",
-        "input_record_count": 1,
-        "error_count": 0,
-        "model_size": asr_config.get("model_size"),
-        "backend": asr_config.get("backend"),
-        "vad_filter": asr_config.get("vad_filter"),
-    }
-    if any(report.get(key) != value for key, value in expected_report.items()):
-        return False
-    if not _phase3_path_matches(report.get("input_path"), video_path):
-        return False
-    if not _phase3_path_matches(report.get("output_path"), paths.asr):
-        return False
-    if not _phase3_path_matches(report.get("segments_output_path"), paths.asr_segments):
-        return False
-    if not _phase3_path_matches(report.get("metadata_path"), paths.candidate_metadata):
-        return False
-    if report.get("device") not in {"cuda", "cpu"}:
-        return False
-    if require_policy and report.get("phase3_asr_policy") != dict(asr_config):
-        return False
-    return True
-
-
-def _phase3_asr_worker_command(
-    *,
-    video_path: Path,
-    paths: Phase3WorkspacePaths,
-    device: str,
-    asr_config: Mapping[str, object],
-    model_cache_dir: Path,
-) -> list[str]:
-    command = [
-        sys.executable,
-        "-m",
-        "competition.asr_worker",
-        "--video-path",
-        str(video_path),
-        "--metadata-path",
-        str(paths.candidate_metadata),
-        "--output-path",
-        str(paths.asr),
-        "--segments-output-path",
-        str(paths.asr_segments),
-        "--report-path",
-        str(paths.asr_report),
-        "--model-cache-dir",
-        str(model_cache_dir),
-        "--device",
-        device,
-        "--model-size",
-        str(asr_config["model_size"]),
-        "--backend",
-        str(asr_config["backend"]),
-    ]
-    if asr_config.get("vad_filter") is False:
-        command.append("--no-vad")
-    return command
-
-
-def _phase3_terminate_worker(process: subprocess.Popen[object]) -> None:
-    if process.poll() is not None:
-        return
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    else:
-        process.terminate()
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-
-
-def _phase3_run_asr_worker(
-    command: Sequence[str],
-    *,
-    timeout_seconds: float,
-) -> dict[str, object]:
-    process = subprocess.Popen(command, cwd=Path(__file__).resolve().parents[1])
-    try:
-        return {
-            "return_code": process.wait(timeout=timeout_seconds),
-            "timed_out": False,
-        }
-    except subprocess.TimeoutExpired:
-        _phase3_terminate_worker(process)
-        return {"return_code": None, "timed_out": True}
-
-
-def _phase3_asr_error_detail(paths: Phase3WorkspacePaths) -> str | None:
-    if not paths.asr.is_file():
-        return None
-    try:
-        records = read_phase3_jsonl(paths.asr)
-    except (OSError, UnicodeError, ValueError):
-        return None
-    errors = [
-        str(record.get("error"))
-        for record in records
-        if record.get("status") == "error" and record.get("error")
-    ]
-    return "; ".join(errors) if errors else None
-
-
-def _phase3_run_asr_video(
-    *,
-    video: CorpusVideo,
-    video_path: Path,
-    paths: Phase3WorkspacePaths,
-    feature_config: Mapping[str, object],
-    model_cache_dir: Path,
-    preferred_device: str,
-) -> tuple[dict[str, object], bool]:
-    asr_config = feature_config.get("asr")
-    if not isinstance(asr_config, Mapping):
-        raise RuntimeError("Phase 3 ASR config is missing")
-    retries = int(asr_config["retries"])
-    attempts: list[dict[str, object]] = []
-    gpu_unavailable = False
-    device_plan = [preferred_device]
-    if preferred_device == "cuda" and asr_config.get("fallback_cpu") is True:
-        device_plan.append("cpu")
-
-    for device in device_plan:
-        attempt_count = retries + 1 if device == preferred_device else 1
-        timeout = float(
-            asr_config[
-                "cpu_timeout_seconds" if device == "cpu" else "timeout_seconds"
-            ]
-        )
-        for retry_index in range(attempt_count):
-            print(
-                f"[asr-worker] {video.filename} device={device} "
-                f"attempt={retry_index + 1}/{attempt_count} timeout={timeout:g}s",
-                flush=True,
-            )
-            command = _phase3_asr_worker_command(
-                video_path=video_path,
-                paths=paths,
-                device=device,
-                asr_config=asr_config,
-                model_cache_dir=model_cache_dir,
-            )
-            for stale_path in (paths.asr, paths.asr_segments, paths.asr_report):
-                stale_path.unlink(missing_ok=True)
-            outcome = _phase3_run_asr_worker(command, timeout_seconds=timeout)
-            detail = _phase3_asr_error_detail(paths)
-            success = (
-                outcome["return_code"] == 0
-                and _phase3_asr_artifacts_current(
-                    video=video,
-                    video_path=video_path,
-                    paths=paths,
-                    feature_config=feature_config,
-                    require_policy=False,
-                )
-            )
-            attempts.append(
-                {
-                    "device": device,
-                    "attempt": retry_index + 1,
-                    "timeout_seconds": timeout,
-                    "timed_out": outcome["timed_out"],
-                    "return_code": outcome["return_code"],
-                    "status": "success" if success else "failed",
-                    "error": detail,
-                }
-            )
-            if success:
-                report = read_phase3_json(paths.asr_report)
-                report.update(
-                    {
-                        "phase3_asr_policy": dict(asr_config),
-                        "phase3_asr_attempts": attempts,
-                        "phase3_asr_execution_device": device,
-                        "phase3_asr_fallback_used": (
-                            device != asr_config.get("requested_device")
-                        ),
-                    }
-                )
-                atomic_write_json(paths.asr_report, report)
-                if not _phase3_asr_artifacts_current(
-                    video=video,
-                    video_path=video_path,
-                    paths=paths,
-                    feature_config=feature_config,
-                    require_policy=True,
-                ):
-                    raise RuntimeError(
-                        f"ASR checkpoint validation failed for {video.video_id}"
-                    )
-                return report, gpu_unavailable
-            lowered = (detail or "").lower()
-            if device == "cuda" and (
-                "cublas" in lowered or "cudnn" in lowered or "cuda driver" in lowered
-            ):
-                gpu_unavailable = True
-                print(
-                    f"[asr-worker] CUDA runtime unavailable for {video.filename}; "
-                    "falling back to CPU.",
-                    flush=True,
-                )
-                break
-
-    raise RuntimeError(
-        f"ASR failed for {video.video_id} after isolated retry/fallback attempts: "
-        f"{attempts}"
-    )
-
-
 def _phase3_release_model_memory(*owners: object) -> None:
     """Best-effort release between heavyweight Phase 3 modalities."""
 
@@ -1085,7 +934,7 @@ def _phase3_release_model_memory(*owners: object) -> None:
                 owner.to("cpu")
             except Exception:  # noqa: BLE001 - cleanup must not hide stage errors.
                 pass
-        for attribute in ("_model", "_reader", "_processor"):
+        for attribute in ("_model", "_reader", "_processor", "_pipeline"):
             if not hasattr(owner, attribute):
                 continue
             value = getattr(owner, attribute, None)
@@ -1106,6 +955,12 @@ def _phase3_release_model_memory(*owners: object) -> None:
             torch.cuda.empty_cache()
     except ImportError:  # pragma: no cover - SigLIP already requires torch in production.
         pass
+    paddle = sys.modules.get("paddle")
+    if paddle is not None:
+        try:
+            paddle.device.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - CPU builds and old Paddle releases may differ.
+            pass
 
 
 def _sha256_file(path: Path) -> str:
@@ -1822,7 +1677,7 @@ def _keyframe_metadata_path(output_root: Path, video: CorpusVideo) -> Path:
 
 
 def enrich_command(args: argparse.Namespace) -> None:
-    """Run the four existing multimodal ingestion pipelines over the corpus."""
+    """Run caption, OCR, and object ingestion over the corpus."""
     corpus = load_corpus(args.public_root)
     metadata_dir = args.output_root / "metadata"
     resolved_device = choose_device(args.device)
@@ -1835,11 +1690,15 @@ def enrich_command(args: argparse.Namespace) -> None:
             )
 
     if "caption" in args.modalities:
-        print("[caption] loading one shared BLIP backend for the corpus")
-        backend = BlipCaptionBackend(
+        print("[caption] loading one shared Qwen multimodal backend for the corpus")
+        backend = QwenCaptionBackend(
             model_name=args.caption_model_name,
+            revision=args.caption_model_revision,
             device=resolved_device,
             cache_dir=args.model_cache_root / "caption",
+            max_new_tokens=args.caption_max_new_tokens,
+            dtype=args.caption_dtype,
+            quantization=args.caption_quantization,
         )
         for number, video in enumerate(corpus, start=1):
             print(f"[caption {number}/{len(corpus)}] {video.filename}")
@@ -1852,11 +1711,22 @@ def enrich_command(args: argparse.Namespace) -> None:
                 include_segment_caption=not args.no_segment_caption,
                 backend=backend,
                 model_name=args.caption_model_name,
+                revision=args.caption_model_revision,
+                max_new_tokens=args.caption_max_new_tokens,
+                dtype=args.caption_dtype,
+                quantization=args.caption_quantization,
+                model_cache_dir=args.model_cache_root / "caption",
             )
 
     if "ocr" in args.modalities:
-        print("[ocr] loading one shared EasyOCR backend for the corpus")
-        backend = EasyOcrBackend(device=resolved_device, languages=("vi", "en"))
+        print("[ocr] loading one shared PP-OCRv5 backend for the corpus")
+        backend = PaddleOcrBackend(
+            device=resolved_device,
+            detection_model=args.ocr_detection_model,
+            recognition_model=args.ocr_recognition_model,
+            revision=args.ocr_model_revision,
+            cache_dir=args.model_cache_root / "ocr",
+        )
         for number, video in enumerate(corpus, start=1):
             print(f"[ocr {number}/{len(corpus)}] {video.filename}")
             run_ocr_file(
@@ -1867,17 +1737,24 @@ def enrich_command(args: argparse.Namespace) -> None:
                 conf_threshold=args.ocr_conf_threshold,
                 overwrite=args.overwrite,
                 backend=backend,
+                detection_model=args.ocr_detection_model,
+                recognition_model=args.ocr_recognition_model,
+                revision=args.ocr_model_revision,
+                model_cache_dir=args.model_cache_root / "ocr",
             )
 
     if "objects" in args.modalities:
-        print("[objects] loading one shared YOLO backend for the corpus")
+        print("[objects] loading one shared YOLOE backend for the corpus")
         object_cache = args.model_cache_root / "objects"
-        backend = YoloBackend(
+        backend = YoloEBackend(
             model_name=args.object_model_name,
+            revision=args.object_model_revision,
             device=resolved_device,
             conf_threshold=args.object_conf_threshold,
             iou_threshold=args.object_iou_threshold,
             cache_dir=object_cache,
+            vocabulary=args.object_vocabulary,
+            prompt_mode=args.object_prompt_mode,
         )
         for number, video in enumerate(corpus, start=1):
             print(f"[objects {number}/{len(corpus)}] {video.filename}")
@@ -1891,32 +1768,11 @@ def enrich_command(args: argparse.Namespace) -> None:
                 overwrite=args.overwrite,
                 backend=backend,
                 model_name=args.object_model_name,
+                revision=args.object_model_revision,
                 model_cache_dir=object_cache,
+                vocabulary=args.object_vocabulary,
+                prompt_mode=args.object_prompt_mode,
             )
-
-    if "asr" in args.modalities:
-        print("[asr] loading one shared Whisper backend for videos with audio")
-        backend = WhisperBackend(
-            model_size=args.asr_model_size,
-            device=resolved_device,
-            backend=args.asr_backend,
-            cache_dir=args.model_cache_root / "asr",
-            vad_filter=not args.no_vad,
-        )
-        for number, video in enumerate(corpus, start=1):
-            print(f"[asr {number}/{len(corpus)}] {video.filename}")
-            run_asr_file(
-                args.public_root / video.relative_path,
-                metadata_path=_keyframe_metadata_path(args.output_root, video),
-                output_dir=metadata_dir,
-                device=resolved_device,
-                model_size=args.asr_model_size,
-                backend_name=args.asr_backend,
-                overwrite=args.overwrite,
-                vad_filter=not args.no_vad,
-                backend=backend,
-            )
-
 
 def _phase3_generate_features(
     args: argparse.Namespace,
@@ -2037,8 +1893,12 @@ def _phase3_generate_features(
             pipeline="caption",
             expected_report={
                 "model_name": args.caption_model_name,
+                "requested_model_revision": args.caption_model_revision,
                 "device": resolved_device,
                 "batch_size": args.caption_batch_size,
+                "max_new_tokens": args.caption_max_new_tokens,
+                "dtype": args.caption_dtype,
+                "quantization": args.caption_quantization,
                 "segment_caption_enabled": not args.no_segment_caption,
             },
             require_success=False,
@@ -2051,11 +1911,15 @@ def _phase3_generate_features(
         else:
             caption_pending.append((video, paths, contract))
     if caption_pending:
-        print("[caption] loading one shared BLIP backend")
-        caption_backend = BlipCaptionBackend(
+        print("[caption] loading one shared Qwen multimodal backend")
+        caption_backend = QwenCaptionBackend(
             model_name=args.caption_model_name,
+            revision=args.caption_model_revision,
             device=resolved_device,
             cache_dir=args.model_cache_root / "caption",
+            max_new_tokens=args.caption_max_new_tokens,
+            dtype=args.caption_dtype,
+            quantization=args.caption_quantization,
         )
         try:
             for number, (video, paths, _contract) in enumerate(
@@ -2063,7 +1927,7 @@ def _phase3_generate_features(
                 start=1,
             ):
                 print(f"[caption {number}/{len(caption_pending)}] {video.filename}")
-                run_caption_file(
+                caption_report = run_caption_file(
                     paths.candidate_metadata,
                     output_path=paths.captions,
                     report_path=paths.caption_report,
@@ -2073,6 +1937,18 @@ def _phase3_generate_features(
                     include_segment_caption=not args.no_segment_caption,
                     backend=caption_backend,
                     model_name=args.caption_model_name,
+                    revision=args.caption_model_revision,
+                    max_new_tokens=args.caption_max_new_tokens,
+                    dtype=args.caption_dtype,
+                    quantization=args.caption_quantization,
+                    model_cache_dir=args.model_cache_root / "caption",
+                )
+                _phase3_require_modality_progress(
+                    pipeline="caption",
+                    video=video,
+                    report=caption_report,
+                    report_path=paths.caption_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(caption_backend)
@@ -2091,9 +1967,15 @@ def _phase3_generate_features(
             report_path=paths.ocr_report,
             pipeline="ocr",
             expected_report={
+                "model_name": (
+                    f"{args.ocr_detection_model}+{args.ocr_recognition_model}"
+                ),
+                "model_revision": args.ocr_model_revision,
                 "device": resolved_device,
                 "batch_size": args.ocr_batch_size,
                 "confidence_threshold": args.ocr_conf_threshold,
+                "detection_model": args.ocr_detection_model,
+                "recognition_model": args.ocr_recognition_model,
             },
             require_success=not args.allow_partial_features,
         )
@@ -2105,12 +1987,18 @@ def _phase3_generate_features(
         else:
             ocr_pending.append((video, paths, contract))
     if ocr_pending:
-        print("[ocr] loading one shared EasyOCR backend")
-        ocr_backend = EasyOcrBackend(device=resolved_device, languages=("vi", "en"))
+        print("[ocr] loading one shared PP-OCRv5 backend")
+        ocr_backend = PaddleOcrBackend(
+            device=resolved_device,
+            detection_model=args.ocr_detection_model,
+            recognition_model=args.ocr_recognition_model,
+            revision=args.ocr_model_revision,
+            cache_dir=args.model_cache_root / "ocr",
+        )
         try:
             for number, (video, paths, _contract) in enumerate(ocr_pending, start=1):
                 print(f"[ocr {number}/{len(ocr_pending)}] {video.filename}")
-                run_ocr_file(
+                ocr_report = run_ocr_file(
                     paths.candidate_metadata,
                     output_path=paths.ocr,
                     report_path=paths.ocr_report,
@@ -2119,6 +2007,17 @@ def _phase3_generate_features(
                     conf_threshold=args.ocr_conf_threshold,
                     overwrite=True,
                     backend=ocr_backend,
+                    detection_model=args.ocr_detection_model,
+                    recognition_model=args.ocr_recognition_model,
+                    revision=args.ocr_model_revision,
+                    model_cache_dir=args.model_cache_root / "ocr",
+                )
+                _phase3_require_hard_feature_success(
+                    pipeline="OCR",
+                    video=video,
+                    report=ocr_report,
+                    report_path=paths.ocr_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(ocr_backend)
@@ -2138,10 +2037,14 @@ def _phase3_generate_features(
             pipeline="objects",
             expected_report={
                 "model_name": args.object_model_name,
+                "model_revision": args.object_model_revision,
                 "device": resolved_device,
                 "batch_size": args.object_batch_size,
                 "confidence_threshold": args.object_conf_threshold,
                 "iou_threshold": args.object_iou_threshold,
+                "open_vocabulary_mode": args.object_prompt_mode,
+                "vocabulary": list(args.object_vocabulary),
+                "evidence_only": True,
             },
             require_success=not args.allow_partial_features,
         )
@@ -2153,19 +2056,22 @@ def _phase3_generate_features(
         else:
             object_pending.append((video, paths, contract))
     if object_pending:
-        print("[objects] loading one shared YOLO backend")
+        print("[objects] loading one shared YOLOE open-vocabulary backend")
         object_cache = args.model_cache_root / "objects"
-        object_backend = YoloBackend(
+        object_backend = YoloEBackend(
             model_name=args.object_model_name,
+            revision=args.object_model_revision,
             device=resolved_device,
             conf_threshold=args.object_conf_threshold,
             iou_threshold=args.object_iou_threshold,
             cache_dir=object_cache,
+            vocabulary=args.object_vocabulary,
+            prompt_mode=args.object_prompt_mode,
         )
         try:
             for number, (video, paths, _contract) in enumerate(object_pending, start=1):
                 print(f"[objects {number}/{len(object_pending)}] {video.filename}")
-                run_object_file(
+                object_report = run_object_file(
                     paths.candidate_metadata,
                     output_path=paths.objects,
                     report_path=paths.object_report,
@@ -2176,45 +2082,24 @@ def _phase3_generate_features(
                     overwrite=True,
                     backend=object_backend,
                     model_name=args.object_model_name,
+                    revision=args.object_model_revision,
                     model_cache_dir=object_cache,
+                    vocabulary=args.object_vocabulary,
+                    prompt_mode=args.object_prompt_mode,
+                )
+                _phase3_require_hard_feature_success(
+                    pipeline="object detection",
+                    video=video,
+                    report=object_report,
+                    report_path=paths.object_report,
+                    allow_partial_features=args.allow_partial_features,
                 )
         finally:
             _phase3_release_model_memory(object_backend)
             del object_backend
 
-    print("[asr] using isolated per-video workers with timeout and CPU fallback")
-    by_video_id = {video.video_id: video for video in corpus}
-    asr_preferred_device = resolved_device
-    for number, (video, paths, candidate_contract) in enumerate(pending, start=1):
-        if by_video_id.get(video.video_id) != video:
-            raise RuntimeError(f"Duplicate or inconsistent corpus video: {video.video_id}")
-        video_path = args.public_root / video.relative_path
-        current = args.resume and _phase3_asr_artifacts_current(
-            video=video,
-            video_path=video_path,
-            paths=paths,
-            feature_config=feature_config,
-            require_policy=True,
-        )
-        if current:
-            print(
-                f"[asr {number}/{len(pending)}] skip {video.filename}: "
-                "exact checkpoint passed"
-            )
-        else:
-            print(f"[asr {number}/{len(pending)}] {video.filename}")
-            _report, gpu_unavailable = _phase3_run_asr_video(
-                video=video,
-                video_path=video_path,
-                paths=paths,
-                feature_config=feature_config,
-                model_cache_dir=args.model_cache_root / "asr",
-                preferred_device=asr_preferred_device,
-            )
-            if gpu_unavailable:
-                asr_preferred_device = "cpu"
-        # Commit a full manifest immediately after this video's exact ASR
-        # checkpoint passes.  A later interruption then skips every modality.
+    for video, paths, candidate_contract in pending:
+        # Commit a full manifest after every configured visual modality passes.
         candidate_report, candidate_records = validate_candidate_pool(
             paths=paths,
             expected_contract=candidate_contract,
@@ -2393,7 +2278,6 @@ def _phase3_publish_video(
         ocr_records=features["ocr_records"],
         object_records=features["object_records"],
         caption_records=features["caption_records"],
-        asr_records=features["asr_records"],
         video_duration=video.frame_count / video.fps,
         selection_config=selection_config,
         adapter_config=adapter_config,
@@ -2426,16 +2310,6 @@ def _phase3_publish_video(
         result.final_caption_records,
         final_records,
     )
-    final_asr = [dict(record) for record in result.final_asr_records]
-    transcript = [
-        record
-        for record in final_asr
-        if record.get("status", "success") == "success"
-        and isinstance(record.get("start"), (int, float))
-        and isinstance(record.get("end"), (int, float))
-    ]
-    final_asr_segments = map_transcript_to_segments(final_records, transcript)
-
     atomic_write_jsonl(paths.candidate_scores, result.candidate_ledger)
     atomic_write_jsonl(paths.protected_events, result.event_ledger)
 
@@ -2457,8 +2331,6 @@ def _phase3_publish_video(
     caption_path = metadata_dir / f"captions_{video.video_id}.jsonl"
     ocr_path = metadata_dir / f"ocr_{video.video_id}.jsonl"
     object_path = metadata_dir / f"objects_{video.video_id}.jsonl"
-    asr_path = metadata_dir / f"asr_{video.video_id}.jsonl"
-    asr_segments_path = metadata_dir / f"asr_segments_{video.video_id}.jsonl"
     phase3_manifest_path = (
         metadata_dir / f"keyframes_{video.video_id}_phase3_manifest.json"
     )
@@ -2477,8 +2349,6 @@ def _phase3_publish_video(
     atomic_write_jsonl(caption_path, final_captions)
     atomic_write_jsonl(ocr_path, final_ocr)
     atomic_write_jsonl(object_path, final_objects)
-    atomic_write_jsonl(asr_path, final_asr)
-    atomic_write_jsonl(asr_segments_path, final_asr_segments)
     atomic_write_jsonl(candidate_scores_path, result.candidate_ledger)
     atomic_write_jsonl(protected_events_path, result.event_ledger)
 
@@ -2582,8 +2452,6 @@ def _phase3_publish_video(
         "captions": _phase3_artifact_entry(caption_path),
         "ocr": _phase3_artifact_entry(ocr_path),
         "objects": _phase3_artifact_entry(object_path),
-        "asr": _phase3_artifact_entry(asr_path),
-        "asr_segments": _phase3_artifact_entry(asr_segments_path),
         "candidate_scores": _phase3_artifact_entry(candidate_scores_path),
         "protected_events": _phase3_artifact_entry(protected_events_path),
     }
@@ -2946,7 +2814,7 @@ def _require_multimodal_artifacts(
 ) -> dict[str, Path]:
     missing: list[Path] = []
     artifacts: dict[str, Path] = {}
-    prefixes = ("captions", "ocr", "objects", "asr")
+    prefixes = ("captions", "ocr", "objects")
     for video in corpus:
         for prefix in prefixes:
             path = metadata_dir / f"{prefix}_{video.video_id}.jsonl"
@@ -3072,7 +2940,6 @@ def segments_command(args: argparse.Namespace) -> None:
         paths["segments"],
         captions_path=metadata_dir,
         ocr_path=metadata_dir,
-        asr_path=metadata_dir,
         objects_path=metadata_dir,
         strategy=args.strategy,
         fixed_duration_seconds=args.fixed_duration_seconds,
@@ -3162,7 +3029,6 @@ def text_index_command(args: argparse.Namespace) -> None:
         config={"text_index_version": TEXT_INDEX_VERSION, "modalities": [
             "caption",
             "ocr",
-            "asr",
             "objects",
         ]},
     )
@@ -3598,7 +3464,7 @@ def build_competition_hybrid_engine(
     retrieval_config_path: Path,
     search_depth: int,
 ) -> HybridSearchEngine:
-    """Build the same visual+caption+OCR+ASR+object retrieval stack as the repo."""
+    """Build the visual+caption+OCR+object retrieval stack."""
     if not text_index_path.exists():
         raise FileNotFoundError(
             f"Competition text index not found: {text_index_path}; "
@@ -3618,12 +3484,6 @@ def build_competition_hybrid_engine(
             searcher=shared_searcher,
         ),
         "ocr": OcrSearchEngine(
-            text_index_path,
-            default_top_k=text_top_k,
-            max_top_k=text_top_k,
-            searcher=shared_searcher,
-        ),
-        "asr": AsrSearchEngine(
             text_index_path,
             default_top_k=text_top_k,
             max_top_k=text_top_k,
@@ -3790,6 +3650,46 @@ def promote_run_command(args: argparse.Namespace) -> None:
     print(json.dumps(active, ensure_ascii=False, indent=2))
 
 
+def precompute_tkis_query_plans(
+    questions: Sequence[Question],
+    *,
+    profile: str,
+    expansion_config,
+    device: str,
+    cache_dir: Path,
+    model_cache_dir: Path,
+    local_files_only: bool,
+    provider_factory: Callable[..., object] | None = None,
+) -> dict[str, QueryPlan]:
+    """Expand TKIS queries once before SigLIP allocation; VKIS never calls it."""
+    tkis_questions = [question for question in questions if question.task == "TKIS"]
+    if not tkis_questions:
+        return {}
+    factory = provider_factory or build_production_query_expansion_provider
+    provider = None
+    if expansion_config.enabled:
+        provider = factory(
+            config=expansion_config,
+            device=device,
+            cache_dir=cache_dir,
+            model_cache_dir=model_cache_dir,
+            local_files_only=local_files_only,
+        )
+    try:
+        return {
+            question.query_id: build_query_plan(
+                question.text,
+                profile=profile,
+                expansion_provider=provider,
+                expansion_config=expansion_config,
+            )
+            for question in tkis_questions
+        }
+    finally:
+        if provider is not None:
+            provider.close()
+
+
 def predict_command(args: argparse.Namespace) -> None:
     public_root = args.public_root.resolve()
     output_root = args.output_root.resolve()
@@ -3816,6 +3716,7 @@ def predict_command(args: argparse.Namespace) -> None:
     columns = submission_columns(public_root)
     paths = competition_index_paths(output_root)
     runtime = load_retrieval_runtime_config(args.retrieval_config)
+    resolved_device = choose_device(args.device)
 
     _require_current_index_lineage(
         corpus=corpus,
@@ -3828,8 +3729,27 @@ def predict_command(args: argparse.Namespace) -> None:
         public_root=public_root,
         output_root=output_root,
     )
+    query_plans: dict[str, QueryPlan] = {}
+    if advanced_mode:
+        expansion_config = replace(
+            runtime.query_expansion,
+            enabled=(
+                runtime.query_expansion.enabled
+                and not args.no_query_expansion
+                and not args.no_query_plan
+            ),
+        )
+        query_plans = precompute_tkis_query_plans(
+            questions,
+            profile=args.retrieval_profile,
+            expansion_config=expansion_config,
+            device=resolved_device,
+            cache_dir=args.query_expansion_cache_dir,
+            model_cache_dir=args.query_expansion_model_cache_dir,
+            local_files_only=args.offline_model_cache,
+        )
+        gc.collect()
     contract = load_encoder_contract(paths["manifest"])
-    resolved_device = choose_device(args.device)
     model, processor = load_siglip2_model_processor(
         model_name=contract.model_name,
         model_revision=contract.model_revision,
@@ -3921,6 +3841,7 @@ def predict_command(args: argparse.Namespace) -> None:
             dense_rescue_enabled=not args.no_dense_rescue,
             cses_enabled=not args.no_cses,
             deterministic_rerank_enabled=not args.no_deterministic_rerank,
+            query_expansion=expansion_config,
         )
 
     predictions: dict[str, list[str]] = {}
@@ -3947,6 +3868,7 @@ def predict_command(args: argparse.Namespace) -> None:
                     dense_index=dense_index,
                     profile=args.retrieval_profile,
                     config=advanced_config,
+                    plan=query_plans[question.query_id],
                 )
             else:
                 vector = vkis_vectors.get(question.query_id)
@@ -4288,45 +4210,47 @@ def _add_phase3_keyframe_arguments(parser: argparse.ArgumentParser) -> None:
         default=Path("data/model_cache"),
     )
     parser.add_argument("--caption-model-name", default=DEFAULT_CAPTION_MODEL_NAME)
-    parser.add_argument("--caption-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--caption-model-revision",
+        default=DEFAULT_CAPTION_MODEL_REVISION,
+    )
+    parser.add_argument("--caption-batch-size", type=int, default=2)
+    parser.add_argument("--caption-max-new-tokens", type=int, default=384)
+    parser.add_argument(
+        "--caption-dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--caption-quantization",
+        choices=("none", "8bit", "4bit"),
+        default="none",
+    )
     parser.add_argument("--no-segment-caption", action="store_true")
+    parser.add_argument("--ocr-detection-model", default=DEFAULT_OCR_DETECTION_MODEL)
+    parser.add_argument("--ocr-recognition-model", default=DEFAULT_OCR_RECOGNITION_MODEL)
+    parser.add_argument("--ocr-model-revision", default=DEFAULT_OCR_MODEL_REVISION)
     parser.add_argument("--ocr-batch-size", type=int, default=4)
     parser.add_argument("--ocr-conf-threshold", type=float, default=0.3)
     parser.add_argument("--object-model-name", default=DEFAULT_OBJECT_MODEL_NAME)
+    parser.add_argument("--object-model-revision", default=DEFAULT_OBJECT_MODEL_REVISION)
     parser.add_argument("--object-batch-size", type=int, default=8)
     parser.add_argument("--object-conf-threshold", type=float, default=0.25)
     parser.add_argument("--object-iou-threshold", type=float, default=0.7)
-    parser.add_argument("--asr-model-size", default=DEFAULT_ASR_MODEL_SIZE)
     parser.add_argument(
-        "--asr-backend",
-        choices=("auto", "faster-whisper", "whisper"),
-        default="auto",
-    )
-    parser.add_argument("--no-vad", action="store_true")
-    parser.add_argument(
-        "--asr-timeout-seconds",
-        type=float,
-        default=90.0,
-        help="GPU ASR timeout for one video before retry/fallback (default: 90).",
+        "--object-prompt-mode",
+        choices=("text", "internal"),
+        default="text",
     )
     parser.add_argument(
-        "--asr-cpu-timeout-seconds",
-        type=float,
-        default=600.0,
-        help="CPU fallback timeout for one video (default: 600).",
+        "--object-vocabulary",
+        nargs="+",
+        default=list(DEFAULT_OBJECT_VOCABULARY),
     )
-    parser.add_argument(
-        "--asr-retries",
-        type=int,
-        default=1,
-        help="Additional ASR attempts on the preferred device (default: 1).",
-    )
-
     parser.add_argument("--ocr-event-min-confidence", type=float, default=0.75)
     parser.add_argument("--object-event-min-confidence", type=float, default=0.65)
     parser.add_argument("--transition-absolute-floor", type=float, default=0.18)
     parser.add_argument("--transition-mad-multiplier", type=float, default=2.5)
-    parser.add_argument("--asr-protection-threshold", type=float, default=0.80)
     parser.add_argument(
         "--allow-partial-features",
         action="store_true",
@@ -4500,14 +4424,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     enrich_parser = subparsers.add_parser(
         "enrich",
-        description="Run caption, OCR, object, and ASR ingestion from the original system.",
+        description="Run Qwen caption, PP-OCRv5, and YOLOE object ingestion.",
     )
     _add_common_paths(enrich_parser)
     enrich_parser.add_argument(
         "--modalities",
         nargs="+",
-        choices=("caption", "ocr", "objects", "asr"),
-        default=["caption", "ocr", "objects", "asr"],
+        choices=("caption", "ocr", "objects"),
+        default=["caption", "ocr", "objects"],
     )
     enrich_parser.add_argument(
         "--device",
@@ -4523,24 +4447,58 @@ def build_parser() -> argparse.ArgumentParser:
         "--caption-model-name",
         default=DEFAULT_CAPTION_MODEL_NAME,
     )
-    enrich_parser.add_argument("--caption-batch-size", type=int, default=4)
+    enrich_parser.add_argument(
+        "--caption-model-revision",
+        default=DEFAULT_CAPTION_MODEL_REVISION,
+    )
+    enrich_parser.add_argument("--caption-batch-size", type=int, default=2)
+    enrich_parser.add_argument("--caption-max-new-tokens", type=int, default=384)
+    enrich_parser.add_argument(
+        "--caption-dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default="auto",
+    )
+    enrich_parser.add_argument(
+        "--caption-quantization",
+        choices=("none", "8bit", "4bit"),
+        default="none",
+    )
     enrich_parser.add_argument("--no-segment-caption", action="store_true")
+    enrich_parser.add_argument(
+        "--ocr-detection-model",
+        default=DEFAULT_OCR_DETECTION_MODEL,
+    )
+    enrich_parser.add_argument(
+        "--ocr-recognition-model",
+        default=DEFAULT_OCR_RECOGNITION_MODEL,
+    )
+    enrich_parser.add_argument(
+        "--ocr-model-revision",
+        default=DEFAULT_OCR_MODEL_REVISION,
+    )
     enrich_parser.add_argument("--ocr-batch-size", type=int, default=4)
     enrich_parser.add_argument("--ocr-conf-threshold", type=float, default=0.3)
     enrich_parser.add_argument(
         "--object-model-name",
         default=DEFAULT_OBJECT_MODEL_NAME,
     )
+    enrich_parser.add_argument(
+        "--object-model-revision",
+        default=DEFAULT_OBJECT_MODEL_REVISION,
+    )
     enrich_parser.add_argument("--object-batch-size", type=int, default=8)
     enrich_parser.add_argument("--object-conf-threshold", type=float, default=0.25)
     enrich_parser.add_argument("--object-iou-threshold", type=float, default=0.7)
-    enrich_parser.add_argument("--asr-model-size", default=DEFAULT_ASR_MODEL_SIZE)
     enrich_parser.add_argument(
-        "--asr-backend",
-        choices=("auto", "faster-whisper", "whisper"),
-        default="auto",
+        "--object-prompt-mode",
+        choices=("text", "internal"),
+        default="text",
     )
-    enrich_parser.add_argument("--no-vad", action="store_true")
+    enrich_parser.add_argument(
+        "--object-vocabulary",
+        nargs="+",
+        default=list(DEFAULT_OBJECT_VOCABULARY),
+    )
     enrich_parser.add_argument("--overwrite", action="store_true")
 
     neighbors_parser = subparsers.add_parser(
@@ -4569,7 +4527,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     text_index_parser = subparsers.add_parser(
         "text-index",
-        description="Build the original caption/OCR/ASR/object lexical index.",
+        description="Build the caption/OCR/object lexical index.",
     )
     _add_common_paths(text_index_parser)
 
@@ -4595,6 +4553,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--offline-model-cache",
         action="store_true",
         help="Refuse network access and load the resolved SigLIP2 revision from cache.",
+    )
+    predict_parser.add_argument(
+        "--query-expansion-cache-dir",
+        type=Path,
+        default=Path("data/model_cache/query_expansion"),
+        help="Cache for the production TKIS paraphrase provider.",
+    )
+    predict_parser.add_argument(
+        "--query-expansion-model-cache-dir",
+        type=Path,
+        default=Path("data/model_cache/caption"),
+        help="Hugging Face cache shared with the Qwen caption stage.",
     )
     predict_parser.add_argument("--search-depth", type=int, default=200)
     predict_parser.add_argument(
@@ -4688,6 +4658,11 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--vlm-top-m", type=int, default=20)
     predict_parser.add_argument("--vlm-timeout-seconds", type=float, default=120.0)
     predict_parser.add_argument("--no-query-plan", action="store_true")
+    predict_parser.add_argument(
+        "--no-query-expansion",
+        action="store_true",
+        help="Explicit TKIS ablation: use the original query only.",
+    )
     predict_parser.add_argument("--no-rrf", action="store_true")
     predict_parser.add_argument("--no-dense-rescue", action="store_true")
     predict_parser.add_argument("--no-cses", action="store_true")
@@ -4748,10 +4723,6 @@ def main() -> None:
                 f"pair gap ({adapter_config.transition_max_pair_gap_seconds}s)"
             )
         _phase3_selection_config(args)
-        if args.asr_timeout_seconds <= 0 or args.asr_cpu_timeout_seconds <= 0:
-            parser.error("ASR timeout values must be positive")
-        if args.asr_retries < 0:
-            parser.error("--asr-retries must be non-negative")
         keyframes_command(args)
     elif args.command == "reselect-keyframes":
         adapter_config = _phase3_adapter_config(args)

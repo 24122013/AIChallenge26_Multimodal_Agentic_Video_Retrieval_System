@@ -16,10 +16,6 @@ from backend.app.services.indexing.keyframe_candidates import (
     REASON_VIDEO_START,
     generate_keyframe_candidates,
 )
-from backend.app.services.indexing.keyframe_feature_adapter import (
-    FeatureAdapterConfig,
-    adapt_feature_records,
-)
 from backend.app.services.indexing.keyframe_selection import (
     PHASE_TEMPORAL_REPAIR,
     ProtectedEvent,
@@ -72,7 +68,7 @@ class QueryPlanTest(unittest.TestCase):
         self.assertEqual(plan.profile, "temporal")
         self.assertEqual(plan.temporal_relation, "then")
         self.assertEqual(len(plan.temporal_events), 2)
-        self.assertEqual(set(plan.modality_hints), {"ocr", "asr", "objects"})
+        self.assertEqual(set(plan.modality_hints), {"ocr", "objects"})
         self.assertEqual(plan.query_for("ocr"), "OPEN")
 
     def test_explicit_profile_overrides_inference(self) -> None:
@@ -149,58 +145,6 @@ class OfflineSelectorV2Test(unittest.TestCase):
         end = next(item for item in generated if REASON_VIDEO_END in item.reasons)
         self.assertIn(start.candidate_id, selected)
         self.assertIn(end.candidate_id, selected)
-
-    def test_high_quality_non_repeated_asr_becomes_protected(self) -> None:
-        candidates = [
-            {
-                "candidate_id": "c1",
-                "video_id": "v",
-                "timestamp": 0.5,
-                "frame_index": 5,
-                "shot_index": 0,
-                "candidate_reasons": ["dense_interval"],
-                "shot_start": 0.0,
-                "shot_end": 2.0,
-            },
-            {
-                "candidate_id": "c2",
-                "video_id": "v",
-                "timestamp": 1.5,
-                "frame_index": 15,
-                "shot_index": 0,
-                "candidate_reasons": ["dense_interval"],
-                "shot_start": 0.0,
-                "shot_end": 2.0,
-            },
-        ]
-        asr = [
-            {
-                "video_id": "v",
-                "status": "success",
-                "start": 0.0,
-                "end": 2.0,
-                "text": "unique spoken evidence in this scene",
-                "confidence": 0.99,
-                "no_speech_probability": 0.0,
-            },
-            {
-                "video_id": "v",
-                "status": "success",
-                "start": 0.0,
-                "end": 2.0,
-                "text": "unique spoken evidence in this scene",
-                "confidence": 0.99,
-                "no_speech_probability": 0.0,
-            },
-        ]
-        result = adapt_feature_records(
-            candidates,
-            asr_records=asr,
-            config=FeatureAdapterConfig(asr_event_min_quality=0.7),
-        )
-        events = [event for event in result.protected_events if event.event_type == "asr_high_quality"]
-        self.assertEqual(len(events), 1)
-        self.assertEqual(result.report.asr_event_count, 1)
 
     def test_protected_duplicate_override_and_repair_after_dedup(self) -> None:
         protected_values = (
@@ -287,6 +231,27 @@ class VLMFallbackTest(unittest.TestCase):
                 runner=timeout,
             )
 
+    def test_vlm_semantic_query_is_original_and_candidate_image_is_evidence(self) -> None:
+        original = "a red bus next to two cars"
+        calls: list[tuple[str, Path]] = []
+
+        def record(query: str, image_path: Path):
+            calls.append((query, image_path))
+            return {"score": 0.9}
+
+        ranked, report = rerank_with_vlm(
+            [self.candidate],
+            query=original,
+            mode="optional",
+            cache_root=self.root / "cache-original-query",
+            image_resolver=lambda _item: self.image,
+            runner=record,
+        )
+
+        self.assertEqual(calls, [(original, self.image)])
+        self.assertEqual(report.status, "passed")
+        self.assertEqual(ranked[0].breakdown["vlm"], 0.9)
+
 
 class DenseIndexContractTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -346,15 +311,6 @@ class DenseIndexContractTest(unittest.TestCase):
             ],
             "protected_events.jsonl": [
                 {"event_id": "e1", "candidate_ids": ["c0"]}
-            ],
-            "asr.jsonl": [
-                {
-                    "video_id": video_id,
-                    "start": 0.0,
-                    "end": 2.0,
-                    "text": "hello",
-                    "confidence": 0.9,
-                }
             ],
         }.items():
             self._write_jsonl(workspace / name, records)

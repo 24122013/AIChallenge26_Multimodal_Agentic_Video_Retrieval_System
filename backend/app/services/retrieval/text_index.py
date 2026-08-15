@@ -1,4 +1,4 @@
-"""Dependency-light lexical indexes for caption, OCR, ASR, and object search."""
+"""Dependency-light lexical indexes for caption, OCR, and object search."""
 from __future__ import annotations
 
 import json
@@ -18,8 +18,8 @@ from backend.app.services.retrieval.query_terms import (
 
 
 _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
-MODALITIES = ("caption", "ocr", "asr", "objects")
-INDEX_VERSION = 2
+MODALITIES = ("caption", "ocr", "objects")
+INDEX_VERSION = 3
 
 
 class TextIndexSearcher:
@@ -36,7 +36,7 @@ class TextIndexSearcher:
         if not self.index_path.exists():
             raise FileNotFoundError(
                 f"Retrieval text index not found: {self.index_path}. "
-                "Metadata role must provide caption/OCR/ASR/object artifacts, then "
+                "Metadata role must provide caption/OCR/object artifacts, then "
                 "run backend/app/services/indexing/build_text_index.py."
             )
         payload = json.loads(self.index_path.read_text(encoding="utf-8"))
@@ -211,7 +211,6 @@ def normalize_modality(modality: str) -> str:
         "object": "objects",
         "object_classes": "objects",
         "caption_text": "caption",
-        "transcript": "asr",
     }
     normalized = aliases.get(normalized, normalized)
     if normalized not in MODALITIES:
@@ -233,15 +232,6 @@ def text_for_modality(record: dict[str, Any], modality: str) -> str:
             _join_nested_text(record.get("ocr")),
             _join_nested_text(record.get("text_regions")),
         )
-    if modality == "asr":
-        return _first_text(
-            record.get("asr_text"),
-            record.get("transcript"),
-            record.get("transcript_text"),
-            _join_nested_text(record.get("asr")),
-            _join_nested_text(record.get("transcript_segments")),
-            record.get("text") if record.get("pipeline") == "asr" else None,
-        )
     return " ".join(_object_labels(record))
 
 
@@ -250,7 +240,6 @@ def _document_id(record: dict[str, Any], modality: str, ordinal: int) -> str:
         record.get("frame_id")
         or record.get("segment_id")
         or record.get("faiss_index")
-        or record.get("transcript_segment_id")
         or ordinal
     )
     video_id = record.get("video_id") or "unknown"
@@ -290,7 +279,6 @@ def _document_from_record(
         ),
         "caption": text_for_modality(record, "caption"),
         "ocr_text": text_for_modality(record, "ocr"),
-        "asr_text": text_for_modality(record, "asr"),
         "objects": _object_labels(record),
         "candidate_id": str(record.get("candidate_id") or ""),
         "keyframe_ids": [str(value) for value in record.get("keyframe_ids") or []],
@@ -331,7 +319,6 @@ def _document_to_result(
         thumbnail_path=str(document.get("thumbnail_path") or ""),
         caption=str(document.get("caption") or ""),
         ocr_text=str(document.get("ocr_text") or ""),
-        asr_text=str(document.get("asr_text") or ""),
         objects=[str(value) for value in document.get("objects") or []],
         modality_scores={modality: score},
     )
@@ -360,7 +347,6 @@ def _join_nested_text(value: object) -> str:
             text = (
                 item.get("text")
                 or item.get("ocr_text")
-                or item.get("transcript_text")
             )
             if text:
                 parts.append(str(text).strip())

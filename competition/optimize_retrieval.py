@@ -70,7 +70,7 @@ def initialize_labeling_set(
     evaluation_root.mkdir(parents=True, exist_ok=True)
     split_path = evaluation_root / "split_manifest.json"
     split = write_split_manifest(split_path, selected, seed=seed)
-    evidence_cycle = ("ocr", "asr", "objects", "transition")
+    evidence_cycle = ("ocr", "objects", "transition")
     manual_events: list[dict[str, Any]] = []
     query_templates: list[dict[str, Any]] = []
     for video_position, video_id in enumerate(selected):
@@ -390,7 +390,6 @@ def _video_features(output_root: Path) -> tuple[list[str], np.ndarray]:
                 duration,
                 float(report.get("shot_count", 0)),
                 float(counts.get("ocr", 0)) / candidate_count,
-                float(counts.get("asr", 0)) / candidate_count,
                 float(counts.get("objects", 0)) / candidate_count,
                 float(adapter.get("transition_boundary_count", 0)) / candidate_count,
             ]

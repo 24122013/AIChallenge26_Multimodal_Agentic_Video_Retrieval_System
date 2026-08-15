@@ -23,7 +23,6 @@ def _result(
     timestamp: float = 0.0,
     score: float = 0.5,
     caption: str = "",
-    asr_text: str = "",
     shot_id: str = "",
     modality_scores: dict[str, float] | None = None,
 ) -> RetrievalResult:
@@ -33,7 +32,6 @@ def _result(
         timestamp=timestamp,
         score=score,
         caption=caption,
-        asr_text=asr_text,
         shot_id=shot_id,
         timestamp_confidence=1.0,
         modality_scores=modality_scores or {},
@@ -76,7 +74,6 @@ class Phase3RetrievalTest(unittest.TestCase):
                             "keyframe_path": "data/keyframes/V001/000001.jpg",
                             "caption": "a cashier at a shop counter",
                             "ocr": [{"text": "OPEN 24H"}],
-                            "asr": [{"text": "welcome to the shop"}],
                             "objects": [
                                 {"class_name": "cashier"},
                                 {"label": "counter"},
@@ -94,7 +91,6 @@ class Phase3RetrievalTest(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(result.caption, "a cashier at a shop counter")
             self.assertEqual(result.ocr_text, "OPEN 24H")
-            self.assertEqual(result.asr_text, "welcome to the shop")
             self.assertEqual(result.objects, ["cashier", "counter"])
 
     def test_candidate_merger_preserves_modality_scores(self) -> None:

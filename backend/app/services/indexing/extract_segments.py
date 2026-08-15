@@ -1,7 +1,6 @@
 """Backward-compatible adapter for the canonical segment metadata builder."""
 
 from src.indexing.build_segment_metadata import (
-    aggregate_asr,
     aggregate_captions,
     aggregate_objects,
     aggregate_ocr,
@@ -13,7 +12,6 @@ from src.indexing.build_segment_metadata import (
 )
 
 __all__ = [
-    "aggregate_asr",
     "aggregate_captions",
     "aggregate_objects",
     "aggregate_ocr",

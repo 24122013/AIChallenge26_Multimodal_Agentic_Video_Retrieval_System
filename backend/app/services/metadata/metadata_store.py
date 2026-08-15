@@ -57,7 +57,6 @@ class FrameRecord:
     # text indexes can still provide them as independent candidate sources.
     caption: str = ""
     ocr_text: str = ""
-    asr_text: str = ""
     objects: list[str] = field(default_factory=list)
 
     # Phase 4 keyframe-selection provenance propagated from the FAISS frame map.
@@ -111,11 +110,6 @@ class FrameRecord:
             ),
             caption=str(data.get("caption") or data.get("segment_caption") or ""),
             ocr_text=str(data.get("ocr_text") or _joined_text(data.get("ocr"))),
-            asr_text=str(
-                data.get("asr_text")
-                or data.get("transcript_text")
-                or _joined_text(data.get("asr"))
-            ),
             objects=_object_labels(data.get("objects") or data.get("object_classes")),
             candidate_id=str(data.get("candidate_id") or ""),
             candidate_index=_optional_int(data.get("candidate_index")),
@@ -159,7 +153,6 @@ class FrameRecord:
             "vector_dim": self.vector_dim,
             "caption": self.caption,
             "ocr_text": self.ocr_text,
-            "asr_text": self.asr_text,
             "objects": list(self.objects),
             "candidate_id": self.candidate_id,
             "candidate_index": self.candidate_index,
@@ -235,7 +228,7 @@ def _joined_text(value: object) -> str:
     parts: list[str] = []
     for item in value:
         if isinstance(item, dict):
-            text = item.get("text") or item.get("transcript_text") or item.get("ocr_text")
+            text = item.get("text") or item.get("ocr_text")
             if text:
                 parts.append(str(text))
         elif item:

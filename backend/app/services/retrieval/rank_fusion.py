@@ -1,7 +1,7 @@
 """Weighted reciprocal-rank fusion and clip aggregation."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Sequence
 
 from backend.app.models.retrieval import RetrievalResult
@@ -10,11 +10,10 @@ from backend.app.services.retrieval.query_plan import QueryPlan
 
 
 DEFAULT_RRF_WEIGHTS: dict[str, float] = {
-    "visual": 0.50,
-    "caption": 0.15,
+    "visual": 0.55,
+    "caption": 0.20,
     "ocr": 0.10,
-    "asr": 0.15,
-    "objects": 0.05,
+    "objects": 0.10,
 }
 
 
@@ -29,6 +28,41 @@ class FusedCandidate:
     def clip_key(self) -> tuple[str, str]:
         clip_id = self.result.segment_id or self.result.shot_id or self.result.frame_id
         return (self.result.video_id, clip_id)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "candidate_id": candidate_identity(self.result),
+            "rrf_score": self.rrf_score,
+            "modality_ranks": dict(self.modality_ranks),
+            "modality_contributions": dict(self.modality_contributions),
+        }
+
+
+@dataclass(frozen=True)
+class IntraModalityCandidate:
+    result: RetrievalResult
+    intra_score: float
+    original_contribution: float
+    raw_expansion_contribution: float
+    max_expansion_budget: float
+    expansion_contribution: float
+    variant_ranks: dict[str, int]
+    variant_contributions: dict[str, float]
+
+    def as_retrieval_result(self) -> RetrievalResult:
+        return replace(self.result, score=self.intra_score)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "candidate_id": candidate_identity(self.result),
+            "original_contribution": self.original_contribution,
+            "raw_expansion_contribution": self.raw_expansion_contribution,
+            "max_expansion_budget": self.max_expansion_budget,
+            "expansion_contribution": self.expansion_contribution,
+            "final_intra_score": self.intra_score,
+            "variant_ranks": dict(self.variant_ranks),
+            "variant_contributions": dict(self.variant_contributions),
+        }
 
 
 @dataclass(frozen=True)
@@ -99,6 +133,101 @@ def weighted_rrf(
     fused.sort(
         key=lambda item: (
             -item.rrf_score,
+            item.result.video_id,
+            item.result.timestamp,
+            item.result.frame_id,
+        )
+    )
+    return fused
+
+
+def fuse_query_variants(
+    groups: Mapping[str, Sequence[RetrievalResult]],
+    *,
+    weights: Mapping[str, float],
+    original_key: str = "original",
+    k: int = 60,
+    max_expansion_contribution: float = 1.0,
+) -> list[IntraModalityCandidate]:
+    """Fuse semantic variants inside one modality using capped weighted RRF.
+
+    ``max_expansion_contribution`` is a ratio against the maximum rank-1
+    contribution of the original query, never a raw-score cap.
+    """
+    if int(k) <= 0:
+        raise ValueError("RRF k must be positive")
+    if max_expansion_contribution <= 0:
+        raise ValueError("max_expansion_contribution must be positive")
+    if original_key not in groups or original_key not in weights:
+        raise ValueError("intra-modality fusion requires the original ranked list")
+    if any(float(value) < 0 for value in weights.values()):
+        raise ValueError("variant RRF weights must be non-negative")
+    original_weight = float(weights[original_key])
+    if any(float(value) > original_weight for value in weights.values()):
+        raise ValueError("original query must have the highest variant weight")
+    max_budget = (
+        float(max_expansion_contribution) * original_weight / (int(k) + 1)
+    )
+
+    merged: dict[tuple[str, str], dict[str, object]] = {}
+    for variant, results in groups.items():
+        weight = float(weights.get(variant, 0.0))
+        if weight <= 0:
+            continue
+        seen: set[tuple[str, str]] = set()
+        for rank, result in enumerate(results, start=1):
+            identity = candidate_identity(result)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            contribution = weight / (int(k) + rank)
+            state = merged.setdefault(
+                identity,
+                {
+                    "result": result,
+                    "best_rank": rank,
+                    "original": 0.0,
+                    "expansion": 0.0,
+                    "ranks": {},
+                    "contributions": {},
+                },
+            )
+            ranks = state["ranks"]
+            contributions = state["contributions"]
+            assert isinstance(ranks, dict) and isinstance(contributions, dict)
+            ranks[variant] = rank
+            contributions[variant] = contribution
+            if variant == original_key:
+                state["original"] = contribution
+                state["result"] = result
+                state["best_rank"] = rank
+            else:
+                state["expansion"] = float(state["expansion"]) + contribution
+                if float(state["original"]) == 0.0 and rank < int(state["best_rank"]):
+                    state["result"] = result
+                    state["best_rank"] = rank
+
+    fused: list[IntraModalityCandidate] = []
+    for state in merged.values():
+        original = float(state["original"])
+        raw_expansion = float(state["expansion"])
+        capped = min(raw_expansion, max_budget)
+        fused.append(
+            IntraModalityCandidate(
+                result=state["result"],  # type: ignore[arg-type]
+                intra_score=original + capped,
+                original_contribution=original,
+                raw_expansion_contribution=raw_expansion,
+                max_expansion_budget=max_budget,
+                expansion_contribution=capped,
+                variant_ranks=dict(state["ranks"]),  # type: ignore[arg-type]
+                variant_contributions=dict(state["contributions"]),  # type: ignore[arg-type]
+            )
+        )
+    fused.sort(
+        key=lambda item: (
+            -item.intra_score,
+            -item.original_contribution,
             item.result.video_id,
             item.result.timestamp,
             item.result.frame_id,

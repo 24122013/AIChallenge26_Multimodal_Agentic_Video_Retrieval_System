@@ -75,17 +75,15 @@ class Phase2RetrievalTest(unittest.TestCase):
             "start_time": 1.2,
             "captions_aggregated": "a person cooking in a kitchen",
             "ocr": [{"text": "BẾP VIỆT"}],
-            "asr": [{"text": "hôm nay chúng ta nấu phở"}],
             "objects": [{"label": "person"}, {"class_name": "bowl"}],
         }
 
         self.assertIn("cooking", text_for_modality(record, "caption"))
         self.assertEqual(text_for_modality(record, "ocr"), "BẾP VIỆT")
-        self.assertIn("nấu phở", text_for_modality(record, "asr"))
         self.assertEqual(text_for_modality(record, "objects"), "person bowl")
 
         payload = build_text_index([record])
-        for modality in ("caption", "ocr", "asr", "objects"):
+        for modality in ("caption", "ocr", "objects"):
             self.assertEqual(
                 payload["modalities"][modality]["stats"]["doc_count"],
                 1,
@@ -100,7 +98,6 @@ class Phase2RetrievalTest(unittest.TestCase):
                 "timestamp": 2.0,
                 "caption": "a person cooking noodles in a kitchen",
                 "ocr_text": "BẾP VIỆT",
-                "asr_text": "hôm nay chúng ta nấu phở",
                 "objects": [{"class_name": "person"}, {"class_name": "bowl"}],
             },
             {
@@ -110,7 +107,6 @@ class Phase2RetrievalTest(unittest.TestCase):
                 "timestamp": 8.0,
                 "caption": "orange clouds at sunset",
                 "ocr_text": "HTV",
-                "asr_text": "dự báo thời tiết",
                 "objects": ["cloud"],
             },
         ]
@@ -121,13 +117,11 @@ class Phase2RetrievalTest(unittest.TestCase):
 
             caption = searcher.search_results("person cooking", "caption", 5)
             ocr = searcher.search_results("BẾP VIỆT", "ocr", 5)
-            asr = searcher.search_results("nấu phở", "asr", 5)
             objects = searcher.search_results("bowl", "objects", 5)
 
             self.assertEqual(caption[0].frame_id, "F001")
             self.assertIn("caption", caption[0].modality_scores)
             self.assertEqual(ocr[0].frame_id, "F001")
-            self.assertEqual(asr[0].asr_text, "hôm nay chúng ta nấu phở")
             self.assertEqual(objects[0].objects, ["person", "bowl"])
 
     def test_text_search_prefers_complete_action_over_partial_overlap(
@@ -182,7 +176,7 @@ class Phase2RetrievalTest(unittest.TestCase):
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["segment_id"], "S1")
 
-    def test_runtime_config_loads_asr_weight_and_text_path(self) -> None:
+    def test_runtime_config_loads_caption_weight_and_text_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "retrieval.yaml"
             path.write_text(
@@ -190,7 +184,7 @@ class Phase2RetrievalTest(unittest.TestCase):
                     [
                         "weights:",
                         "  visual: 0.4",
-                        "  asr: 0.3",
+                        "  caption: 0.3",
                         "text_index:",
                         "  path: custom/index.json",
                         "  default_top_k: 7",
@@ -202,7 +196,7 @@ class Phase2RetrievalTest(unittest.TestCase):
             config = load_retrieval_runtime_config(path)
 
             self.assertEqual(config.rerank.weights.visual, 0.4)
-            self.assertEqual(config.rerank.weights.asr, 0.3)
+            self.assertEqual(config.rerank.weights.caption, 0.3)
             self.assertEqual(config.text_index.path, Path("custom/index.json"))
             self.assertEqual(config.text_index.default_top_k, 7)
 
