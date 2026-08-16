@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
 
@@ -24,7 +24,16 @@ from backend.app.services.retrieval.rank_fusion import (
     weighted_rrf,
 )
 from backend.app.services.retrieval.rank_fusion import FusedCandidate
-from competition.dense_index import DenseCandidateIndex
+
+
+class DenseCandidateIndex(Protocol):
+    """Backend-owned structural contract for the optional dense rescue index."""
+
+    records: Sequence[Mapping[str, Any]]
+    vectors: np.ndarray
+    rows_by_clip: Mapping[tuple[str, str], Sequence[int]]
+
+    def search(self, query_vector: np.ndarray, top_k: int) -> list[tuple[int, float]]: ...
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,12 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 
-OUTPUT = Path(__file__).resolve().parent / "KE_HOACH_UPGRADE_RETRIEVAL_QA_QUERY_PARSER.docx"
+OUTPUT = (
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "reports"
+    / "KE_HOACH_UPGRADE_RETRIEVAL_QA_QUERY_PARSER.docx"
+)
 BLUE, DARK_BLUE, INK = "2E74B5", "1F4D78", "0B2545"
 MUTED, LIGHT_GRAY, CALLOUT, BORDER = "667085", "F2F4F7", "F4F6F9", "D0D5DD"
 GREEN, GOLD, RED = "1F5A44", "7A5A00", "9B1C1C"
@@ -413,7 +418,7 @@ def assessment(doc):
         ["Nhận định trong chat", "Đối chiếu baseline", "Quyết định"],
         [
             ("SigLIP2 So400m đủ mạnh", "Đúng; visual contract và FAISS đã ổn định", "Giữ, chỉ benchmark"),
-            ("Qwen3.5 caption là upgrade lớn", "Caption hiện dùng Qwen3.5-4B revision đã pin", "Giữ caption path"),
+            ("Qwen3-VL caption là upgrade lớn", "Caption hiện dùng Qwen3-VL-8B-Instruct revision đã pin", "Giữ caption path"),
             ("PP-OCRv5 nên giữ", "Đúng; detector + Latin recognizer hiện hữu", "Giữ BM25 exact OCR"),
             ("YOLOE mask có thể nặng", "Hợp lý nhưng chưa có bằng chứng thay model", "Không đổi trong scope"),
             ("ASR là P0 bắt buộc", "Đúng cho speech query, trái quyết định resource hiện tại", "Loại khỏi vòng test"),
@@ -691,7 +696,7 @@ def dependencies(doc, bullets):
         ["Vai trò", "Model / revision", "Artifact hoặc runtime impact"],
         [
             ("Visual", "google/siglip2-so400m-patch16-384", "Giữ visual artifacts"),
-            ("Caption + QA", "Caption Qwen3.5-4B; QA Qwen3.5-9B", "QA cache/model path riêng"),
+            ("Caption + QA", "Caption Qwen3-VL-8B-Instruct; grounded QA giữ model riêng", "QA cache/model path riêng"),
             ("OCR", "PP-OCRv5 server det + Latin mobile rec", "Giữ OCR JSON/BM25"),
             ("Object", "YOLOE-26l", "Giữ object metadata/BM25"),
             ("Dense text", "BAAI/bge-m3 @ resolved revision", "Thêm 3 BGE artifacts"),

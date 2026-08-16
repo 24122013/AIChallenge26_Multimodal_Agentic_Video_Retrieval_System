@@ -11,7 +11,7 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 
-OUTPUT_PATH = Path("reports/bao_cao_retrieval_can_lam_de_chay_duoc.docx")
+OUTPUT_PATH = Path("data/reports/bao_cao_retrieval_can_lam_de_chay_duoc.docx")
 
 
 def set_cell_shading(cell, fill: str) -> None:

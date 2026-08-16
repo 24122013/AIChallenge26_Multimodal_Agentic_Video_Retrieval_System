@@ -140,7 +140,7 @@ Lệnh:
 
 ```powershell
 .\.venv\Scripts\python.exe -m reports.benchmark_indexing_metadata `
-  --output reports/index_size_latency_benchmark.json `
+  --output data/reports/index_size_latency_benchmark.json `
   --videos 4 `
   --frames-per-video 250 `
   --runs 3 `
@@ -178,7 +178,7 @@ cùng capability: phần artifact mới compact nhỏ hơn 76,03%. Không có FA
 artifact thật nên **tổng kích thước vector index trước/sau là N/A**; vector index
 không đổi.
 
-Raw result: `reports/index_size_latency_benchmark.json`.
+Raw result: `data/reports/index_size_latency_benchmark.json`.
 
 ## Trade-off
 

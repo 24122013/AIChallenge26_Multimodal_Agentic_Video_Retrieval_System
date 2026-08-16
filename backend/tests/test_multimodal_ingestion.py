@@ -17,6 +17,7 @@ from PIL import Image
 from backend.app.services.ingestion.caption_pipeline import (
     DEFAULT_MODEL_NAME,
     DEFAULT_MODEL_REVISION,
+    QwenCaptionBackend,
     parse_caption_output,
     run_caption_file,
 )
@@ -191,17 +192,57 @@ class MultimodalIngestionTest(unittest.TestCase):
         self.assertEqual(plain["caption"], "person standing beside a red car")
         self.assertEqual(plain["structured_caption"], None)
 
-    def test_caption_cli_uses_pinned_4b_defaults(self) -> None:
+    def test_caption_cli_uses_pinned_qwen3_vl_8b_defaults(self) -> None:
         args = build_caption_parser().parse_args(
             ["--metadata-path", str(self.metadata)]
         )
-        self.assertEqual(DEFAULT_MODEL_NAME, "Qwen/Qwen3.5-4B")
+        self.assertEqual(DEFAULT_MODEL_NAME, "Qwen/Qwen3-VL-8B-Instruct")
         self.assertEqual(
             DEFAULT_MODEL_REVISION,
-            "c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97",
+            "b5bc35aa2d1dc2db88ca1482375afc801511bffb",
         )
         self.assertEqual(args.model_name, DEFAULT_MODEL_NAME)
         self.assertEqual(args.model_revision, DEFAULT_MODEL_REVISION)
+
+    def test_caption_loader_uses_image_text_to_text_factory_without_download(self) -> None:
+        transformers = ModuleType("transformers")
+        model_calls: list[tuple[str, dict[str, Any]]] = []
+        processor_calls: list[tuple[str, dict[str, Any]]] = []
+
+        class FakeConfig:
+            _commit_hash = DEFAULT_MODEL_REVISION
+
+        class FakeModel:
+            config = FakeConfig()
+
+            def to(self, device: str) -> "FakeModel":
+                self.device = device
+                return self
+
+            def eval(self) -> None:
+                return None
+
+        class FakeModelFactory:
+            @classmethod
+            def from_pretrained(cls, name: str, **kwargs: Any) -> FakeModel:
+                model_calls.append((name, kwargs))
+                return FakeModel()
+
+        class FakeProcessorFactory:
+            @classmethod
+            def from_pretrained(cls, name: str, **kwargs: Any) -> object:
+                processor_calls.append((name, kwargs))
+                return object()
+
+        transformers.AutoModelForImageTextToText = FakeModelFactory  # type: ignore[attr-defined]
+        transformers.AutoProcessor = FakeProcessorFactory  # type: ignore[attr-defined]
+        backend = QwenCaptionBackend(device="cpu", cache_dir=self.root / "caption-cache")
+        with mock.patch.dict(sys.modules, {"transformers": transformers}):
+            backend._load()
+
+        self.assertEqual(model_calls[0][0], DEFAULT_MODEL_NAME)
+        self.assertEqual(processor_calls[0][0], DEFAULT_MODEL_NAME)
+        self.assertEqual(model_calls[0][1]["revision"], DEFAULT_MODEL_REVISION)
 
     def test_caption_batch_order_model_error_and_segment_determinism(self) -> None:
         output = self.root / "captions.jsonl"

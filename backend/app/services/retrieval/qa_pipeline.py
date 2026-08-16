@@ -308,6 +308,7 @@ def _manual_evidence(response: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "evidence_id": f"E{index:03d}",
                 "video_id": str(item.get("video_id") or ""),
                 "frame_id": str(item.get("frame_id") or ""),
+                "frame_index": item.get("frame_index"),
                 "shot_id": str(item.get("shot_id") or item.get("segment_id") or ""),
                 "timestamp": item.get("timestamp", 0.0),
                 "image_path": str(

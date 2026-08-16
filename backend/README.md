@@ -4,7 +4,7 @@ Backend cung cấp ingestion metadata, indexing và retrieval API.
 
 ## Ingestion
 
-- `run_caption.py`: Qwen3.5-4B multimodal, JSON retrieval schema, lazy loading,
+- `run_caption.py`: Qwen3-VL-8B-Instruct image-to-text, JSON retrieval schema, lazy loading,
   batch, dtype và quantization.
 - `run_ocr.py`: PP-OCRv5 detection + Latin recognition cho tiếng Việt/Anh,
   polygon/confidence và Unicode normalization.
@@ -27,6 +27,19 @@ cache dưới `data/model_cache/` và resume theo model/revision.
 .\.venv\Scripts\python.exe backend\app\services\ingestion\run_caption.py --help
 .\.venv\Scripts\python.exe backend\app\services\ingestion\run_ocr.py --help
 .\.venv\Scripts\python.exe backend\app\services\ingestion\run_object_detection.py --help
+```
+
+Caption mặc định dùng `Qwen/Qwen3-VL-8B-Instruct` tại revision bất biến
+`b5bc35aa2d1dc2db88ca1482375afc801511bffb`, cache dưới
+`data/model_cache/caption`. Hãy profile VRAM trên máy đích theo dtype,
+quantization và batch size; không tái sử dụng ước lượng của model 4B.
+
+Xuất CSV thực hành (chỉ KIS và QA; TRAKE chưa triển khai):
+
+```powershell
+python -m backend.app.services.submission.export_query --task kis `
+  --query "người mặc áo đỏ cầm điện thoại" --top-k 100 `
+  --output data/submissions/kis_result.csv
 ```
 
 ## Test

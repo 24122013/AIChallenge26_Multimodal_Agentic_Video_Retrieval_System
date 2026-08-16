@@ -1,6 +1,7 @@
 # AIChallenge26 Multimodal Agentic Video Retrieval System
 
-Hệ thống truy hồi video đa phương thức cho KIS/AVS và hỏi đáp có dẫn chứng (QA).
+Hệ thống truy hồi video đa phương thức cho KIS và hỏi đáp có dẫn chứng (QA).
+TRAKE được dự kiến bổ sung sau nhưng chưa được triển khai trong phạm vi hiện tại.
 Kiến trúc hiện hành chỉ dùng thông tin thị giác: ảnh keyframe, caption, OCR và
 object labels. **Không có ASR, không đọc audio và không lập chỉ mục transcript.**
 
@@ -8,7 +9,7 @@ Các phần chính của hệ thống:
 
 | Phạm vi | Vai trò | Nguồn sự thật | Entrypoint | Input | Output |
 |---|---|---|---|---|---|
-| `backend/` | Backend chính | Canonical implementation | Các module `python -m backend...` | Video, metadata, query | Keyframe/index, KIS/AVS/QA result |
+| `backend/` | Backend chính | Canonical implementation | Các module `python -m backend...` | Video, metadata, query | Keyframe/index, KIS/QA result |
 | `src/indexing/` | Tiện ích dùng chung | Code neighbor/segment thực tế | Backend wrapper gọi | Canonical metadata | Neighbor/segment artifacts |
 | `frontend/` | Placeholder | Không có implementation | Chưa có | — | Chưa có UI chạy được |
 
@@ -24,7 +25,7 @@ video
   -> SigLIP2 FAISS + neighbor/segment metadata
   -> BM25 text index + optional BGE-M3 dense text index
 
-ONLINE KIS/AVS
+ONLINE KIS
 query -> typed query plan -> visual/text/temporal retrieval
       -> weighted fusion -> deterministic rerank -> ranked frames
 
@@ -34,7 +35,7 @@ question -> typed QA/temporal plan -> shared retrieval
          -> optional Qwen grounded answer, or abstain
 ```
 
-- KIS/AVS trả về frame/segment đã xếp hạng từ visual, caption, OCR, objects và
+- KIS trả về frame/segment đã xếp hạng từ visual, caption, OCR, objects và
   temporal metadata.
 - QA dùng cùng retrieval stack, tối đa Top-3 evidence cho câu hỏi thường hoặc
   strict temporal chain tối đa 5 event.
@@ -52,7 +53,7 @@ Chi tiết truy vết theo file/function và risk register nằm tại
 |---|---|---|---|---|---|
 | Shot detection | `TransNetV2` | Shot boundaries + dense sampling | `indexing/extract_keyframes.py`, `keyframe_candidates.py` | CPU/CUDA (`auto`) | keyframe JSONL/report |
 | Visual embedding | `google/siglip2-so400m-patch16-384` | normalized embedding, FAISS IP | `build_siglip2_index.py`, `search_visual.py` | CPU/CUDA | `.npy`, FAISS, map/manifest |
-| Caption | `Qwen/Qwen3.5-4B` @ `c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97` | Structured frame caption | `ingestion/caption_pipeline.py` | CPU/CUDA | caption JSONL/report |
+| Caption | `Qwen/Qwen3-VL-8B-Instruct` @ `b5bc35aa2d1dc2db88ca1482375afc801511bffb` | Structured frame caption | `ingestion/caption_pipeline.py` | CPU/CUDA | caption JSONL/report |
 | OCR | `PP-OCRv5_server_det` + `latin_PP-OCRv5_mobile_rec` | Vietnamese/English OCR | `ingestion/ocr_pipeline.py` | CPU/CUDA | OCR JSONL/report |
 | Object evidence | `yoloe-26l-seg.pt` | Open-vocabulary soft evidence | `ingestion/object_pipeline.py` | CPU/CUDA | object JSONL/report |
 | Keyframe selection | Không có checkpoint | protected events, gap repair, dedup, MMR | `keyframe_selection.py` | CPU | selected metadata/ledgers |
@@ -72,7 +73,7 @@ PaddlePaddle được cài riêng trước `requirements.txt` để pip không t
 CPU/CUDA. Chỉ chọn **một** profile dưới đây.
 
 Code không áp đặt mức RAM/VRAM tối thiểu. Full corpus cần dung lượng cho video,
-dense candidates và model cache; Qwen 4B/9B phải được profile batch, VRAM và disk
+dense candidates và model cache; Qwen 8B/9B phải được profile batch, VRAM và disk
 trên máy đích thay vì dựa vào một ước lượng chung.
 
 ### CPU
@@ -163,42 +164,9 @@ thích; nếu OOM, giảm batch trước, sau đó mới cân nhắc quantizatio
 
 ## Chạy backend canonical
 
-Ví dụ tối thiểu cho một video. `ffmpeg`/`ffprobe` và model checkpoints phải sẵn
-sàng; thay `L01_V001.mp4` bằng dữ liệu thật.
-
-```powershell
-python -m backend.app.services.indexing.extract_keyframes `
-  --video-path data/raw/video/L01_V001.mp4 `
-  --output-dir data/keyframes `
-  --strategy dense_coverage --candidate-interval-sec 0.5 --max-gap-seconds 2
-
-python -m backend.app.services.ingestion.run_caption `
-  --metadata-path data/metadata/keyframes_L01_V001.jsonl --device cuda --batch-size 2
-python -m backend.app.services.ingestion.run_ocr `
-  --metadata-path data/metadata/keyframes_L01_V001.jsonl --device cuda
-python -m backend.app.services.ingestion.run_object_detection `
-  --metadata-path data/metadata/keyframes_L01_V001.jsonl --device cuda
-
-python -m backend.app.services.indexing.build_siglip2_index `
-  --metadata-path data/metadata/keyframes_L01_V001.jsonl --device cuda
-python -m backend.app.services.indexing.build_faiss_index
-python -m backend.app.services.indexing.build_text_index `
-  --metadata data/metadata --output data/indexes/retrieval_text_index.json
-python -m backend.app.services.indexing.build_bge_m3_index `
-  --metadata data/metadata --output-root data/indexes/bge_m3 `
-  --device cuda --canonical-only
-```
-
-Caption/OCR/object CLI ghi artifact riêng; chúng không tự sửa keyframe JSONL gốc.
-Logic chọn keyframe đa phương thức đầy đủ nằm trong
-`backend/app/services/indexing/keyframe_multimodal_pipeline.py`, nhưng hiện chưa
-có một backend CLI duy nhất điều phối toàn bộ các lệnh trên.
-
-### Chạy toàn bộ video trong `data/raw`
-
-Video của hệ thống nằm trực tiếp trong `data/raw/video/`. Lệnh dưới đây quét toàn
-bộ file `*.mp4` trong thư mục đó và chạy keyframe extraction lần lượt cho từng
-video:
+Các lệnh dưới đây chạy pipeline cho toàn bộ video `*.mp4` trong
+`data/raw/video/`. `ffmpeg`/`ffprobe` và model checkpoints phải sẵn sàng trước
+khi chạy.
 
 ```powershell
 python -m backend.app.services.indexing.extract_keyframes `
@@ -210,14 +178,11 @@ python -m backend.app.services.indexing.extract_keyframes `
   --max-gap-seconds 2
 ```
 
-Với mỗi `<video_id>.mp4`, lệnh tự tạo:
+Với mỗi `<video_id>.mp4`, bước trên tạo keyframe tại
+`data/keyframes/<video_id>/`, metadata tại
+`data/metadata/keyframes_<video_id>.jsonl` và extraction report tương ứng.
 
-- keyframe tại `data/keyframes/<video_id>/`;
-- metadata tại `data/metadata/keyframes_<video_id>.jsonl`;
-- report tại `data/metadata/keyframes_<video_id>_extract_report.json`.
-
-Sau khi đã extract toàn bộ video, có thể chạy caption, OCR và object detection
-cho tất cả file `keyframes_*.jsonl` bằng cách truyền cả thư mục metadata:
+Chạy caption, OCR và object detection cho toàn bộ keyframe metadata:
 
 ```powershell
 python -m backend.app.services.ingestion.run_caption `
@@ -228,7 +193,62 @@ python -m backend.app.services.ingestion.run_object_detection `
   --metadata-path data/metadata --device cuda
 ```
 
-### Smoke KIS, AVS và QA
+Tạo neighbor index cho toàn bộ keyframe. Mỗi record giữ các frame lân cận trong
+cùng video ở cửa sổ ±5 giây:
+
+```powershell
+python -m backend.app.services.indexing.neighbor_index `
+  --input data/metadata `
+  --output data/metadata/neighbors_all.jsonl `
+  --window-seconds 5
+```
+
+Tạo segment metadata cho toàn bộ corpus, đồng thời tổng hợp caption, OCR và
+object evidence:
+
+```powershell
+python -m backend.app.services.indexing.extract_segments `
+  --input data/metadata `
+  --captions data/metadata `
+  --ocr data/metadata `
+  --objects data/metadata `
+  --output data/metadata/segments_all.jsonl `
+  --strategy auto
+```
+
+Nếu chưa chạy OCR hoặc object detection, bỏ riêng `--ocr data/metadata` hoặc
+`--objects data/metadata`; builder sẽ không bịa dữ liệu cho modality còn thiếu.
+
+Sau khi có frame/segment metadata, build các index retrieval:
+
+```powershell
+python -m backend.app.services.indexing.build_siglip2_index `
+  --metadata-path data/metadata --device cuda
+python -m backend.app.services.indexing.build_faiss_index
+python -m backend.app.services.indexing.build_text_index `
+  --metadata data/metadata --output data/indexes/retrieval_text_index.json
+python -m backend.app.services.indexing.build_bge_m3_index `
+  --metadata data/metadata --output-root data/indexes/bge_m3 `
+  --device cuda --canonical-only
+```
+
+Caption/OCR/object CLI ghi artifact riêng và không sửa keyframe JSONL gốc.
+Neighbor và segment cũng là hai bước explicit, không được ingestion tự động gọi.
+Kiểm tra artifact toàn corpus trước khi build text/BGE index:
+
+```powershell
+Test-Path data/metadata/neighbors_all.jsonl
+Test-Path data/metadata/segments_all.jsonl
+Get-Content data/metadata/neighbors_all.jsonl -TotalCount 1
+Get-Content data/metadata/segments_all.jsonl -TotalCount 1
+```
+
+Logic chọn keyframe đa phương thức đầy đủ nằm trong
+`backend/app/services/indexing/keyframe_multimodal_pipeline.py`, nhưng hiện chưa
+có một backend CLI duy nhất điều phối toàn bộ chuỗi lệnh trên. Việc các lệnh xuất
+hiện trong README là hướng dẫn chạy, không phải bằng chứng một run đã hoàn tất.
+
+### Smoke KIS và QA
 
 `run_task_smoke` là CLI **không tương tác**: chương trình không dừng lại để hỏi
 query trong terminal. Nếu không truyền query, nó tự dùng các câu mặc định sau:
@@ -236,11 +256,10 @@ query trong terminal. Nếu không truyền query, nó tự dùng các câu mặ
 | Task | Tham số để đổi query | Query mặc định |
 |---|---|---|
 | KIS | `--kis-query` | `người phụ nữ mặc áo đỏ đang cầm điện thoại` |
-| AVS | `--avs-query` | `tất cả các cảnh có xe máy đi qua đường` |
 | QA | `--qa-query` | `Người phụ nữ mặc áo đỏ đang cầm vật gì?` |
 
 Đây là **strict smoke**, không phải sanity check tối giản. Validator yêu cầu BGE-M3
-dense retrieval và BGE cross-encoder thực sự được áp dụng cho KIS, AVS lẫn QA.
+dense retrieval và BGE cross-encoder thực sự được áp dụng cho KIS và QA.
 Vì vậy phải build `data/indexes/bge_m3/{bge_m3_flat_ip.faiss,
 bge_m3_frame_map.json,bge_m3_manifest.json}` từ canonical selected-keyframe hoặc
 segment metadata, rồi đặt các biến dưới đây **trước khi chạy bất kỳ task nào**:
@@ -261,7 +280,6 @@ Chạy với query mặc định:
 
 ```powershell
 python -m backend.app.services.retrieval.run_task_smoke --task kis --top-k 20
-python -m backend.app.services.retrieval.run_task_smoke --task avs --top-k 20
 $env:QA_ANSWER_MODE = "required"
 python -m backend.app.services.retrieval.run_task_smoke --task qa --top-k 5
 ```
@@ -273,12 +291,7 @@ python -m backend.app.services.retrieval.run_task_smoke `
   --task kis `
   --kis-query "một người đàn ông mặc áo xanh đang cầm điện thoại" `
   --top-k 20 `
-  --output reports/kis_smoke.json
-
-python -m backend.app.services.retrieval.run_task_smoke `
-  --task avs `
-  --avs-query "tất cả cảnh có xe buýt đi qua giao lộ" `
-  --top-k 20
+  --output data/reports/kis_smoke.json
 
 $env:QA_ANSWER_MODE = "required"
 python -m backend.app.services.retrieval.run_task_smoke `
@@ -287,7 +300,7 @@ python -m backend.app.services.retrieval.run_task_smoke `
   --top-k 5
 ```
 
-KIS/AVS dừng ở evidence bundle và không gọi Qwen answerer. QA mới dùng
+KIS dừng ở evidence bundle và không gọi Qwen answerer. QA mới dùng
 `QA_ANSWER_MODE`; query expansion, BGE dense và BGE reranker có feature flag riêng.
 Các lỗi `bge_dense_not_enabled`, `bge_reranker_not_enabled`,
 `routing_bge_dense_not_applied` hoặc `routing_reranker_not_applied` nghĩa là strict
@@ -307,6 +320,41 @@ nhận thêm `task_mode` và `expanded_queries`, trả answer status/citations c
 evidence bundle. Score chỉ dùng để xếp hạng trong cùng query/path, không phải xác
 suất đã hiệu chỉnh. Hiện không có host, port hay port-conflict policy.
 
+### Xuất CSV KIS và QA
+
+Router `backend/app/api/search.py` cung cấp contract `POST /search/export` để
+mount vào FastAPI application sau này:
+
+```json
+{"query":"người mặc áo đỏ cầm điện thoại","task":"kis","top_k":100}
+```
+
+Response là `text/csv; charset=utf-8` với `Content-Disposition: attachment`.
+KIS dùng header `video_id,frame_id`; QA dùng
+`video_id,frame_id,answer`. Ranking được giữ nguyên, cặp frame trùng bị loại theo
+lần xuất hiện đầu tiên và không tạo row giả. QA chỉ xuất khi grounded answer có
+`status=answered`, nội dung không rỗng và citation hợp lệ; abstain hoặc thiếu dẫn
+chứng trả lỗi rõ ràng. `top_k` chỉ nhận từ 1 đến 100 và TRAKE bị từ chối vì chưa
+được triển khai.
+
+CLI dùng chung serializer/service với API:
+
+```powershell
+python -m backend.app.services.submission.export_query `
+  --task kis --query "người mặc áo đỏ cầm điện thoại" --top-k 100 `
+  --output data/submissions/kis_result.csv
+```
+
+Khi chưa có `data/sample_submission.csv` chính thức, `video_id` là stem không có
+`.mp4`. `frame_id` luôn lấy từ trường `frame_index` ánh xạ về video gốc; không
+dùng ordinal của keyframe, timestamp, tên file hoặc FAISS row.
+
+Để chuẩn bị caption offline, tải đúng `Qwen/Qwen3-VL-8B-Instruct` revision
+`b5bc35aa2d1dc2db88ca1482375afc801511bffb` vào
+`data/model_cache/caption` trên máy có mạng, sau đó chuyển nguyên cache sang máy
+chạy. Cần profile VRAM theo dtype, quantization và batch size của model 8B; repo
+không công bố một con số VRAM cố định chưa được đo.
+
 ## Artifact và lineage
 
 | Nhóm | Vị trí mặc định/điển hình | Nội dung |
@@ -314,8 +362,8 @@ suất đã hiệu chỉnh. Hiện không có host, port hay port-conflict polic
 | Frame/keyframe | `data/keyframes/` | JPEG và canonical candidate/frame identity |
 | Metadata | `data/metadata/` | keyframe, caption, OCR, objects, segments, neighbors |
 | Embedding/index | `data/embeddings/`, `data/indexes/` | SigLIP2 arrays/FAISS, BGE FAISS, maps/manifests |
-| Cache | `data/model_cache/`, QA cache path | Downloaded checkpoints và grounded-answer cache |
-| Log/report | extract/index/model reports | status, hashes, model/config fingerprint |
+| Cache | `data/model_cache/`, `data/cache/` | Downloaded checkpoints và grounded-answer cache |
+| Submission/report | `data/submissions/`, `data/reports/` | CSV đã lưu và báo cáo lineage/runtime |
 
 Không có transcript/ASR artifact trong contract hiện tại. Không ghép file từ các
 run chỉ dựa vào tên: loader kiểm tra dimension, normalization, row identity và

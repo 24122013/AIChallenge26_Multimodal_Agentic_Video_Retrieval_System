@@ -30,8 +30,8 @@ from backend.app.services.ingestion.common import (
 )
 
 
-DEFAULT_MODEL_NAME = "Qwen/Qwen3.5-4B"
-DEFAULT_MODEL_REVISION = "c7429d5a8ed57f4a9cfdaf1af76a8943eba0ae97"
+DEFAULT_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+DEFAULT_MODEL_REVISION = "b5bc35aa2d1dc2db88ca1482375afc801511bffb"
 DEFAULT_PROMPT = """Describe this video keyframe specifically for multimedia retrieval.
 
 Focus only on visually observable information.
@@ -74,7 +74,7 @@ class CaptionBackend(Protocol):
 
 
 class QwenCaptionBackend:
-    """Lazy local Qwen3.5 multimodal caption backend."""
+    """Lazy local Qwen3-VL image-to-text caption backend."""
 
     def __init__(
         self,
@@ -126,11 +126,11 @@ class QwenCaptionBackend:
             return
         try:
             import torch
-            from transformers import AutoModelForMultimodalLM, AutoProcessor
+            from transformers import AutoModelForImageTextToText, AutoProcessor
         except ImportError as exc:
             raise RuntimeError(
-                "Qwen3.5 captioning requires torch and a Transformers release with "
-                "AutoModelForMultimodalLM support. Install requirements.txt."
+                "Qwen3-VL captioning requires torch and a Transformers release with "
+                "AutoModelForImageTextToText support. Install requirements.txt."
             ) from exc
 
         kwargs: dict[str, Any] = {}
@@ -154,7 +154,7 @@ class QwenCaptionBackend:
                 bnb_4bit_compute_dtype=self._torch_dtype,
             )
             model_kwargs["device_map"] = "auto"
-        self._model = AutoModelForMultimodalLM.from_pretrained(
+        self._model = AutoModelForImageTextToText.from_pretrained(
             self.model_name,
             **model_kwargs,
         )

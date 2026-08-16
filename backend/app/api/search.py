@@ -12,10 +12,14 @@ from backend.app.services.retrieval.retrieval_manager import (
     search_visual,
 )
 from backend.app.services.retrieval.qa_pipeline import RequiredQaPipelineError
+from backend.app.services.submission.csv_export import (
+    SubmissionExportError,
+    export_query_csv,
+)
 
 try:  # pragma: no cover - depends on optional API runtime.
     from fastapi import APIRouter, HTTPException
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, Response
     from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover
     APIRouter = None
@@ -34,6 +38,11 @@ if APIRouter is not None:
         top_k: int = Field(default=20, ge=1, le=200)
         task_mode: str = "auto"
         expanded_queries: list[str] = Field(default_factory=list, max_length=20)
+
+    class ExportBody(BaseModel):
+        query: str
+        task: str
+        top_k: int = Field(default=100, ge=1, le=100)
 
     @router.post("")
     def search_endpoint(body: SearchBody) -> dict:
@@ -63,6 +72,32 @@ if APIRouter is not None:
         except FileNotFoundError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - convert service errors to API response.
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post("/export")
+    def export_search_endpoint(body: ExportBody) -> Response:
+        try:
+            exported = export_query_csv(body.query, body.task, body.top_k)
+            return Response(
+                content=exported.content.encode("utf-8"),
+                media_type="text/csv; charset=utf-8",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="{exported.filename}"'
+                    )
+                },
+            )
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except RequiredQaPipelineError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except SubmissionExportError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 else:
     router = None

@@ -148,6 +148,7 @@ class QaEvidence:
     evidence_id: str
     video_id: str
     frame_id: str
+    frame_index: int | None
     shot_id: str
     timestamp: float
     image_path: str
@@ -173,6 +174,7 @@ class QaEvidence:
             "evidence_id": self.evidence_id,
             "video_id": self.video_id,
             "frame_id": self.frame_id,
+            "frame_index": self.frame_index,
             "shot_id": self.shot_id,
             "timestamp": self.timestamp,
             "image_path": self.image_path,
@@ -1306,6 +1308,7 @@ def _build_evidence(
         evidence_id=f"E{index:03d}",
         video_id=result.video_id,
         frame_id=result.frame_id,
+        frame_index=result.frame_index,
         shot_id=result.shot_id or result.segment_id,
         timestamp=float(result.timestamp),
         image_path=image_path,

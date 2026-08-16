@@ -11,47 +11,30 @@ __pycache__/
 /yoloe-*.pt
 /mobileclip*.ts
 
-# Local/public competition datasets and generated submissions.
+# Local datasets and generated runtime artifacts.
 data/public/
-data/competition/
 
-data/raw/video/
+data/raw/video/*
+!data/raw/video/.gitkeep
 data/raw/*.zip
 data/**/*.jpg
 data/**/*.jpeg
 data/**/*.png
-data/embeddings/
-data/indexes/
-data/model_cache/
+data/embeddings/*
+!data/embeddings/.gitkeep
+data/indexes/*
+!data/indexes/.gitkeep
+data/model_cache/*
+!data/model_cache/.gitkeep
 data/smoke/
 data/keyframes/*
 !data/keyframes/.gitkeep
 data/keyframes_*/
 data/metadata/*
 !data/metadata/.gitkeep
-
-# Generated artifacts from the public competition adapter.
-competition/keyframes/*
-!competition/keyframes/.gitkeep
-competition/metadata/*
-!competition/metadata/.gitkeep
-competition/embeddings/*
-!competition/embeddings/.gitkeep
-competition/indexes/*
-!competition/indexes/.gitkeep
-competition/results/*
-!competition/results/.gitkeep
-competition/evaluation/*
-!competition/evaluation/.gitkeep
-!competition/evaluation/__init__.py
-!competition/evaluation/qa_evaluation.py
-!competition/evaluation/qa_model_benchmark.py
-!competition/evaluation/qa_quality_gates.py
-!competition/evaluation/qa_real_split_manifest.template.json
-!competition/evaluation/qa_example_dataset.jsonl
-!competition/evaluation/qa_split_manifest.example.json
-!competition/evaluation/README_QA_EVALUATION.md
-competition/work/*
-!competition/work/.gitkeep
-competition/runs/*
-!competition/runs/.gitkeep
+data/cache/*
+!data/cache/.gitkeep
+data/submissions/*
+!data/submissions/.gitkeep
+data/reports/*
+!data/reports/.gitkeep

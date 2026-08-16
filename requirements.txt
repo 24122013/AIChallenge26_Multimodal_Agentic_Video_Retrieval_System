@@ -1,4 +1,4 @@
-# Canonical Python dependencies for backend, competition runtime, scripts, and tests.
+# Canonical Python dependencies for backend runtime, scripts, and tests.
 # Install exactly one compatible PyTorch profile and exactly one PaddlePaddle
 # profile first; see README.md. They are intentionally absent here so pip cannot
 # replace CPU/CUDA wheels with a conflicting build.

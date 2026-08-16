@@ -364,7 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("reports/index_size_latency_benchmark.json"),
+        default=Path("data/reports/index_size_latency_benchmark.json"),
     )
     parser.add_argument("--videos", type=int, default=4)
     parser.add_argument("--frames-per-video", type=int, default=250)
