@@ -454,6 +454,35 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
 
         caption_runner.assert_called_once()
 
+    def test_ocr_worker_isolates_paddle_from_parent_torch_runtime(self) -> None:
+        metadata_path = self.root / "dense.jsonl"
+        output_path = self.root / "ocr.jsonl"
+        report_path = self.root / "ocr_report.json"
+        metadata_path.write_text("{}\n", encoding="utf-8")
+
+        def run_worker(command, *, cwd, check):
+            self.assertEqual(command[0], pipeline.sys.executable)
+            self.assertIn("--isolate-paddle-runtime", command)
+            self.assertIn("--overwrite", command)
+            self.assertEqual(cwd, Path(pipeline.__file__).resolve().parents[3])
+            self.assertFalse(check)
+            report_path.write_text(
+                json.dumps({"pipeline": "ocr", "success_count": 1}),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(returncode=0)
+
+        with patch.object(pipeline.subprocess, "run", side_effect=run_worker):
+            report = pipeline._run_ocr_file_isolated(
+                metadata_path=metadata_path,
+                output_path=output_path,
+                report_path=report_path,
+                config=self.config,
+                overwrite=True,
+            )
+
+        self.assertEqual(report["success_count"], 1)
+
     def test_empty_siglip_checkpoint_is_invalidated_and_rebuilt(self) -> None:
         video = self._video("video_empty_npy")
         materialized = self._materialized_stage(video.stem, 1)

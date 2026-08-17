@@ -126,28 +126,26 @@ def export_query_csv(
     task: str,
     top_k: int = 100,
     *,
-    kis_search: Callable[..., Any] | None = None,
-    qa_search: Callable[..., Mapping[str, Any]] | None = None,
+    online_search: Callable[..., Mapping[str, Any]] | None = None,
 ) -> ExportedCsv:
     request = ExportRequest.parse(query, task, top_k)
-    if request.task is SubmissionTask.KIS:
-        if kis_search is None:
-            from backend.app.services.retrieval.retrieval_manager import search_hybrid
+    if online_search is None:
+        from backend.app.services.retrieval.retrieval_manager import search_online
 
-            kis_search = search_hybrid
-        response = kis_search(query=request.query, top_k=request.top_k)
+        online_search = search_online
+    response = online_search(
+        query=request.query,
+        task=request.task.value,
+        top_k=request.top_k,
+    )
+    if request.task is SubmissionTask.KIS:
         payload = _mapping(response)
-        candidates = payload.get("results")
+        candidates = payload.get("candidates")
         if not isinstance(candidates, Sequence) or isinstance(candidates, (str, bytes)):
             raise SubmissionExportError("KIS retrieval returned no ranked results")
         content = serialize_kis_csv(candidates, top_k=request.top_k)
         row_count = max(0, content.count("\r\n") - 1)
     else:
-        if qa_search is None:
-            from backend.app.services.retrieval.retrieval_manager import search_qa
-
-            qa_search = search_qa
-        response = qa_search(query=request.query, top_k=request.top_k, task_mode="qa")
         content = serialize_qa_csv(response, top_k=request.top_k)
         row_count = max(0, content.count("\r\n") - 1)
     return ExportedCsv(

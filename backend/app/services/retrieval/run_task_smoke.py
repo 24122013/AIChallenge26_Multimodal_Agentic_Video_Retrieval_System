@@ -1,8 +1,8 @@
-"""Run bounded KIS, AVS, and grounded-QA checks on existing artifacts.
+"""Run bounded canonical online-pipeline checks on existing artifacts.
 
 This command never builds a submission.  It is the post-submission verification
-surface used by the Colab launcher and README examples.  KIS/AVS stop at the
-evidence bundle; only QA invokes the configured grounded answerer.
+surface used by the Colab launcher and README examples.  Every task enters via
+``search_online``; only QA invokes the configured grounded answerer.
 """
 from __future__ import annotations
 
@@ -21,9 +21,8 @@ from backend.app.services.retrieval.bge_dense import BGE_M3_SCHEMA_VERSION
 from backend.app.services.retrieval.qa_pipeline import RequiredQaPipelineError
 from backend.app.services.retrieval.retrieval_manager import (
     clear_retrieval_caches,
-    get_qa_evidence_search_engine,
     get_qa_runtime_lineage,
-    search_qa,
+    search_online,
 )
 
 
@@ -40,9 +39,17 @@ class SmokeValidationError(RuntimeError):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", choices=("kis", "avs", "qa", "all"), default="all")
+    parser.add_argument(
+        "--task",
+        choices=("kis", "avs", "temporal", "qa", "all"),
+        default="all",
+    )
     parser.add_argument("--kis-query", default=DEFAULT_QUERIES["kis"])
     parser.add_argument("--avs-query", default=DEFAULT_QUERIES["avs"])
+    parser.add_argument(
+        "--temporal-query",
+        default="a person enters a room, then sits down",
+    )
     parser.add_argument("--qa-query", default=DEFAULT_QUERIES["qa"])
     parser.add_argument("--expanded-query", action="append", default=[])
     parser.add_argument("--top-k", type=int, default=5)
@@ -96,19 +103,12 @@ def _task_payload(
     expanded: list[str],
 ) -> dict[str, Any]:
     started = time.perf_counter()
-    if task == "qa":
-        response = search_qa(
-            query,
-            top_k=top_k,
-            task_mode="qa",
-            expanded_queries=expanded,
-        )
-    else:
-        response = get_qa_evidence_search_engine().search(
-            query,
-            top_k=top_k,
-            task_mode=task,
-        )
+    response = search_online(
+        query=query,
+        task=task,
+        top_k=top_k,
+        expanded_queries=expanded if task == "qa" else (),
+    )
     query_plan = response.get("query_plan", {})
     needs_temporal = bool(
         query_plan.get("needs_temporal")
@@ -116,6 +116,9 @@ def _task_payload(
         else False
     )
     evidence_limit = 5 if needs_temporal else top_k
+    evidence_source = response.get("evidence")
+    if not evidence_source and task in {"kis", "avs"}:
+        evidence_source = _candidate_evidence(response.get("candidates"), top_k)
     payload = {
         "task": task,
         "query": query,
@@ -128,7 +131,8 @@ def _task_payload(
             response.get("preflight_block_reason") if task == "qa" else None
         ),
         "temporal_matches": response.get("temporal_matches", []),
-        "evidence": _bounded_evidence(response.get("evidence"), evidence_limit),
+        "candidates": list(response.get("candidates") or []),
+        "evidence": _bounded_evidence(evidence_source, evidence_limit),
         # Snapshot after retrieval so the reranker report proves this exact
         # request reached the model rather than merely having it configured.
         "runtime_lineage": get_qa_runtime_lineage(),
@@ -138,6 +142,47 @@ def _task_payload(
         ),
     }
     return payload
+
+
+def _candidate_evidence(items: object, limit: int) -> list[dict[str, Any]]:
+    """Adapt canonical KIS/AVS candidates to the smoke evidence validator."""
+
+    if not isinstance(items, list):
+        return []
+    evidence: list[dict[str, Any]] = []
+    for index, item in enumerate(items[:limit], start=1):
+        if not isinstance(item, Mapping):
+            continue
+        modality_scores = item.get("modality_scores")
+        source_modalities = (
+            sorted(
+                str(name)
+                for name, score in modality_scores.items()
+                if float(score) != 0.0 and name not in {"fusion", "rrf"}
+            )
+            if isinstance(modality_scores, Mapping)
+            else []
+        )
+        evidence.append(
+            {
+                "evidence_id": f"E{index:03d}",
+                "video_id": item.get("video_id"),
+                "frame_id": item.get("frame_id") or item.get("keyframe_id"),
+                "shot_id": item.get("shot_id"),
+                "timestamp": item.get("timestamp"),
+                "image_path": item.get("keyframe_path") or item.get("thumbnail_path"),
+                "caption": item.get("caption"),
+                "ocr_text": item.get("ocr_text"),
+                "objects": item.get("objects") or [],
+                "source_modalities": source_modalities,
+                "retrieval_score": item.get("rerank_score", item.get("score")),
+                "base_retrieval_score": item.get("fusion_score"),
+                "constraint_score": 0.0,
+                "matched_constraints": [],
+                "warnings": [],
+            }
+        )
+    return evidence
 
 
 def _validate_runtime_lineage(lineage: object) -> list[str]:
@@ -221,7 +266,11 @@ def _positive_int(value: object) -> bool:
 
 def _validate_task_payload(payload: Mapping[str, Any]) -> list[str]:
     task = str(payload.get("task") or "")
-    issues = _validate_runtime_lineage(payload.get("runtime_lineage"))
+    issues = (
+        _validate_runtime_lineage(payload.get("runtime_lineage"))
+        if task == "qa"
+        else []
+    )
     evidence = payload.get("evidence")
     if not isinstance(evidence, list) or not evidence:
         issues.append("evidence_empty")
@@ -253,22 +302,32 @@ def _validate_task_payload(payload: Mapping[str, Any]) -> list[str]:
         trace = {}
     if trace.get("fallback_used") or list(trace.get("fallback_reasons") or []):
         issues.append("retrieval_fallback_used")
-    if trace.get("reranker") != "applied":
-        issues.append("routing_reranker_not_applied")
-    modality_queries = trace.get("modality_queries")
-    dense_calls = [
-        item
-        for item in modality_queries
-        if isinstance(item, Mapping) and item.get("modality") == "dense_text"
-    ] if isinstance(modality_queries, list) else []
-    if (
-        not dense_calls
-        or any(item.get("error") for item in dense_calls)
-        or any(not _positive_int(item.get("candidate_count")) for item in dense_calls)
-    ):
-        issues.append("routing_bge_dense_not_applied")
+    if task == "qa":
+        if trace.get("reranker") != "applied":
+            issues.append("routing_reranker_not_applied")
+        modality_queries = trace.get("modality_queries")
+        dense_calls = [
+            item
+            for item in modality_queries
+            if isinstance(item, Mapping) and item.get("modality") == "dense_text"
+        ] if isinstance(modality_queries, list) else []
+        if (
+            not dense_calls
+            or any(item.get("error") for item in dense_calls)
+            or any(not _positive_int(item.get("candidate_count")) for item in dense_calls)
+        ):
+            issues.append("routing_bge_dense_not_applied")
 
     query_plan = payload.get("query_plan")
+    original_query = (
+        " ".join(str(query_plan.get("original_query") or "").split())
+        if isinstance(query_plan, Mapping)
+        else ""
+    )
+    if original_query and original_query != " ".join(
+        str(payload.get("query") or "").split()
+    ):
+        issues.append("original_query_anchor_missing")
     needs_temporal = bool(
         query_plan.get("needs_temporal")
         if isinstance(query_plan, Mapping)
@@ -519,10 +578,15 @@ def _isolated_answer_cache(enabled: bool):
 def run(args: argparse.Namespace) -> dict[str, Any]:
     if not 1 <= int(args.top_k) <= 20:
         raise ValueError("--top-k must be within [1, 20]")
-    tasks = ("kis", "avs", "qa") if args.task == "all" else (args.task,)
+    tasks = (
+        ("kis", "avs", "temporal", "qa")
+        if args.task == "all"
+        else (args.task,)
+    )
     queries = {
         "kis": args.kis_query,
         "avs": args.avs_query,
+        "temporal": args.temporal_query,
         "qa": args.qa_query,
     }
     with _isolated_answer_cache("qa" in tasks):

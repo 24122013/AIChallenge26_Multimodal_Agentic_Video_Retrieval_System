@@ -472,7 +472,7 @@ class QaPipelineApiTest(unittest.TestCase):
             "latency_ms": 0,
         }
         with patch(
-            "backend.app.api.search.search_qa",
+            "backend.app.api.search.search_online",
             return_value=expected,
         ) as mocked:
             response = search(
@@ -485,22 +485,24 @@ class QaPipelineApiTest(unittest.TestCase):
         self.assertEqual(response, expected)
         mocked.assert_called_once_with(
             query="What is she holding?",
+            task="qa",
             top_k=5,
-            task_mode="qa",
             expanded_queries=["woman holding an object"],
         )
 
-    def test_legacy_qa_alias_is_unchanged(self) -> None:
+    def test_qa_alias_uses_canonical_online_pipeline(self) -> None:
         expected = {"answer_mode": "manual_visual_inspection", "results": []}
         with patch(
-            "backend.app.api.search.search_qa_evidence",
+            "backend.app.api.search.search_online",
             return_value=expected,
         ) as mocked:
             response = search("người phụ nữ cầm gì", 5, "qa")
         self.assertEqual(response, expected)
         mocked.assert_called_once_with(
-            question="người phụ nữ cầm gì",
+            query="người phụ nữ cầm gì",
+            task="qa",
             top_k=5,
+            expanded_queries=[],
         )
 
 

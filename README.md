@@ -25,14 +25,11 @@ video
   -> SigLIP2 FAISS + neighbor/segment metadata
   -> BM25 text index + optional BGE-M3 dense text index
 
-ONLINE KIS
-query -> typed query plan -> visual/text/temporal retrieval
-      -> weighted fusion -> deterministic rerank -> ranked frames
-
-ONLINE QA
-question -> typed QA/temporal plan -> shared retrieval
-         -> optional BGE-M3 + cross-encoder -> evidence bundle
-         -> optional Qwen grounded answer, or abstain
+ONLINE (một entrypoint: search_online -> OnlinePipeline)
+query + task (KIS/AVS/temporal/QA/auto)
+  -> typed query plan -> visual/text/temporal retrieval
+  -> weighted fusion -> deterministic rerank -> canonical candidates
+  -> QA only: evidence bundle -> optional Qwen grounded answer, or abstain
 ```
 
 - KIS trả về frame/segment đã xếp hạng từ visual, caption, OCR, objects và
@@ -137,6 +134,10 @@ Repository **không tự load file `.env`**; đặt biến bằng shell hoặc p
 | `RETRIEVAL_MANIFEST_PATH` | Khi search visual | Path dưới `data/metadata` | Backend | Encoder dimension/normalization/lineage |
 | `RETRIEVAL_TEXT_INDEX_PATH` | Khi bật text | `data/indexes/retrieval_text_index.json` | Backend | Caption/OCR/object sparse index |
 | `RETRIEVAL_DEVICE` | Không | `auto` | Backend | `auto`, `cpu` hoặc `cuda` |
+| `ONLINE_NEIGHBOR_CONTEXT_ENABLED` | Không | `false` | Online pipeline | Đọc trực tiếp `neighbors_all.jsonl` sau rerank |
+| `ONLINE_SEGMENT_CONTEXT_ENABLED` | Không | `false` | Online/temporal | Gắn canonical segment trước temporal matching |
+| `ONLINE_NEIGHBOR_PATH` | Khi bật neighbor | `data/metadata/neighbors_all.jsonl` | Online pipeline | Canonical neighbor artifact |
+| `ONLINE_SEGMENT_PATH` | Khi bật segment | `data/metadata/segments_all.jsonl` | Online pipeline | Canonical segment artifact |
 | `QA_BGE_DENSE_ENABLED` | Không | `false` | QA backend | Bật BGE dense retrieval |
 | `QA_BGE_INDEX_ROOT` | Khi bật BGE | `data/indexes/bge_m3` | QA backend | BGE index/map/manifest root |
 | `QA_BGE_RERANKER_ENABLED` | Không | `false` | QA backend | Bật cross-encoder rerank |
@@ -211,6 +212,9 @@ Có thể đổi bằng `--neighbor-window-seconds`, `--segment-strategy` và
 
 Dense workspace được cô lập tại `data/candidates/`, `data/dense_keyframes/` và
 `data/candidate_features/`, nên không thể lọt vào glob retrieval canonical.
+OCR được chạy trong một child process chỉ nạp Paddle để tránh xung đột DLL cuDNN
+giữa wheel Torch và Paddle trên Windows; parent pipeline vẫn dùng Torch/CUDA cho
+SigLIP2, object detection và caption như bình thường.
 Selected artifacts nằm tại `data/keyframes/`, `data/embeddings/` và
 `data/metadata/`; per-video/corpus reports nằm dưới `data/reports/offline/`.
 `data/metadata/neighbors_all.jsonl` và `segments_all.jsonl` cũng được build từ
@@ -236,21 +240,85 @@ Logic chọn keyframe đa phương thức vẫn nằm trong
 `backend/app/services/indexing/keyframe_multimodal_pipeline.py`; entrypoint chỉ
 điều phối, checkpoint, persist và validate, không copy lại thuật toán selector.
 
-### Smoke KIS và QA
+## Cách chạy query online
 
-`run_task_smoke` là CLI **không tương tác**: chương trình không dừng lại để hỏi
-query trong terminal. Nếu không truyền query, nó tự dùng các câu mặc định sau:
+Sau khi phần offline đã tạo xong index và metadata trong `data/`, mở PowerShell tại
+thư mục gốc repository và chạy đúng lệnh sau:
+
+```powershell
+.\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline --task auto --query "người đàn ông mặc áo đỏ đang mở cửa xe" --top-k 20
+```
+
+Trong đó:
+
+- `--query`: câu bạn muốn tìm hoặc câu hỏi cần trả lời.
+- `--top-k 20`: lấy tối đa 20 kết quả.
+- `--task auto`: để hệ thống tự chọn cách xử lý. Nếu chưa biết chọn gì, cứ giữ
+  nguyên `auto`.
+
+Kết quả JSON được in ngay trong terminal. Muốn lưu kết quả vào file thì thêm:
+
+```powershell
+--output data/reports/online_query.json
+```
+
+Luồng chạy rất đơn giản:
+
+```text
+câu query -> OnlinePipeline -> đọc index đã có trong data/ -> trả kết quả
+```
+
+`OnlinePipeline` **không chạy lại phần offline**, không cắt video và không build
+lại index. Nó chỉ tìm kiếm trên artifact mà offline đã tạo trước đó.
+
+Nếu cần ép loại bài toán thay vì dùng `auto`, thay giá trị của `--task`:
+
+| Giá trị | Dùng khi |
+|---|---|
+| `kis` | Tìm đúng một cảnh hoặc khoảnh khắc cụ thể |
+| `avs` | Tìm nhiều cảnh phù hợp với mô tả |
+| `temporal` | Query có thứ tự sự kiện, ví dụ “mở cửa rồi ngồi xuống” |
+| `qa` | Đặt câu hỏi và cần câu trả lời dựa trên video |
+
+Tóm lại: query bình thường chỉ chạy module `online_pipeline` ở lệnh trên.
+`run_task_smoke` bên dưới chỉ dùng để kiểm tra hệ thống, không phải lệnh query
+thứ hai.
+
+### Dành cho code Python và API
+
+Code Python, API, CSV export và smoke đều đi qua cùng một hàm `search_online()` và
+cùng một `OnlinePipeline`. Ví dụ gọi trực tiếp từ Python:
+
+```python
+from backend.app.services.retrieval.retrieval_manager import search_online
+
+response = search_online(query="người mặc áo đỏ", task="auto", top_k=20)
+print(response["candidates"])
+```
+
+Neighbor/segment context là tùy chọn nâng cao và mặc định tắt. Các biến cấu hình
+tương ứng được liệt kê trong bảng môi trường ở phía trên.
+
+### Kiểm định cùng online pipeline bằng smoke
+
+`run_task_smoke` không phải cách query thứ hai. Đây chỉ là validator gọi lại
+`search_online()` để kiểm tra artifact, ảnh evidence và các model bắt buộc. Chỉ
+dùng lệnh này khi cần xác nhận môi trường chạy đúng; query bình thường dùng CLI ở
+trên. Chương trình không dừng lại để hỏi query trong terminal và tự dùng câu mặc
+định nếu không truyền:
 
 | Task | Tham số để đổi query | Query mặc định |
 |---|---|---|
 | KIS | `--kis-query` | `người phụ nữ mặc áo đỏ đang cầm điện thoại` |
+| AVS | `--avs-query` | Query AVS mặc định trong smoke runner |
+| Temporal | `--temporal-query` | `a person enters a room, then sits down` |
 | QA | `--qa-query` | `Người phụ nữ mặc áo đỏ đang cầm vật gì?` |
 
-Đây là **strict smoke**, không phải sanity check tối giản. Validator yêu cầu BGE-M3
-dense retrieval và BGE cross-encoder thực sự được áp dụng cho KIS và QA.
-Vì vậy phải build `data/indexes/bge_m3/{bge_m3_flat_ip.faiss,
+Với task QA, đây là **strict smoke**, không phải sanity check tối giản: validator
+yêu cầu BGE-M3 dense retrieval, BGE cross-encoder và answer model thực sự được áp
+dụng. Vì vậy phải build `data/indexes/bge_m3/{bge_m3_flat_ip.faiss,
 bge_m3_frame_map.json,bge_m3_manifest.json}` từ canonical selected-keyframe hoặc
-segment metadata, rồi đặt các biến dưới đây **trước khi chạy bất kỳ task nào**:
+segment metadata, rồi đặt các biến dưới đây trước khi chạy QA:
 
 ```powershell
 $env:QA_BGE_DENSE_ENABLED = "true"
@@ -288,8 +356,8 @@ python -m backend.app.services.retrieval.run_task_smoke `
   --top-k 5
 ```
 
-KIS dừng ở evidence bundle và không gọi Qwen answerer. QA mới dùng
-`QA_ANSWER_MODE`; query expansion, BGE dense và BGE reranker có feature flag riêng.
+KIS, AVS và temporal không gọi Qwen answerer. Chỉ QA dùng `QA_ANSWER_MODE`;
+query expansion, BGE dense và BGE reranker có feature flag riêng.
 Các lỗi `bge_dense_not_enabled`, `bge_reranker_not_enabled`,
 `routing_bge_dense_not_applied` hoặc `routing_reranker_not_applied` nghĩa là strict
 smoke chưa chứng minh được BGE path, không đồng nghĩa visual retrieval không chạy.
@@ -297,8 +365,9 @@ smoke chưa chứng minh được BGE path, không đồng nghĩa visual retriev
 Hiện tại chưa có `FastAPI()` application factory, router mounting, health
 endpoint hoặc host/port chuẩn. `backend/app/api/retrieval.py` và `search.py` chỉ
 định nghĩa router/service contract; không chạy `uvicorn` cho đến khi bổ sung app
-entrypoint. Các route dự kiến khi được mount là `/retrieval/{visual,hybrid,
-caption,ocr,object,temporal,qa-evidence,qa}` và `/search`.
+entrypoint. Route online chính khi được mount là `/retrieval/online` hoặc
+`/search`; các route cũ và modality-only được giữ làm alias/diagnostic nhưng đều
+ủy quyền task public về cùng `OnlinePipeline`.
 
 Contract đã triển khai trong router (nhưng chưa phục vụ HTTP) nhận JSON như
 `{"query":"người đang đi xe đạp","top_k":20}`. Response envelope là

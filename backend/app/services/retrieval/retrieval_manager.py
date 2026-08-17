@@ -10,11 +10,17 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, TypeVar, cast
 
 from backend.app.models.retrieval import VisualSearchResponse
+from backend.app.pipelines.online_pipeline import OnlinePipeline, OnlinePipelineConfig
 from backend.app.services.agent.query_expansion import (
     QueryExpansionProvider,
     build_production_query_expansion_provider,
 )
 from backend.app.services.retrieval.hybrid_search import HybridSearchEngine
+from backend.app.services.retrieval.online_context import (
+    DEFAULT_NEIGHBOR_PATH,
+    DEFAULT_SEGMENT_PATH,
+    OnlineContextIndex,
+)
 from backend.app.services.retrieval.planned_hybrid import planned_hybrid_search
 from backend.app.services.retrieval.query_plan import build_query_plan
 from backend.app.services.retrieval.qa_evidence import (
@@ -479,6 +485,62 @@ def get_hybrid_search_engine(
 
 
 @_corpus_generation_cached
+def get_online_context_index(
+    corpus_key: _CorpusCacheKey,
+) -> OnlineContextIndex | None:
+    """Load enabled canonical context artifacts for the current generation."""
+
+    neighbors_enabled = _bool_from_env(
+        "ONLINE_NEIGHBOR_CONTEXT_ENABLED",
+        False,
+    )
+    segments_enabled = _bool_from_env(
+        "ONLINE_SEGMENT_CONTEXT_ENABLED",
+        False,
+    )
+    if not neighbors_enabled and not segments_enabled:
+        return None
+
+    neighbor_path = _path_from_env(
+        "ONLINE_NEIGHBOR_PATH",
+        DEFAULT_NEIGHBOR_PATH,
+    )
+    segment_path = _path_from_env(
+        "ONLINE_SEGMENT_PATH",
+        DEFAULT_SEGMENT_PATH,
+    )
+    frame_map_path = load_visual_search_config().frame_map_path
+    required_roles: list[str] = []
+    overrides: dict[str, Path] = {}
+    if neighbors_enabled:
+        required_roles.append("neighbor_metadata")
+        overrides["neighbor_metadata"] = neighbor_path
+    if segments_enabled:
+        required_roles.append("segment_metadata")
+        overrides["segment_metadata"] = segment_path
+    before = _validate_expected_corpus(
+        corpus_key,
+        required_roles=tuple(required_roles),
+        artifact_overrides=overrides,
+    )
+    context_index = OnlineContextIndex.from_artifacts(
+        neighbor_path=neighbor_path,
+        segment_path=segment_path,
+        frame_map_path=frame_map_path,
+        require_neighbors=neighbors_enabled,
+        require_segments=segments_enabled,
+    )
+    after = _validate_expected_corpus(
+        corpus_key,
+        required_roles=tuple(required_roles),
+        artifact_overrides=overrides,
+    )
+    if before != after:
+        raise ValueError("Offline corpus changed while online context was loading")
+    return context_index
+
+
+@_corpus_generation_cached
 def get_qa_evidence_search_engine(
     corpus_key: _CorpusCacheKey,
 ) -> QaEvidenceSearchEngine:
@@ -544,6 +606,7 @@ def get_qa_evidence_search_engine(
         hybrid_engine,
         dense_text_engine=dense_text_engine,
         candidate_reranker=reranker,
+        context_index=get_online_context_index(),
         config=_qa_routing_config(),
     )
     after = _validate_expected_corpus(
@@ -619,6 +682,44 @@ def get_qa_search_pipeline(
     return pipeline
 
 
+@_corpus_generation_cached
+def get_online_pipeline(
+    corpus_key: _CorpusCacheKey,
+) -> OnlinePipeline:
+    """Build the canonical online-only orchestrator for one corpus generation."""
+
+    runtime = get_runtime_config()
+    neighbors_enabled = _bool_from_env(
+        "ONLINE_NEIGHBOR_CONTEXT_ENABLED",
+        False,
+    )
+    segments_enabled = _bool_from_env(
+        "ONLINE_SEGMENT_CONTEXT_ENABLED",
+        False,
+    )
+    context_index = get_online_context_index()
+
+    pipeline = OnlinePipeline(
+        hybrid_engine=get_hybrid_search_engine(),
+        runtime_config=runtime,
+        query_expansion_provider=(
+            get_query_expansion_provider()
+            if runtime.query_expansion.enabled
+            else None
+        ),
+        qa_pipeline=get_qa_search_pipeline(),
+        qa_evidence_engine=get_qa_evidence_search_engine(),
+        context_index=context_index,
+        config=OnlinePipelineConfig(
+            include_neighbors=neighbors_enabled,
+            include_segments=segments_enabled,
+            max_top_k=runtime.hybrid.max_top_k,
+        ),
+    )
+    pipeline.corpus_generation = corpus_key.bundle_generation
+    return pipeline
+
+
 def get_qa_runtime_lineage() -> dict[str, Any]:
     """Return the exact QA model/index contracts used by the current engines."""
 
@@ -690,8 +791,10 @@ def clear_retrieval_caches() -> None:
         _query_expansion_provider_instance.close()
         _query_expansion_provider_instance = None
     for cached in (
+        get_online_pipeline,
         get_qa_search_pipeline,
         get_qa_evidence_search_engine,
+        get_online_context_index,
         get_hybrid_search_engine,
         get_object_search_engine,
         get_ocr_search_engine,
@@ -788,4 +891,23 @@ def search_qa(
         top_k=requested_top_k,
         task_mode=task_mode,
         expanded_queries=expanded_queries or (),
+    )
+
+
+def search_online(
+    query: str,
+    task: str = "kis",
+    top_k: int | None = None,
+    *,
+    expanded_queries: tuple[str, ...] | list[str] | None = None,
+    include_context: bool | None = None,
+) -> dict[str, Any]:
+    """Run one query through the canonical online orchestration layer."""
+
+    return get_online_pipeline().run(
+        query=query,
+        task=task,
+        top_k=top_k,
+        expanded_queries=expanded_queries or (),
+        include_context=include_context,
     )

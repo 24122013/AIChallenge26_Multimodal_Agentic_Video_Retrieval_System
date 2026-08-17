@@ -22,6 +22,8 @@ import logging
 import math
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -96,7 +98,6 @@ from backend.app.services.ingestion.ocr_pipeline import (
     DEFAULT_DETECTION_MODEL,
     DEFAULT_MODEL_REVISION as DEFAULT_OCR_REVISION,
     DEFAULT_RECOGNITION_MODEL,
-    run_ocr_file,
 )
 from backend.app.services.retrieval.bge_dense import (
     DEFAULT_BGE_M3_MODEL,
@@ -1658,6 +1659,55 @@ def _finalize_modality_report(
     _atomic_write_json(report_path, report)
 
 
+def _run_ocr_file_isolated(
+    *,
+    metadata_path: Path,
+    output_path: Path,
+    report_path: Path,
+    config: OfflinePipelineConfig,
+    overwrite: bool,
+) -> dict[str, Any]:
+    """Run PaddleOCR outside the Torch process to avoid Windows cuDNN clashes."""
+
+    command = [
+        sys.executable,
+        "-m",
+        "backend.app.services.ingestion.run_ocr",
+        "--metadata-path",
+        str(metadata_path.resolve()),
+        "--output-path",
+        str(output_path.resolve()),
+        "--report-path",
+        str(report_path.resolve()),
+        "--device",
+        config.device,
+        "--batch-size",
+        str(config.ocr_batch_size),
+        "--conf-threshold",
+        str(config.ocr_conf_threshold),
+        "--detection-model",
+        config.ocr_detection_model,
+        "--recognition-model",
+        config.ocr_recognition_model,
+        "--model-revision",
+        config.ocr_model_revision,
+        "--model-cache-dir",
+        str(config.ocr_model_cache_dir.resolve()),
+        "--isolate-paddle-runtime",
+    ]
+    if overwrite:
+        command.append("--overwrite")
+
+    project_root = Path(__file__).resolve().parents[3]
+    completed = subprocess.run(command, cwd=project_root, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Isolated PaddleOCR worker failed with exit code "
+            f"{completed.returncode}."
+        )
+    return _read_json(report_path)
+
+
 def _load_or_run_ocr_features(
     video_path: Path,
     materialized: MaterializedStageResult,
@@ -1704,18 +1754,12 @@ def _load_or_run_ocr_features(
         append_allowed=not overwrite,
     )
     try:
-        generated_report = run_ocr_file(
-            paths.dense_metadata,
+        generated_report = _run_ocr_file_isolated(
+            metadata_path=paths.dense_metadata,
             output_path=paths.dense_ocr,
             report_path=paths.dense_ocr_report,
-            device=config.device,
-            batch_size=config.ocr_batch_size,
-            conf_threshold=config.ocr_conf_threshold,
+            config=config,
             overwrite=overwrite,
-            detection_model=config.ocr_detection_model,
-            recognition_model=config.ocr_recognition_model,
-            revision=config.ocr_model_revision,
-            model_cache_dir=config.ocr_model_cache_dir,
         )
         records = _read_jsonl(paths.dense_ocr)
         _validate_modality_records(

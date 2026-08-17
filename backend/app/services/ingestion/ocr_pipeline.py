@@ -107,6 +107,27 @@ class PaddleOcrBackend:
         return list(self._pipeline.predict([str(path) for path in paths]))
 
 
+def choose_ocr_device(requested: str) -> str:
+    """Resolve the OCR device without importing Torch in an isolated worker."""
+
+    if os.environ.get("OCR_ISOLATED_PADDLE_RUNTIME") != "1":
+        return choose_device(requested)
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise ValueError("--device must be one of: auto, cpu, cuda")
+    if requested == "cpu":
+        return "cpu"
+
+    import paddle
+
+    available = bool(
+        paddle.device.is_compiled_with_cuda()
+        and paddle.device.cuda.device_count() > 0
+    )
+    if requested == "cuda" and not available:
+        raise RuntimeError("CUDA was requested, but Paddle cannot access a CUDA device.")
+    return "cuda" if available else "cpu"
+
+
 def normalize_text(value: str) -> str:
     normalized = unicodedata.normalize("NFC", str(value))
     normalized = "".join(
@@ -255,7 +276,7 @@ def run_ocr_file(
     video_id = video_id_from_records(records, metadata_path.stem)
     output_path = output_path or output_dir / f"ocr_{video_id}.jsonl"
     report_path = report_path or output_dir / f"ocr_{video_id}_report.json"
-    selected_device = choose_device(device)
+    selected_device = choose_ocr_device(device)
     backend = backend or PaddleOcrBackend(
         device=selected_device,
         detection_model=detection_model,

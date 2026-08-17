@@ -7,12 +7,9 @@ from __future__ import annotations
 
 from backend.app.services.retrieval.retrieval_manager import (
     search_caption,
-    search_hybrid,
     search_object,
     search_ocr,
-    search_qa,
-    search_qa_evidence,
-    search_temporal,
+    search_online,
     search_visual,
 )
 from backend.app.services.retrieval.qa_pipeline import RequiredQaPipelineError
@@ -42,13 +39,32 @@ if APIRouter is not None:
         task_mode: str = "qa"
         expanded_queries: list[str] = Field(default_factory=list, max_length=20)
 
+    class OnlineSearchBody(BaseModel):
+        query: str
+        task: str = "auto"
+        top_k: int = Field(default=20, ge=1, le=200)
+        expanded_queries: list[str] = Field(default_factory=list, max_length=20)
+
+    @router.post("/online")
+    def online_search_endpoint(body: OnlineSearchBody) -> dict:
+        return _response(
+            lambda: search_online(
+                body.query,
+                task=body.task,
+                top_k=body.top_k,
+                expanded_queries=body.expanded_queries,
+            )
+        )
+
     @router.post("/visual")
     def visual_search_endpoint(body: VisualSearchBody) -> dict:
         return _response(lambda: search_visual(body.query, body.top_k).to_dict())
 
     @router.post("/hybrid")
     def hybrid_search_endpoint(body: VisualSearchBody) -> dict:
-        return _response(lambda: search_hybrid(body.query, body.top_k).to_dict())
+        return _response(
+            lambda: search_online(body.query, task="kis", top_k=body.top_k)
+        )
 
     @router.post("/caption")
     def caption_search_endpoint(body: VisualSearchBody) -> dict:
@@ -65,29 +81,22 @@ if APIRouter is not None:
     @router.post("/temporal")
     def temporal_search_endpoint(body: VisualSearchBody) -> dict:
         return _response(
-            lambda: {
-                "query": body.query,
-                "top_k": body.top_k,
-                "results": [
-                    match.to_dict()
-                    for match in search_temporal(body.query, body.top_k)
-                ],
-            }
+            lambda: search_online(body.query, task="temporal", top_k=body.top_k)
         )
 
     @router.post("/qa-evidence")
     def qa_evidence_search_endpoint(body: VisualSearchBody) -> dict:
         return _response(
-            lambda: search_qa_evidence(body.query, body.top_k)
+            lambda: search_online(body.query, task="qa", top_k=min(5, body.top_k))
         )
 
     @router.post("/qa")
     def qa_search_endpoint(body: QaSearchBody) -> dict:
         return _response(
-            lambda: search_qa(
+            lambda: search_online(
                 body.query,
-                body.top_k,
-                task_mode=body.task_mode,
+                task="qa",
+                top_k=body.top_k,
                 expanded_queries=body.expanded_queries,
             )
         )
@@ -124,7 +133,7 @@ def visual_search(query: str, top_k: int = 20) -> dict:
 
 
 def hybrid_search(query: str, top_k: int = 20) -> dict:
-    return search_hybrid(query=query, top_k=top_k).to_dict()
+    return search_online(query=query, task="kis", top_k=top_k)
 
 
 def caption_search(query: str, top_k: int = 20) -> dict:
@@ -140,14 +149,11 @@ def object_search(query: str, top_k: int = 20) -> dict:
 
 
 def temporal_search(query: str, top_k: int = 20) -> list[dict]:
-    return [
-        match.to_dict()
-        for match in search_temporal(query=query, top_k=top_k)
-    ]
+    return search_online(query=query, task="temporal", top_k=top_k)["candidates"]
 
 
 def qa_evidence_search(question: str, top_k: int = 10) -> dict:
-    return search_qa_evidence(question=question, top_k=top_k)
+    return search_online(query=question, task="qa", top_k=min(5, top_k))
 
 
 def qa_search(
@@ -157,9 +163,9 @@ def qa_search(
     task_mode: str = "qa",
     expanded_queries: list[str] | None = None,
 ) -> dict:
-    return search_qa(
+    return search_online(
         query=query,
+        task="qa",
         top_k=top_k,
-        task_mode=task_mode,
         expanded_queries=expanded_queries or [],
     )

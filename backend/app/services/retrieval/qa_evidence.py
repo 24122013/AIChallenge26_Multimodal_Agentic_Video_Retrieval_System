@@ -16,6 +16,7 @@ from backend.app.services.retrieval.candidate_merger import (
     candidate_identity,
     merge_candidates,
 )
+from backend.app.services.retrieval.online_context import OnlineContextIndex
 from backend.app.services.retrieval.query_plan import QueryPlan, build_query_plan
 from backend.app.services.retrieval.query_terms import weighted_query_coverage
 from backend.app.services.retrieval.rank_fusion import weighted_rrf
@@ -255,6 +256,7 @@ class QaEvidenceSearchEngine:
         *,
         dense_text_engine: object | None = None,
         candidate_reranker: CandidateRerankerLike | None = None,
+        context_index: OnlineContextIndex | None = None,
         config: QaRoutingConfig | None = None,
         candidate_multiplier: int | None = None,
         consensus_bonus: float | None = None,
@@ -277,6 +279,7 @@ class QaEvidenceSearchEngine:
         self.hybrid_engine = hybrid_engine
         self.dense_text_engine = dense_text_engine
         self.candidate_reranker = candidate_reranker
+        self.context_index = context_index
         self.config = resolved
 
     def search(
@@ -482,6 +485,7 @@ class QaEvidenceSearchEngine:
         ] = {}
         conflict_sources: list[RetrievalResult] = []
         constraint_reports: list[dict[str, Any]] = []
+        canonical_segment_mappings = 0
         for event_index, event in enumerate(events):
             group, sources = self._retrieve_and_fuse(
                 event,
@@ -499,6 +503,8 @@ class QaEvidenceSearchEngine:
             )
             constraint_reports.append(dict(trace.constraint_rerank))
             pool = constrained[: self.config.fusion_pool_size]
+            pool, mapped_count = self._canonical_segment_candidates(pool)
+            canonical_segment_mappings += mapped_count
             event_results.append(pool)
             for identity, detail in details.items():
                 detail_by_event[(event_index, identity)] = detail
@@ -562,6 +568,10 @@ class QaEvidenceSearchEngine:
                 "answer_event_index": plan.answer_event_index,
                 "chain_id": best_match.chain_id if best_match else "",
                 "chain_score": best_match.score if best_match else None,
+                "canonical_segment_context": {
+                    "enabled": self.context_index is not None,
+                    "mapped_candidate_count": canonical_segment_mappings,
+                },
             }
         )
 
@@ -625,6 +635,31 @@ class QaEvidenceSearchEngine:
             "evidence": [item.to_dict() for item in evidence],
             "results": temporal_results,
         }
+
+    def _canonical_segment_candidates(
+        self,
+        candidates: Sequence[RetrievalResult],
+    ) -> tuple[list[RetrievalResult], int]:
+        """Attach segment IDs from ``segments_all`` before temporal matching."""
+
+        if self.context_index is None:
+            return (list(candidates), 0)
+        output: list[RetrievalResult] = []
+        mapped_count = 0
+        for candidate in candidates:
+            context = self.context_index.lookup(
+                video_id=candidate.video_id,
+                frame_id=candidate.frame_id,
+                timestamp=candidate.timestamp,
+                segment_id=candidate.segment_id,
+            )
+            if context.segment_id and context.segment_id != candidate.segment_id:
+                candidate = replace(candidate, segment_id=context.segment_id)
+                mapped_count += 1
+            elif context.segment is not None:
+                mapped_count += 1
+            output.append(candidate)
+        return (output, mapped_count)
 
     def _retrieve_and_fuse(
         self,

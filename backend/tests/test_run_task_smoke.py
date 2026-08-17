@@ -209,49 +209,46 @@ def _temporal_response(image_paths: list[Path]) -> dict:
 
 
 class RunTaskSmokeTest(unittest.TestCase):
-    @mock.patch("backend.app.services.retrieval.run_task_smoke.search_qa")
-    @mock.patch("backend.app.services.retrieval.run_task_smoke.get_qa_evidence_search_engine")
+    @mock.patch("backend.app.services.retrieval.run_task_smoke.search_online")
     @mock.patch("backend.app.services.retrieval.run_task_smoke.get_qa_runtime_lineage")
     @mock.patch("backend.app.services.retrieval.run_task_smoke.clear_retrieval_caches")
     def test_all_tasks_keep_answerer_qa_only(
         self,
         clear_mock: mock.Mock,
         lineage_mock: mock.Mock,
-        evidence_factory: mock.Mock,
-        qa_mock: mock.Mock,
+        online_mock: mock.Mock,
     ) -> None:
-        engine = mock.Mock()
-        evidence_factory.return_value = engine
         lineage_mock.return_value = _runtime_lineage()
         with tempfile.TemporaryDirectory() as temporary:
             image_path = Path(temporary) / "frame.jpg"
             Image.new("RGB", (2, 2), color="red").save(image_path)
-            engine.search.side_effect = (
-                lambda query, top_k, task_mode: _response(task_mode, image_path)
+            online_mock.side_effect = (
+                lambda query, task, **_: _response(task, image_path)
             )
-            qa_mock.return_value = _response("qa", image_path)
             output = Path(temporary) / "task_smoke.json"
             args = build_parser().parse_args(["--task", "all", "--output", str(output)])
             payload = run(args)
             saved = json.loads(output.read_text(encoding="utf-8"))
 
         self.assertEqual(payload, saved)
-        self.assertEqual([item["task"] for item in payload["results"]], ["kis", "avs", "qa"])
+        self.assertEqual(
+            [item["task"] for item in payload["results"]],
+            ["kis", "avs", "temporal", "qa"],
+        )
         self.assertIsNone(payload["results"][0]["answer"])
-        self.assertEqual(payload["results"][2]["answer"]["answer"], "phone")
+        self.assertEqual(payload["results"][3]["answer"]["answer"], "phone")
         self.assertNotIn("ignored_large_field", payload["results"][0]["evidence"][0])
-        self.assertEqual(engine.search.call_count, 2)
-        qa_mock.assert_called_once()
+        self.assertEqual(online_mock.call_count, 4)
         self.assertEqual(clear_mock.call_count, 2)
 
-    @mock.patch("backend.app.services.retrieval.run_task_smoke.search_qa")
+    @mock.patch("backend.app.services.retrieval.run_task_smoke.search_online")
     @mock.patch("backend.app.services.retrieval.run_task_smoke.get_qa_runtime_lineage")
     @mock.patch("backend.app.services.retrieval.run_task_smoke.clear_retrieval_caches")
     def test_fail_loud_writes_report_when_qa_reuses_cache(
         self,
         _: mock.Mock,
         lineage_mock: mock.Mock,
-        qa_mock: mock.Mock,
+        online_mock: mock.Mock,
     ) -> None:
         lineage_mock.return_value = _runtime_lineage()
         with tempfile.TemporaryDirectory() as temporary:
@@ -260,7 +257,7 @@ class RunTaskSmokeTest(unittest.TestCase):
             response = _response("qa", image_path)
             response["answer_report"]["cache_hit"] = True
             response["answer_report"]["model_invoked"] = False
-            qa_mock.return_value = response
+            online_mock.return_value = response
             output = Path(temporary) / "task_smoke.json"
             args = build_parser().parse_args(
                 ["--task", "qa", "--output", str(output)]
@@ -274,14 +271,14 @@ class RunTaskSmokeTest(unittest.TestCase):
             saved["validation_errors"][0]["issues"],
         )
 
-    @mock.patch("backend.app.services.retrieval.run_task_smoke.search_qa")
+    @mock.patch("backend.app.services.retrieval.run_task_smoke.search_online")
     @mock.patch("backend.app.services.retrieval.run_task_smoke.get_qa_runtime_lineage")
     @mock.patch("backend.app.services.retrieval.run_task_smoke.clear_retrieval_caches")
     def test_temporal_smoke_retains_complete_chain_when_top_k_is_one(
         self,
         _: mock.Mock,
         lineage_mock: mock.Mock,
-        qa_mock: mock.Mock,
+        online_mock: mock.Mock,
     ) -> None:
         lineage_mock.return_value = _runtime_lineage()
         with tempfile.TemporaryDirectory() as temporary:
@@ -290,7 +287,7 @@ class RunTaskSmokeTest(unittest.TestCase):
                 image_path = Path(temporary) / f"frame-{index}.jpg"
                 Image.new("RGB", (2, 2), color="purple").save(image_path)
                 image_paths.append(image_path)
-            qa_mock.return_value = _temporal_response(image_paths)
+            online_mock.return_value = _temporal_response(image_paths)
             args = build_parser().parse_args(["--task", "qa", "--top-k", "1"])
 
             payload = run(args)

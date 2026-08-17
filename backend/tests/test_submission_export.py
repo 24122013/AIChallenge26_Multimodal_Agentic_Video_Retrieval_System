@@ -77,28 +77,33 @@ class SubmissionCsvTests(unittest.TestCase):
                 }
             )
 
-    def test_export_uses_hybrid_and_grounded_qa_services(self) -> None:
+    def test_export_uses_canonical_online_service(self) -> None:
         kis = export_query_csv(
             "query",
             "kis",
             5,
-            kis_search=lambda **_: {
-                "results": [{"video_id": "folder/V9.mp4", "frame_index": 12}]
+            online_search=lambda **_: {
+                "candidates": [{"video_id": "folder/V9.mp4", "frame_index": 12}]
             },
         )
         self.assertEqual(kis.filename, "kis_result.csv")
         self.assertNotIn("..", kis.filename)
         self.assertEqual(rows(kis.content)[1], ["V9", "12"])
 
-        qa_search = mock.Mock(
+        online_search = mock.Mock(
             return_value={
                 "answer": {"status": "answered", "answer": "đáp án", "evidence_ids": ["E1"]},
                 "evidence": [{"evidence_id": "E1", "video_id": "V2", "frame_index": 7}],
             }
         )
-        qa = export_query_csv("câu hỏi", "qa", 5, qa_search=qa_search)
+        qa = export_query_csv(
+            "câu hỏi",
+            "qa",
+            5,
+            online_search=online_search,
+        )
         self.assertEqual(rows(qa.content)[1], ["V2", "7", "đáp án"])
-        self.assertEqual(qa_search.call_args.kwargs["task_mode"], "qa")
+        self.assertEqual(online_search.call_args.kwargs["task"], "qa")
 
 
 class SubmissionApiTests(unittest.TestCase):

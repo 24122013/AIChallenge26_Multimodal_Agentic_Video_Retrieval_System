@@ -11,30 +11,10 @@ __pycache__/
 /yoloe-*.pt
 /mobileclip*.ts
 
-# Local datasets and generated runtime artifacts.
-data/public/
-
-data/raw/video/*
-!data/raw/video/.gitkeep
-data/raw/*.zip
-data/**/*.jpg
-data/**/*.jpeg
-data/**/*.png
-data/embeddings/*
-!data/embeddings/.gitkeep
-data/indexes/*
-!data/indexes/.gitkeep
-data/model_cache/*
-!data/model_cache/.gitkeep
-data/smoke/
-data/keyframes/*
-!data/keyframes/.gitkeep
-data/keyframes_*/
-data/metadata/*
-!data/metadata/.gitkeep
-data/cache/*
-!data/cache/.gitkeep
-data/submissions/*
-!data/submissions/.gitkeep
-data/reports/*
-!data/reports/.gitkeep
+# Local datasets and generated runtime artifacts. Keep only documentation and
+# directory placeholders under version control; this also covers new offline
+# workspaces such as candidates/, candidate_features/, and dense_keyframes/.
+/data/**
+!/data/**/
+!/data/README.md
+!/data/**/.gitkeep

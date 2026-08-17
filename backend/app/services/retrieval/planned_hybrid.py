@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Any
 
 from backend.app.models.retrieval import RetrievalResult, VisualSearchResponse
@@ -107,6 +108,19 @@ def planned_hybrid_search(
         top_k=engine.config.rerank_pool_size,
         dedupe_same_shot=False,
     )
+    # Preserve the pre-rerank fusion value before ``HybridReranker`` replaces
+    # ``score`` with the final score.  The canonical online Candidate schema can
+    # then report both stages without changing any retriever contract.
+    merged_pool = [
+        replace(
+            candidate,
+            modality_scores={
+                **candidate.modality_scores,
+                "fusion": float(candidate.score),
+            },
+        )
+        for candidate in merged_pool
+    ]
     results = engine.reranker.rerank(
         query=plan.original_query,
         candidates=merged_pool,

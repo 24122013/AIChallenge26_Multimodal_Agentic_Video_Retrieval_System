@@ -3,12 +3,9 @@ from __future__ import annotations
 
 from backend.app.services.retrieval.retrieval_manager import (
     search_caption,
-    search_hybrid,
     search_object,
     search_ocr,
-    search_qa,
-    search_qa_evidence,
-    search_temporal,
+    search_online,
     search_visual,
 )
 from backend.app.services.retrieval.qa_pipeline import RequiredQaPipelineError
@@ -34,7 +31,7 @@ if APIRouter is not None:
 
     class SearchBody(BaseModel):
         query: str
-        mode: str = "visual"
+        mode: str = "online"
         top_k: int = Field(default=20, ge=1, le=200)
         task_mode: str = "auto"
         expanded_queries: list[str] = Field(default_factory=list, max_length=20)
@@ -106,7 +103,7 @@ else:
 def search(
     query: str,
     top_k: int = 20,
-    mode: str = "visual",
+    mode: str = "online",
     *,
     task_mode: str = "auto",
     expanded_queries: list[str] | None = None,
@@ -129,33 +126,45 @@ def _dispatch_search(
     expanded_queries: list[str] | None = None,
 ) -> dict:
     normalized = mode.casefold().strip()
+    if normalized in {"online", "auto"}:
+        return search_online(
+            query=query,
+            task=task_mode,
+            top_k=top_k,
+            expanded_queries=expanded_queries or [],
+        )
+    if normalized in {"kis", "hybrid"}:
+        return search_online(query=query, task="kis", top_k=top_k)
+    if normalized == "avs":
+        return search_online(query=query, task="avs", top_k=top_k)
+    if normalized in {
+        "qa",
+        "qa_evidence",
+        "question",
+        "question_answering",
+        "qa_answer",
+        "grounded_qa",
+    }:
+        return search_online(
+            query=query,
+            task="qa",
+            top_k=min(5, int(top_k)),
+            expanded_queries=expanded_queries or [],
+        )
+    if normalized == "temporal":
+        return search_online(query=query, task="temporal", top_k=top_k)
+
+    # Modality-only modes are retained as diagnostics. User-facing task routes
+    # above all pass through the canonical OnlinePipeline.
     if normalized in {"visual", "image", "baseline"}:
         return search_visual(query=query, top_k=top_k).to_dict()
-    if normalized == "hybrid":
-        return search_hybrid(query=query, top_k=top_k).to_dict()
     if normalized == "caption":
         return search_caption(query=query, top_k=top_k).to_dict()
     if normalized in {"ocr", "ocr_text"}:
         return search_ocr(query=query, top_k=top_k).to_dict()
     if normalized in {"object", "objects"}:
         return search_object(query=query, top_k=top_k).to_dict()
-    if normalized in {"qa", "qa_evidence", "question", "question_answering"}:
-        return search_qa_evidence(question=query, top_k=top_k)
-    if normalized in {"qa_answer", "grounded_qa"}:
-        return search_qa(
-            query=query,
-            top_k=min(5, int(top_k)),
-            task_mode="qa" if task_mode == "auto" else task_mode,
-            expanded_queries=expanded_queries or [],
-        )
-    if normalized == "temporal":
-        matches = search_temporal(query=query, top_k=top_k)
-        return {
-            "query": query,
-            "top_k": max(1, int(top_k)),
-            "results": [match.to_dict() for match in matches],
-        }
     raise ValueError(
-        "Unsupported search mode. Expected visual, hybrid, caption, OCR, "
-        "object, QA evidence, QA answer, or temporal."
+        "Unsupported search mode. Expected online, KIS, AVS, temporal, QA, "
+        "or a modality diagnostic (visual, caption, OCR, object)."
     )

@@ -572,15 +572,17 @@ class QaEvidenceTest(unittest.TestCase):
     def test_unified_search_accepts_qa_alias(self) -> None:
         expected = {"answer_mode": "manual_visual_inspection", "results": []}
         with patch(
-            "backend.app.api.search.search_qa_evidence",
+            "backend.app.api.search.search_online",
             return_value=expected,
         ) as mocked:
             response = search("người phụ nữ cầm gì", 5, "qa")
 
         self.assertEqual(response, expected)
         mocked.assert_called_once_with(
-            question="người phụ nữ cầm gì",
+            query="người phụ nữ cầm gì",
+            task="qa",
             top_k=5,
+            expanded_queries=[],
         )
 
 
