@@ -235,18 +235,23 @@ def _materialize_candidates(
     boundary_guard_sec: float,
     tiny_shot_max_sec: float,
     include_video_endpoints: bool,
+    candidates: Sequence[KeyframeCandidate] | None = None,
 ) -> dict[str, object]:
     video_output_dir = output_dir / info.video_id
     video_output_dir.mkdir(parents=True, exist_ok=True)
-    generated = generate_keyframe_candidates(
-        info.video_id,
-        shots,
-        info.fps,
-        interval_sec=candidate_interval_sec,
-        boundary_guard_sec=boundary_guard_sec,
-        tiny_shot_max_sec=tiny_shot_max_sec,
-        frame_count=info.frame_count,
-        include_video_endpoints=include_video_endpoints,
+    generated = (
+        tuple(candidates)
+        if candidates is not None
+        else generate_keyframe_candidates(
+            info.video_id,
+            shots,
+            info.fps,
+            interval_sec=candidate_interval_sec,
+            boundary_guard_sec=boundary_guard_sec,
+            tiny_shot_max_sec=tiny_shot_max_sec,
+            frame_count=info.frame_count,
+            include_video_endpoints=include_video_endpoints,
+        )
     )
     shot_by_index = {shot.shot_index: shot for shot in shots}
     kept_phashes: deque[tuple[int, str, float]] = deque()
@@ -522,11 +527,22 @@ def materialize_keyframe_candidates_for_video(
             f"inspect the root cause: {type(exc).__name__}: {exc}.{cuda_hint}"
         ) from exc
 
-    return _materialize_candidates(
+    candidates = generate_keyframe_candidates(
+        info.video_id,
+        shots,
+        info.fps,
+        interval_sec=candidate_interval_sec,
+        boundary_guard_sec=boundary_guard_sec,
+        tiny_shot_max_sec=tiny_shot_max_sec,
+        frame_count=info.frame_count,
+        include_video_endpoints=include_video_endpoints,
+    )
+    return materialize_generated_keyframe_candidates_for_video(
         video_path=video_path,
         info=info,
         shots=shots,
         detector_name=detector_name,
+        candidates=candidates,
         output_dir=output_dir,
         metadata_path=metadata_path,
         report_path=report_path,
@@ -542,10 +558,67 @@ def materialize_keyframe_candidates_for_video(
     )
 
 
+def materialize_generated_keyframe_candidates_for_video(
+    *,
+    video_path: Path,
+    info: VideoInfo,
+    shots: Sequence[Shot],
+    detector_name: str,
+    candidates: Sequence[KeyframeCandidate],
+    output_dir: Path,
+    metadata_path: Path,
+    report_path: Path,
+    phash_threshold: int = 6,
+    phash_window_sec: float = 12.0,
+    jpeg_quality: int = 95,
+    shot_threshold: float = 0.5,
+    shot_device: str = "auto",
+    candidate_interval_sec: float = DEFAULT_INTERVAL_SEC,
+    boundary_guard_sec: float = DEFAULT_BOUNDARY_GUARD_SEC,
+    tiny_shot_max_sec: float = DEFAULT_TINY_SHOT_MAX_SEC,
+    include_video_endpoints: bool = False,
+) -> dict[str, object]:
+    """Materialize an already-generated dense pool without re-running earlier stages.
+
+    The canonical offline orchestrator checkpoints shot detection and candidate
+    generation independently, then passes that exact candidate sequence here.
+    The legacy convenience API above keeps its existing one-call behavior.
+    """
+
+    ordered = tuple(candidates)
+    if not ordered:
+        raise ValueError("candidates must contain at least one dense candidate")
+    if any(candidate.video_id != info.video_id for candidate in ordered):
+        raise ValueError("all candidates must match info.video_id")
+    if len({candidate.candidate_id for candidate in ordered}) != len(ordered):
+        raise ValueError("candidate_id values must be unique")
+
+    return _materialize_candidates(
+        video_path=video_path,
+        info=info,
+        shots=list(shots),
+        detector_name=detector_name,
+        output_dir=output_dir,
+        metadata_path=metadata_path,
+        report_path=report_path,
+        phash_threshold=phash_threshold,
+        phash_window_sec=phash_window_sec,
+        jpeg_quality=jpeg_quality,
+        shot_threshold=shot_threshold,
+        shot_device=shot_device,
+        candidate_interval_sec=candidate_interval_sec,
+        boundary_guard_sec=boundary_guard_sec,
+        tiny_shot_max_sec=tiny_shot_max_sec,
+        include_video_endpoints=include_video_endpoints,
+        candidates=ordered,
+    )
+
+
 __all__ = [
     "CandidateFrameDecode",
     "FRAME_EXTRACTOR",
     "MATERIALIZATION_MODE",
     "decode_candidate_frames_sequential",
+    "materialize_generated_keyframe_candidates_for_video",
     "materialize_keyframe_candidates_for_video",
 ]

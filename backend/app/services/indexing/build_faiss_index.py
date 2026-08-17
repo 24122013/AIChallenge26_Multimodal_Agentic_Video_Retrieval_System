@@ -228,6 +228,11 @@ def validate_embedding_source(
 
     source_contract: dict | None = None
     for offset, record in enumerate(records):
+        if str(record.get("video_id") or "") != video_id:
+            raise ValueError(
+                f"video_id mismatch in {metadata_path} record {offset}: "
+                f"expected {video_id!r}, got {record.get('video_id')!r}"
+            )
         if record.get("embedding_index") != offset:
             raise ValueError(
                 f"embedding_index mismatch in {metadata_path} record {offset}: "

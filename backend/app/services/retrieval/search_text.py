@@ -15,12 +15,16 @@ class ModalitySearchEngine:
         *,
         default_top_k: int = 20,
         max_top_k: int = 200,
+        expected_sha256: str | None = None,
         searcher: TextIndexSearcher | None = None,
     ) -> None:
         self.modality = modality
         self.default_top_k = max(1, int(default_top_k))
         self.max_top_k = max(1, int(max_top_k))
-        self.searcher = searcher or TextIndexSearcher(index_path)
+        self.searcher = searcher or TextIndexSearcher(
+            index_path,
+            expected_sha256=expected_sha256,
+        )
 
     def search(
         self,

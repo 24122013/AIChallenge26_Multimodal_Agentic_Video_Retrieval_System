@@ -148,6 +148,7 @@ $env:RETRIEVAL_INDEX_PATH = "data/indexes/siglip2_so400m_patch16_384_flat_ip.fai
 $env:RETRIEVAL_FRAME_MAP_PATH = "data/metadata/siglip2_so400m_patch16_384_frame_map.json"
 $env:RETRIEVAL_MANIFEST_PATH = "data/metadata/siglip2_so400m_patch16_384_faiss_manifest.json"
 $env:RETRIEVAL_TEXT_INDEX_PATH = "data/indexes/retrieval_text_index.json"
+$env:RETRIEVAL_CORPUS_MANIFEST_PATH = "data/metadata/offline_corpus_manifest.json"
 $env:RETRIEVAL_DEVICE = "cuda"
 ```
 
@@ -164,37 +165,58 @@ thích; nếu OOM, giảm batch trước, sau đó mới cân nhắc quantizatio
 
 ## Chạy backend canonical
 
-Các lệnh dưới đây chạy pipeline cho toàn bộ video `*.mp4` trong
-`data/raw/video/`. `ffmpeg`/`ffprobe` và model checkpoints phải sẵn sàng trước
-khi chạy.
+Entrypoint dưới đây chạy toàn bộ video `*.mp4` trong `data/raw/video/` theo thứ
+tự deterministic. Mỗi video phải hoàn tất dense candidates → materialize toàn
+bộ ảnh → SigLIP2/OCR/object/caption cho toàn pool → multimodal selection →
+canonical publish/validation trước khi video kế tiếp bắt đầu. Chỉ sau khi mọi
+video requested thành công, pipeline mới build FAISS, BM25 và BGE-M3.
 
 ```powershell
-python -m backend.app.services.indexing.extract_keyframes `
+python -m backend.app.pipelines.offline_pipeline `
   --video-dir data/raw/video `
   --video-glob "*.mp4" `
-  --output-dir data/keyframes `
-  --strategy dense_coverage `
-  --candidate-interval-sec 0.5 `
-  --max-gap-seconds 2
+  --output-dir data `
+  --dense-interval 0.5 `
+  --device cuda `
+  --resume
 ```
 
-Với mỗi `<video_id>.mp4`, bước trên tạo keyframe tại
-`data/keyframes/<video_id>/`, metadata tại
-`data/metadata/keyframes_<video_id>.jsonl` và extraction report tương ứng.
-
-Chạy caption, OCR và object detection cho toàn bộ keyframe metadata:
+Quick mode cho một video (mặc định chỉ publish/validate artifact per-video và
+giữ nguyên corpus index hiện có):
 
 ```powershell
-python -m backend.app.services.ingestion.run_caption `
-  --metadata-path data/metadata --device cuda --batch-size 2
-python -m backend.app.services.ingestion.run_ocr `
-  --metadata-path data/metadata --device cuda
-python -m backend.app.services.ingestion.run_object_detection `
-  --metadata-path data/metadata --device cuda
+python -m backend.app.pipelines.offline_pipeline `
+  --video-dir data/raw/video `
+  --video-id L01_V001 `
+  --output-dir data `
+  --device cuda `
+  --resume
 ```
 
-Tạo neighbor index cho toàn bộ keyframe. Mỗi record giữ các frame lân cận trong
-cùng video ở cửa sổ ±5 giây:
+Chỉ thêm `--build-corpus` nếu thực sự muốn **thay** global FAISS/BM25/BGE bằng
+corpus chứa đúng tập video đang request. Với quick mode một video, flag này sẽ
+tạo corpus một-video; pipeline không tự quét artifact cũ vì làm vậy có thể kéo
+metadata stale vào index.
+
+`--resume` là mặc định và chỉ skip stage khi contract, checksum, identity
+alignment và artifact validator đều pass. `--force` recompute toàn bộ;
+`--skip-bge` tắt riêng BGE-M3; `--allow-partial-corpus` cho phép index các video
+thành công khi video khác fail (mặc định corpus indexing bị chặn). Full-dataset
+mode build corpus mặc định; `--skip-corpus` chỉ chạy/publish các stage per-video.
+
+Dense workspace được cô lập tại `data/candidates/`, `data/dense_keyframes/` và
+`data/candidate_features/`, nên không thể lọt vào glob retrieval canonical.
+Selected artifacts nằm tại `data/keyframes/`, `data/embeddings/` và
+`data/metadata/`; per-video/corpus reports nằm dưới `data/reports/offline/`.
+FAISS, BM25 và BGE-M3 được build/validate trong staging trước; manifest corpus
+được publish cuối cùng. Nếu crash giữa lúc promote, runtime fail-closed thay vì
+trộn index thuộc hai generation khác nhau.
+
+Các CLI service riêng lẻ vẫn hữu ích để debug một stage, nhưng không thay thế
+entrypoint canonical vì chúng không tự đảm bảo thứ tự full-pool multimodal.
+
+Sau canonical run, có thể tạo thêm neighbor index cho các keyframe đã chọn. Mỗi
+record giữ các frame lân cận trong cùng video ở cửa sổ ±5 giây:
 
 ```powershell
 python -m backend.app.services.indexing.neighbor_index `
@@ -216,25 +238,8 @@ python -m backend.app.services.indexing.extract_segments `
   --strategy auto
 ```
 
-Nếu chưa chạy OCR hoặc object detection, bỏ riêng `--ocr data/metadata` hoặc
-`--objects data/metadata`; builder sẽ không bịa dữ liệu cho modality còn thiếu.
-
-Sau khi có frame/segment metadata, build các index retrieval:
-
-```powershell
-python -m backend.app.services.indexing.build_siglip2_index `
-  --metadata-path data/metadata --device cuda
-python -m backend.app.services.indexing.build_faiss_index
-python -m backend.app.services.indexing.build_text_index `
-  --metadata data/metadata --output data/indexes/retrieval_text_index.json
-python -m backend.app.services.indexing.build_bge_m3_index `
-  --metadata data/metadata --output-root data/indexes/bge_m3 `
-  --device cuda --canonical-only
-```
-
-Caption/OCR/object CLI ghi artifact riêng và không sửa keyframe JSONL gốc.
 Neighbor và segment cũng là hai bước explicit, không được ingestion tự động gọi.
-Kiểm tra artifact toàn corpus trước khi build text/BGE index:
+Kiểm tra artifact tùy chọn:
 
 ```powershell
 Test-Path data/metadata/neighbors_all.jsonl
@@ -243,10 +248,9 @@ Get-Content data/metadata/neighbors_all.jsonl -TotalCount 1
 Get-Content data/metadata/segments_all.jsonl -TotalCount 1
 ```
 
-Logic chọn keyframe đa phương thức đầy đủ nằm trong
-`backend/app/services/indexing/keyframe_multimodal_pipeline.py`, nhưng hiện chưa
-có một backend CLI duy nhất điều phối toàn bộ chuỗi lệnh trên. Việc các lệnh xuất
-hiện trong README là hướng dẫn chạy, không phải bằng chứng một run đã hoàn tất.
+Logic chọn keyframe đa phương thức vẫn nằm trong
+`backend/app/services/indexing/keyframe_multimodal_pipeline.py`; entrypoint chỉ
+điều phối, checkpoint, persist và validate, không copy lại thuật toán selector.
 
 ### Smoke KIS và QA
 

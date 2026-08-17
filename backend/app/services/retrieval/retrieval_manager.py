@@ -1,11 +1,13 @@
 """Cached entry points for visual, lexical, hybrid, and temporal retrieval."""
 from __future__ import annotations
 
+import hashlib
+import json
 import os
-from dataclasses import fields
-from functools import lru_cache
+from dataclasses import dataclass, fields
+from functools import lru_cache, wraps
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, TypeVar, cast
 
 from backend.app.models.retrieval import VisualSearchResponse
 from backend.app.services.agent.query_expansion import (
@@ -42,11 +44,165 @@ from backend.app.services.retrieval.temporal_search import TemporalMatch
 
 
 _query_expansion_provider_instance: QueryExpansionProvider | None = None
+DEFAULT_CORPUS_MANIFEST_PATH = Path("data/metadata/offline_corpus_manifest.json")
+_CachedEngine = TypeVar("_CachedEngine")
+
+
+@dataclass(frozen=True)
+class _CorpusCacheKey:
+    """Immutable identity of the corpus a cached runtime object belongs to."""
+
+    manifest_path: str
+    bundle_generation: str | None
+    manifest_contract_sha256: str | None
 
 
 def _path_from_env(name: str, default: Path) -> Path:
     value = os.getenv(name)
     return Path(value) if value else default
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _generation(hashes: Mapping[str, str]) -> str:
+    payload = json.dumps(
+        hashes,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def validate_runtime_corpus_bundle(
+    *,
+    required_roles: tuple[str, ...] = (),
+    artifact_overrides: Mapping[str, Path] | None = None,
+    require_bge: bool = False,
+) -> Mapping[str, Any] | None:
+    """Gate runtime engines on one fully committed offline corpus generation."""
+
+    manifest_path = _path_from_env(
+        "RETRIEVAL_CORPUS_MANIFEST_PATH",
+        DEFAULT_CORPUS_MANIFEST_PATH,
+    )
+    if not manifest_path.is_file():
+        return None  # Backward-compatible legacy deployments.
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("status") != "passed":
+        raise ValueError("Offline corpus bundle is not fully published")
+    if require_bge and manifest.get("bge_enabled") is not True:
+        raise ValueError("Runtime requested BGE-M3 but the committed corpus omitted it")
+    declared = manifest.get("artifacts")
+    if not isinstance(declared, dict):
+        raise ValueError("Offline corpus manifest has no artifact declarations")
+    hashes: dict[str, str] = {}
+    for role, item in declared.items():
+        if not isinstance(item, dict) or not isinstance(item.get("sha256"), str):
+            raise ValueError(f"Offline corpus artifact declaration is invalid: {role}")
+        hashes[str(role)] = str(item["sha256"])
+    if manifest.get("bundle_generation") != _generation(hashes):
+        raise ValueError("Offline corpus generation does not match declared hashes")
+
+    overrides = dict(artifact_overrides or {})
+    root = manifest_path.parent.parent
+    for role in required_roles:
+        item = declared.get(role)
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise ValueError(f"Committed corpus does not contain required role: {role}")
+        path = overrides.get(role, root / str(item["path"]))
+        if not path.is_file() or _sha256_file(path) != hashes[role]:
+            raise ValueError(f"Runtime artifact is outside the committed corpus: {role}")
+    return manifest
+
+
+def _manifest_contract_sha256(manifest: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _corpus_cache_key(
+    manifest: Mapping[str, Any] | None,
+) -> _CorpusCacheKey:
+    manifest_path = _path_from_env(
+        "RETRIEVAL_CORPUS_MANIFEST_PATH",
+        DEFAULT_CORPUS_MANIFEST_PATH,
+    ).resolve(strict=False)
+    if manifest is None:
+        return _CorpusCacheKey(
+            manifest_path=str(manifest_path),
+            bundle_generation=None,
+            manifest_contract_sha256=None,
+        )
+    return _CorpusCacheKey(
+        manifest_path=str(manifest_path),
+        bundle_generation=str(manifest["bundle_generation"]),
+        manifest_contract_sha256=_manifest_contract_sha256(manifest),
+    )
+
+
+def _current_corpus_cache_key() -> _CorpusCacheKey:
+    """Read the publication gate even when an engine is already cached."""
+
+    return _corpus_cache_key(validate_runtime_corpus_bundle())
+
+
+def _validate_expected_corpus(
+    expected: _CorpusCacheKey,
+    *,
+    required_roles: tuple[str, ...] = (),
+    artifact_overrides: Mapping[str, Path] | None = None,
+    require_bge: bool = False,
+) -> Mapping[str, Any] | None:
+    manifest = validate_runtime_corpus_bundle(
+        required_roles=required_roles,
+        artifact_overrides=artifact_overrides,
+        require_bge=require_bge,
+    )
+    if _corpus_cache_key(manifest) != expected:
+        raise ValueError("Offline corpus changed while retrieval was loading")
+    return manifest
+
+
+def _corpus_generation_cached(
+    factory: Callable[[_CorpusCacheKey], _CachedEngine],
+) -> Callable[[], _CachedEngine]:
+    """Cache one engine per current committed corpus, with a hot-publish gate.
+
+    Legacy deployments without a canonical manifest keep the previous one-entry
+    cache behaviour.  Once a manifest exists, every zero-argument factory call
+    reads its committed identity before consulting the cache.  A new generation
+    therefore evicts and rebuilds the old engine; a publishing/invalid manifest
+    raises before any stale cached object can escape.
+    """
+
+    cached = lru_cache(maxsize=1)(factory)
+
+    @wraps(factory)
+    def wrapper() -> _CachedEngine:
+        before = _current_corpus_cache_key()
+        value = cached(before)
+        after = _current_corpus_cache_key()
+        if before != after:
+            raise ValueError("Offline corpus changed while retrieval was loading")
+        return value
+
+    # Preserve the public cache control API used by tests and operational tools.
+    setattr(wrapper, "cache_clear", cached.cache_clear)
+    setattr(wrapper, "cache_info", cached.cache_info)
+    setattr(wrapper, "cache_parameters", cached.cache_parameters)
+    return cast(Callable[[], _CachedEngine], wrapper)
 
 
 def _bool_from_env(name: str, default: bool) -> bool:
@@ -176,38 +332,115 @@ def get_query_expansion_provider() -> QueryExpansionProvider | None:
     return provider
 
 
-@lru_cache(maxsize=1)
-def get_visual_search_engine() -> VisualSearchEngine:
-    return VisualSearchEngine(load_visual_search_config())
+@_corpus_generation_cached
+def get_visual_search_engine(
+    corpus_key: _CorpusCacheKey,
+) -> VisualSearchEngine:
+    config = load_visual_search_config()
+    before = _validate_expected_corpus(
+        corpus_key,
+        required_roles=("visual_index", "visual_frame_map", "visual_manifest"),
+        artifact_overrides={
+            "visual_index": config.index_path,
+            "visual_frame_map": config.frame_map_path,
+            "visual_manifest": config.manifest_path,
+        },
+    )
+    engine = VisualSearchEngine(config)
+    after = _validate_expected_corpus(
+        corpus_key,
+        required_roles=("visual_index", "visual_frame_map", "visual_manifest"),
+        artifact_overrides={
+            "visual_index": config.index_path,
+            "visual_frame_map": config.frame_map_path,
+            "visual_manifest": config.manifest_path,
+        },
+    )
+    if before != after:
+        raise ValueError("Offline corpus changed while visual retrieval was loading")
+    engine.corpus_generation = (
+        str(before.get("bundle_generation")) if before is not None else None
+    )
+    return engine
 
 
-def _text_engine_kwargs() -> dict:
+def _text_engine_kwargs(corpus_key: _CorpusCacheKey) -> dict:
     config = get_runtime_config().text_index
+    manifest = _validate_expected_corpus(
+        corpus_key,
+        required_roles=("text_index",),
+        artifact_overrides={"text_index": config.path},
+    )
+    expected_sha256 = None
+    if manifest is not None:
+        expected_sha256 = manifest["artifacts"]["text_index"]["sha256"]
     return {
         "index_path": config.path,
         "default_top_k": config.default_top_k,
         "max_top_k": config.max_top_k,
+        "expected_sha256": expected_sha256,
     }
 
 
-@lru_cache(maxsize=1)
-def get_caption_search_engine() -> CaptionSearchEngine:
-    return CaptionSearchEngine(**_text_engine_kwargs())
-
-
-@lru_cache(maxsize=1)
-def get_ocr_search_engine() -> OcrSearchEngine:
-    return OcrSearchEngine(**_text_engine_kwargs())
-
-
-@lru_cache(maxsize=1)
-def get_object_search_engine() -> ObjectSearchEngine:
-    return ObjectSearchEngine(**_text_engine_kwargs())
-
-
-@lru_cache(maxsize=1)
-def get_hybrid_search_engine() -> HybridSearchEngine:
+def _build_text_search_engine(
+    engine_type: type[_CachedEngine],
+    corpus_key: _CorpusCacheKey,
+) -> _CachedEngine:
     runtime = get_runtime_config()
+    engine = engine_type(**_text_engine_kwargs(corpus_key))
+    _validate_expected_corpus(
+        corpus_key,
+        required_roles=("text_index",),
+        artifact_overrides={"text_index": runtime.text_index.path},
+    )
+    setattr(engine, "corpus_generation", corpus_key.bundle_generation)
+    return engine
+
+
+@_corpus_generation_cached
+def get_caption_search_engine(
+    corpus_key: _CorpusCacheKey,
+) -> CaptionSearchEngine:
+    return _build_text_search_engine(CaptionSearchEngine, corpus_key)
+
+
+@_corpus_generation_cached
+def get_ocr_search_engine(
+    corpus_key: _CorpusCacheKey,
+) -> OcrSearchEngine:
+    return _build_text_search_engine(OcrSearchEngine, corpus_key)
+
+
+@_corpus_generation_cached
+def get_object_search_engine(
+    corpus_key: _CorpusCacheKey,
+) -> ObjectSearchEngine:
+    return _build_text_search_engine(ObjectSearchEngine, corpus_key)
+
+
+@_corpus_generation_cached
+def get_hybrid_search_engine(
+    corpus_key: _CorpusCacheKey,
+) -> HybridSearchEngine:
+    runtime = get_runtime_config()
+    visual_config = load_visual_search_config()
+    required_roles = (
+        "visual_index",
+        "visual_frame_map",
+        "visual_manifest",
+        "text_index",
+    )
+    overrides = {
+        "visual_index": visual_config.index_path,
+        "visual_frame_map": visual_config.frame_map_path,
+        "visual_manifest": visual_config.manifest_path,
+        "text_index": runtime.text_index.path,
+    }
+    before = _validate_expected_corpus(
+        corpus_key,
+        required_roles=required_roles,
+        artifact_overrides=overrides,
+    )
     text_engines = {}
     if runtime.text_index.path.exists():
         text_engines = {
@@ -215,19 +448,59 @@ def get_hybrid_search_engine() -> HybridSearchEngine:
             "ocr": get_ocr_search_engine(),
             "objects": get_object_search_engine(),
         }
-    return HybridSearchEngine(
-        visual_engine=get_visual_search_engine(),
+    visual_engine = get_visual_search_engine()
+    if before is not None:
+        generation = str(before["bundle_generation"])
+        if getattr(visual_engine, "corpus_generation", None) != generation:
+            raise ValueError("Cached visual engine belongs to another corpus generation")
+        expected_text_sha = str(before["artifacts"]["text_index"]["sha256"])
+        if any(
+            getattr(engine.searcher, "expected_sha256", None) != expected_text_sha
+            for engine in text_engines.values()
+        ):
+            raise ValueError("Cached text engine belongs to another corpus generation")
+    engine = HybridSearchEngine(
+        visual_engine=visual_engine,
         text_engines=text_engines,
         reranker=HybridReranker(runtime.rerank),
         config=runtime.hybrid,
     )
+    after = _validate_expected_corpus(
+        corpus_key,
+        required_roles=required_roles,
+        artifact_overrides=overrides,
+    )
+    if before != after:
+        raise ValueError("Offline corpus changed while hybrid retrieval was loading")
+    engine.corpus_generation = (
+        str(before.get("bundle_generation")) if before is not None else None
+    )
+    return engine
 
 
-@lru_cache(maxsize=1)
-def get_qa_evidence_search_engine() -> QaEvidenceSearchEngine:
+@_corpus_generation_cached
+def get_qa_evidence_search_engine(
+    corpus_key: _CorpusCacheKey,
+) -> QaEvidenceSearchEngine:
     dense_text_engine = None
     dense_enabled = _bool_from_env("QA_BGE_DENSE_ENABLED", False)
     dense_root = _path_from_env("QA_BGE_INDEX_ROOT", Path("data/indexes/bge_m3"))
+    bge_paths: dict[str, Path] = {}
+    if dense_enabled:
+        from backend.app.services.retrieval.bge_dense import BgeM3ArtifactPaths
+
+        resolved_bge_paths = BgeM3ArtifactPaths.from_root(dense_root)
+        bge_paths = {
+            "bge_index": resolved_bge_paths.index,
+            "bge_frame_map": resolved_bge_paths.frame_map,
+            "bge_manifest": resolved_bge_paths.manifest,
+        }
+    before = _validate_expected_corpus(
+        corpus_key,
+        required_roles=tuple(bge_paths) if dense_enabled else (),
+        artifact_overrides=bge_paths,
+        require_bge=dense_enabled,
+    )
     if dense_enabled:
         from backend.app.services.retrieval.bge_dense import BgeM3DenseSearchEngine
 
@@ -260,16 +533,35 @@ def get_qa_evidence_search_engine() -> QaEvidenceSearchEngine:
             ),
             local_files_only=_bool_from_env("QA_MODELS_LOCAL_ONLY", False),
         )
-    return QaEvidenceSearchEngine(
-        get_hybrid_search_engine(),
+    hybrid_engine = get_hybrid_search_engine()
+    if before is not None and getattr(
+        hybrid_engine,
+        "corpus_generation",
+        None,
+    ) != str(before["bundle_generation"]):
+        raise ValueError("Cached hybrid engine belongs to another corpus generation")
+    engine = QaEvidenceSearchEngine(
+        hybrid_engine,
         dense_text_engine=dense_text_engine,
         candidate_reranker=reranker,
         config=_qa_routing_config(),
     )
+    after = _validate_expected_corpus(
+        corpus_key,
+        required_roles=tuple(bge_paths) if dense_enabled else (),
+        artifact_overrides=bge_paths,
+        require_bge=dense_enabled,
+    )
+    if before != after:
+        raise ValueError("Offline corpus changed while QA retrieval was loading")
+    engine.corpus_generation = corpus_key.bundle_generation
+    return engine
 
 
-@lru_cache(maxsize=1)
-def get_qa_search_pipeline() -> QaSearchPipeline:
+@_corpus_generation_cached
+def get_qa_search_pipeline(
+    corpus_key: _CorpusCacheKey,
+) -> QaSearchPipeline:
     answer_mode = _choice_from_env(
         "QA_ANSWER_MODE",
         "off",
@@ -292,8 +584,15 @@ def get_qa_search_pipeline() -> QaSearchPipeline:
                 Path("data/model_cache/qa_answer"),
             ),
         )
-    return QaSearchPipeline(
-        get_qa_evidence_search_engine(),
+    evidence_engine = get_qa_evidence_search_engine()
+    if (
+        corpus_key.bundle_generation is not None
+        and getattr(evidence_engine, "corpus_generation", None)
+        != corpus_key.bundle_generation
+    ):
+        raise ValueError("Cached QA evidence belongs to another corpus generation")
+    pipeline = QaSearchPipeline(
+        evidence_engine,
         config=QaPipelineConfig(
             answer_mode=answer_mode,
             model_name=os.getenv("QA_ANSWER_MODEL", DEFAULT_QA_MODEL),
@@ -315,6 +614,9 @@ def get_qa_search_pipeline() -> QaSearchPipeline:
         ),
         answer_runner=answer_runner,
     )
+    _validate_expected_corpus(corpus_key)
+    pipeline.corpus_generation = corpus_key.bundle_generation
+    return pipeline
 
 
 def get_qa_runtime_lineage() -> dict[str, Any]:

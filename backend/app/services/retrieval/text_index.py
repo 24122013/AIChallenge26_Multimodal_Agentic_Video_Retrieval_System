@@ -1,6 +1,7 @@
 """Dependency-light lexical indexes for caption, OCR, and object search."""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -22,11 +23,25 @@ MODALITIES = ("caption", "ocr", "objects")
 INDEX_VERSION = 3
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class TextIndexSearcher:
     """BM25-style search over text metadata built by build_text_index.py."""
 
-    def __init__(self, index_path: str | Path) -> None:
+    def __init__(
+        self,
+        index_path: str | Path,
+        *,
+        expected_sha256: str | None = None,
+    ) -> None:
         self.index_path = Path(index_path)
+        self.expected_sha256 = expected_sha256
         self._payload: dict[str, Any] | None = None
         self._stem_postings: dict[str, dict[str, dict[str, int]]] = {}
 
@@ -39,7 +54,15 @@ class TextIndexSearcher:
                 "Metadata role must provide caption/OCR/object artifacts, then "
                 "run backend/app/services/indexing/build_text_index.py."
             )
+        before = _sha256_file(self.index_path) if self.expected_sha256 else None
+        if self.expected_sha256 is not None and before != self.expected_sha256:
+            raise ValueError("Retrieval text index changed after corpus validation")
         payload = json.loads(self.index_path.read_text(encoding="utf-8"))
+        if (
+            self.expected_sha256 is not None
+            and _sha256_file(self.index_path) != self.expected_sha256
+        ):
+            raise ValueError("Retrieval text index changed while it was loading")
         if not isinstance(payload, dict) or payload.get("version") != INDEX_VERSION:
             raise ValueError(
                 f"Unsupported retrieval text index in {self.index_path}; "

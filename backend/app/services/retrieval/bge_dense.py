@@ -293,6 +293,7 @@ def validate_bge_m3_artifacts(
     for path in (paths.index, paths.frame_map, paths.manifest):
         if not path.is_file():
             raise FileNotFoundError(f"Missing BGE-M3 artifact: {path}")
+    manifest_sha256 = _sha256_file(paths.manifest)
     manifest = _read_json_object(paths.manifest)
     if manifest.get("schema_version") != BGE_M3_SCHEMA_VERSION:
         raise ValueError("Unsupported BGE-M3 manifest schema")
@@ -391,6 +392,12 @@ def validate_bge_m3_artifacts(
     vector_count = int(manifest.get("vector_count", -1))
     if vector_count != len(frame_records) or int(index.ntotal) != vector_count:
         raise ValueError("BGE-M3 index, frame map, and manifest counts do not match")
+    # Close the checksum/read TOCTOU window: a publisher may replace one file
+    # after the first verification but before FAISS/frame metadata are loaded.
+    _verify_artifact(paths.index, artifacts.get("index"), BGE_M3_INDEX_NAME)
+    _verify_artifact(paths.frame_map, artifacts.get("frame_map"), BGE_M3_FRAME_MAP_NAME)
+    if _sha256_file(paths.manifest) != manifest_sha256:
+        raise ValueError("BGE-M3 manifest changed while artifacts were loading")
     return ValidatedBgeM3Artifacts(
         paths=paths,
         manifest=manifest,
