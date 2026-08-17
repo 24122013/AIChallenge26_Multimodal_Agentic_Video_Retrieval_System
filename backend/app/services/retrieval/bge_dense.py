@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import threading
 import os
 import tempfile
 from dataclasses import dataclass
@@ -490,10 +491,15 @@ class LazyBgeM3Encoder:
         self._torch: Any | None = None
         self._device = "cpu"
         self.resolved_revision = model_revision
+        self._call_lock = threading.RLock()
 
     def __call__(self, texts: Sequence[str]) -> np.ndarray:
         if not texts:
             return np.empty((0, BGE_M3_DIMENSION), dtype=np.float32)
+        with self._call_lock:
+            return self._encode(texts)
+
+    def _encode(self, texts: Sequence[str]) -> np.ndarray:
         self._load()
         assert self._torch is not None and self._model is not None and self._tokenizer is not None
         batches: list[np.ndarray] = []

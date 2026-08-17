@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -208,6 +210,57 @@ class RetrievalManagerGenerationCacheTest(unittest.TestCase):
         self.assertIs(first, second)
         self.assertIsNone(first.corpus_generation)
         factory.assert_called_once()
+
+    def test_trake_factory_is_cached_per_committed_corpus_generation(self) -> None:
+        generation_1 = self._publish("g1")
+        current_generation = generation_1
+        constructed: list[SimpleNamespace] = []
+
+        class FakeTrakePipeline:
+            def __init__(
+                self,
+                *,
+                retrieval_engine,
+                dense_event_engine=None,
+                event_reranker=None,
+                bge_contract=None,
+                config,
+            ) -> None:
+                self.retrieval_engine = retrieval_engine
+                self.dense_event_engine = dense_event_engine
+                self.event_reranker = event_reranker
+                self.bge_contract = bge_contract
+                self.config = config
+                constructed.append(self)
+
+        fake_module = types.ModuleType("backend.app.services.trake.pipeline")
+        fake_module.TrakePipeline = FakeTrakePipeline
+
+        def retrieval_engine() -> SimpleNamespace:
+            return SimpleNamespace(corpus_generation=current_generation)
+
+        with (
+            mock.patch.dict(os.environ, self.environment, clear=False),
+            mock.patch.dict(
+                sys.modules,
+                {"backend.app.services.trake.pipeline": fake_module},
+            ),
+            mock.patch.object(
+                retrieval_manager,
+                "get_hybrid_search_engine",
+                side_effect=retrieval_engine,
+            ),
+        ):
+            first = retrieval_manager.get_trake_pipeline()
+            self.assertIs(first, retrieval_manager.get_trake_pipeline())
+            current_generation = self._publish("g2")
+            second = retrieval_manager.get_trake_pipeline()
+            self.assertIs(second, retrieval_manager.get_trake_pipeline())
+
+        self.assertIsNot(first, second)
+        self.assertEqual(first.corpus_generation, generation_1)
+        self.assertEqual(second.corpus_generation, current_generation)
+        self.assertEqual(len(constructed), 2)
 
 
 if __name__ == "__main__":

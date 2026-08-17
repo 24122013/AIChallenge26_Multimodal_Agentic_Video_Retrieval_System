@@ -242,22 +242,15 @@ File: `captions_<video_id>.jsonl`.
   "source_video_path": "data/raw/video/L27_V001.mp4",
   "schema_version": "1.0",
   "pipeline": "caption",
-  "model_name": "Qwen/Qwen3-VL-8B-Instruct",
+  "model_name": "florence-community/Florence-2-base-ft",
+  "model_revision": "0b03b6f15a4a211370fb204aee4e7dd48887ea37",
   "model_version": "5.x",
   "run_at": "2026-07-25T12:00:00+00:00",
   "status": "success",
   "caption": "two people standing beside a red car on a street",
-  "structured_caption": {
-    "scene": "street",
-    "people": [{"type": "people", "attributes": []}],
-    "objects": ["red car"],
-    "actions": ["standing"],
-    "relationships": ["people beside car"],
-    "colors": ["red"],
-    "visible_text": [],
-    "caption": "two people standing beside a red car on a street"
-  },
+  "structured_caption": null,
   "caption_parse_status": "success",
+  "raw_caption_output": "<s>two people standing beside a red car on a street</s>",
   "caption_language": "en",
   "segment_caption": "Two people standing beside a red car on a street."
 }
@@ -265,6 +258,12 @@ File: `captions_<video_id>.jsonl`.
 
 `segment_caption` chỉ xuất hiện khi bật `--segment-caption`. Caption frame vẫn
 luôn được giữ riêng.
+
+Caption producer mặc định là Florence-2-base-ft (~0.23B tham số) với task token
+`<MORE_DETAILED_CAPTION>`. Florence-2 trả text thay vì JSON theo instruction, nên
+adapter đặt `structured_caption` thành `null`, chuẩn hóa caption tiếng Anh không
+rỗng và giữ decoded generation trong `raw_caption_output`; các field identity,
+processing, resume và report không đổi.
 
 ### OCR
 

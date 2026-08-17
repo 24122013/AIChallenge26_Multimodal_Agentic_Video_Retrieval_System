@@ -1,4 +1,4 @@
-"""Canonical orchestration for online KIS, AVS, temporal, and QA queries."""
+"""Canonical orchestration for online KIS, AVS, temporal, TRAKE, and QA."""
 from __future__ import annotations
 
 import argparse
@@ -6,7 +6,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from backend.app.services.agent.query_expansion import QueryExpansionProvider
 from backend.app.services.retrieval.hybrid_search import HybridSearchEngine
@@ -15,11 +15,20 @@ from backend.app.services.retrieval.planned_hybrid import planned_hybrid_search
 from backend.app.services.retrieval.qa_evidence import QaEvidenceSearchEngine
 from backend.app.services.retrieval.qa_pipeline import QaSearchPipeline
 from backend.app.services.retrieval.query_plan import QueryPlan, build_query_plan
-from backend.app.services.retrieval.retrieval_config import RetrievalRuntimeConfig
+from backend.app.services.retrieval.retrieval_config import (
+    RetrievalRuntimeConfig,
+    load_project_env,
+)
 
 
 ONLINE_SCHEMA_VERSION = "1.0"
-SUPPORTED_ONLINE_TASKS = ("auto", "kis", "avs", "temporal", "qa")
+SUPPORTED_ONLINE_TASKS = ("auto", "kis", "avs", "temporal", "trake", "qa")
+
+
+class TrakeSearchPipeline(Protocol):
+    """Narrow dependency contract for the separately owned TRAKE pipeline."""
+
+    def search(self, query: str, top_k: int = 100) -> Mapping[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -206,6 +215,7 @@ class OnlinePipeline:
         query_expansion_provider: QueryExpansionProvider | None = None,
         qa_pipeline: QaSearchPipeline | None = None,
         qa_evidence_engine: QaEvidenceSearchEngine | None = None,
+        trake_pipeline: TrakeSearchPipeline | None = None,
         context_index: OnlineContextIndex | None = None,
         config: OnlinePipelineConfig | None = None,
     ) -> None:
@@ -214,6 +224,7 @@ class OnlinePipeline:
         self.query_expansion_provider = query_expansion_provider
         self.qa_pipeline = qa_pipeline
         self.qa_evidence_engine = qa_evidence_engine
+        self.trake_pipeline = trake_pipeline
         self.context_index = context_index
         self.config = config or OnlinePipelineConfig()
         if int(self.config.max_top_k) <= 0:
@@ -241,6 +252,20 @@ class OnlinePipeline:
                 + ", ".join(SUPPORTED_ONLINE_TASKS)
             )
         requested_top_k = self._top_k(top_k, task=requested_task)
+
+        if requested_task == "trake":
+            if self.trake_pipeline is None:
+                raise RuntimeError("TRAKE pipeline is unavailable in this online runtime")
+            raw_trake = self.trake_pipeline.search(
+                original_query,
+                top_k=requested_top_k,
+            )
+            return _trake_response(
+                raw_trake,
+                query=original_query,
+                top_k=requested_top_k,
+                started_at=started_at,
+            )
 
         plan: QueryPlan | None = None
         resolved_task = requested_task
@@ -354,9 +379,21 @@ class OnlinePipeline:
         )
 
     def _top_k(self, value: int | None, *, task: str) -> int:
-        default = 5 if task == "qa" else self.runtime_config.hybrid.default_top_k
+        if task == "qa":
+            default = 5
+            maximum = int(self.config.max_top_k)
+        elif task == "trake":
+            default = int(self.runtime_config.trake.max_answers)
+            maximum = min(
+                int(self.config.max_top_k),
+                int(self.runtime_config.trake.max_answers),
+                100,
+            )
+        else:
+            default = self.runtime_config.hybrid.default_top_k
+            maximum = int(self.config.max_top_k)
         requested = default if value is None else int(value)
-        return max(1, min(requested, int(self.config.max_top_k)))
+        return max(1, min(requested, maximum))
 
     def _context_flags(self, override: bool | None) -> tuple[bool, bool]:
         if override is None:
@@ -378,6 +415,63 @@ def _query_plan_payload(
     if plan is not None:
         return plan.to_dict()
     raise RuntimeError("Online route did not return its query plan")
+
+
+def _trake_response(
+    raw: Mapping[str, Any],
+    *,
+    query: str,
+    top_k: int,
+    started_at: float,
+) -> dict[str, Any]:
+    """Preserve the sequence-first TRAKE contract without candidate flattening."""
+
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("TRAKE pipeline returned a non-mapping response")
+    response = dict(raw)
+    returned_query = " ".join(str(response.get("query") or query).split())
+    if returned_query != query:
+        raise RuntimeError("TRAKE response did not preserve the original query anchor")
+    returned_task = str(response.get("task") or "trake").casefold().strip()
+    if returned_task != "trake":
+        raise RuntimeError("TRAKE pipeline returned an invalid task identity")
+    event_plan = response.get("event_plan")
+    if isinstance(event_plan, Mapping):
+        plan_query = " ".join(str(event_plan.get("original_query") or query).split())
+        if plan_query != query:
+            raise RuntimeError(
+                "TRAKE event plan did not preserve the original query anchor"
+            )
+
+    raw_hypotheses = response.get("hypotheses", ())
+    if (
+        not isinstance(raw_hypotheses, Sequence)
+        or isinstance(raw_hypotheses, (str, bytes))
+    ):
+        raise RuntimeError("TRAKE pipeline hypotheses must be a sequence")
+    hypotheses = [
+        dict(item)
+        for item in raw_hypotheses[:top_k]
+        if isinstance(item, Mapping)
+    ]
+    if len(hypotheses) != len(raw_hypotheses[:top_k]):
+        raise RuntimeError("TRAKE pipeline hypotheses must be mappings")
+
+    response.setdefault("schema_version", ONLINE_SCHEMA_VERSION)
+    response["query"] = query
+    response["requested_task"] = "trake"
+    response["task"] = "trake"
+    response["top_k"] = top_k
+    response["hypotheses"] = hypotheses
+    if "candidates" in response:
+        # The compatibility alias, when supplied by the core pipeline, remains
+        # a list of complete sequences and must obey the same public limit.
+        response["candidates"] = hypotheses
+    response.setdefault(
+        "latency_ms",
+        round((time.perf_counter() - started_at) * 1000.0, 3),
+    )
+    return response
 
 
 def _validate_original_anchor(query: str, plan: Mapping[str, Any]) -> None:
@@ -467,6 +561,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    load_project_env()
     # Lazy import avoids a module cycle: retrieval_manager owns the cached
     # production OnlinePipeline instance and imports this class definition.
     from backend.app.services.retrieval.retrieval_manager import search_online
@@ -493,6 +588,7 @@ __all__ = [
     "OnlinePipeline",
     "OnlinePipelineConfig",
     "SUPPORTED_ONLINE_TASKS",
+    "TrakeSearchPipeline",
     "build_parser",
     "main",
 ]

@@ -1,4 +1,4 @@
-"""CLI for exporting one live KIS or grounded-QA query to CSV."""
+"""CLI for exporting one live KIS, grounded-QA, or TRAKE query to CSV."""
 from __future__ import annotations
 
 import argparse
@@ -9,8 +9,8 @@ from backend.app.services.submission.csv_export import export_query_csv
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Export an AIC KIS/QA query as ranked CSV.")
-    parser.add_argument("--task", required=True, help="kis or qa (TRAKE is not implemented)")
+    parser = argparse.ArgumentParser(description="Export an AIC KIS/QA/TRAKE query as ranked CSV.")
+    parser.add_argument("--task", required=True, choices=("kis", "qa", "trake"))
     parser.add_argument("--query", required=True)
     parser.add_argument("--top-k", type=int, default=100, help="Number of rows (1-100)")
     parser.add_argument(

@@ -1,13 +1,17 @@
-"""Cached entry points for visual, lexical, hybrid, and temporal retrieval."""
+"""Cached entry points for visual, hybrid, temporal, TRAKE, and QA retrieval."""
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import re
+import threading
+import weakref
 from dataclasses import dataclass, fields
 from functools import lru_cache, wraps
 from pathlib import Path
-from typing import Any, Callable, Mapping, TypeVar, cast
+from typing import Any, Callable, Mapping, Sequence, TypeVar, cast
 
 from backend.app.models.retrieval import VisualSearchResponse
 from backend.app.pipelines.online_pipeline import OnlinePipeline, OnlinePipelineConfig
@@ -52,6 +56,11 @@ from backend.app.services.retrieval.temporal_search import TemporalMatch
 _query_expansion_provider_instance: QueryExpansionProvider | None = None
 DEFAULT_CORPUS_MANIFEST_PATH = Path("data/metadata/offline_corpus_manifest.json")
 _CachedEngine = TypeVar("_CachedEngine")
+_LOGGER = logging.getLogger(__name__)
+_BGE_DENSE_ENGINE_LOCK = threading.RLock()
+_BGE_DENSE_ENGINES: weakref.WeakValueDictionary[tuple[object, ...], Any] = (
+    weakref.WeakValueDictionary()
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +70,94 @@ class _CorpusCacheKey:
     manifest_path: str
     bundle_generation: str | None
     manifest_contract_sha256: str | None
+
+
+class _LazyTrakeSearchPipeline:
+    """Resolve the heavy task pipeline only when routing an actual TRAKE call."""
+
+    def __init__(self, expected_generation: str | None) -> None:
+        self.expected_generation = expected_generation
+
+    def search(self, query: str, top_k: int | None = None) -> dict[str, Any]:
+        pipeline = get_trake_pipeline()
+        if (
+            self.expected_generation is not None
+            and getattr(pipeline, "corpus_generation", None)
+            != self.expected_generation
+        ):
+            raise ValueError("Lazy TRAKE pipeline belongs to another corpus generation")
+        return pipeline.search(query=query, top_k=top_k)
+
+
+def _validate_lazy_generation(
+    component: Any,
+    *,
+    expected_generation: str | None,
+    component_name: str,
+) -> None:
+    if (
+        expected_generation is not None
+        and getattr(component, "corpus_generation", None) != expected_generation
+    ):
+        raise ValueError(
+            f"Lazy {component_name} belongs to another corpus generation"
+        )
+
+
+class _LazyQaSearchPipeline:
+    """Resolve answer-capable QA only when the selected route is QA."""
+
+    def __init__(self, expected_generation: str | None) -> None:
+        self.expected_generation = expected_generation
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        task_mode: str = "qa",
+        expanded_queries: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        pipeline = get_qa_search_pipeline()
+        _validate_lazy_generation(
+            pipeline,
+            expected_generation=self.expected_generation,
+            component_name="QA pipeline",
+        )
+        return pipeline.search(
+            query=query,
+            top_k=top_k,
+            task_mode=task_mode,
+            expanded_queries=expanded_queries or (),
+        )
+
+
+class _LazyQaEvidenceSearchEngine:
+    """Resolve temporal/QA evidence only when that branch is selected."""
+
+    def __init__(self, expected_generation: str | None) -> None:
+        self.expected_generation = expected_generation
+
+    def search(
+        self,
+        question: str,
+        top_k: int = 5,
+        *,
+        task_mode: str = "qa",
+        expanded_queries: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        engine = get_qa_evidence_search_engine()
+        _validate_lazy_generation(
+            engine,
+            expected_generation=self.expected_generation,
+            component_name="QA evidence engine",
+        )
+        return engine.search(
+            question=question,
+            top_k=top_k,
+            task_mode=task_mode,
+            expanded_queries=expanded_queries or (),
+        )
 
 
 def _path_from_env(name: str, default: Path) -> Path:
@@ -99,7 +196,11 @@ def validate_runtime_corpus_bundle(
         DEFAULT_CORPUS_MANIFEST_PATH,
     )
     if not manifest_path.is_file():
-        return None  # Backward-compatible legacy deployments.
+        if require_bge:
+            raise FileNotFoundError(
+                "BGE runtime requires a committed offline corpus manifest"
+            )
+        return None  # Backward-compatible non-BGE legacy deployments.
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict) or manifest.get("status") != "passed":
         raise ValueError("Offline corpus bundle is not fully published")
@@ -239,6 +340,148 @@ def _choice_from_env(
     if value not in choices:
         raise ValueError(f"{name} must be one of {choices}, got {value!r}")
     return value
+
+
+def _positive_int_from_env(
+    name: str,
+    default: int,
+    *,
+    maximum: int | None = None,
+) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0 or (maximum is not None and value > maximum):
+        suffix = f" between 1 and {maximum}" if maximum is not None else " positive"
+        raise ValueError(f"{name} must be{suffix}")
+    return value
+
+
+def _unit_float_from_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number between 0 and 1") from exc
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be a number between 0 and 1")
+    return value
+
+
+def _bge_artifact_overrides(artifact_root: Path) -> dict[str, Path]:
+    """Resolve the three corpus-governed BGE-M3 artifacts from one root."""
+
+    from backend.app.services.retrieval.bge_dense import BgeM3ArtifactPaths
+
+    paths = BgeM3ArtifactPaths.from_root(artifact_root)
+    return {
+        "bge_index": paths.index,
+        "bge_frame_map": paths.frame_map,
+        "bge_manifest": paths.manifest,
+    }
+
+
+def build_bge_m3_dense_search_engine(
+    *,
+    artifact_root: Path,
+    model_name: str = "BAAI/bge-m3",
+    model_revision: str | None = None,
+    batch_size: int = 16,
+    device: str = "auto",
+    cache_dir: Path = Path("data/model_cache/bge_m3"),
+    local_files_only: bool = False,
+) -> Any:
+    """Build the canonical validated dense engine for QA or TRAKE."""
+
+    from backend.app.services.retrieval.bge_dense import BgeM3DenseSearchEngine
+
+    return BgeM3DenseSearchEngine(
+        artifact_root,
+        model_name=model_name,
+        model_revision=model_revision,
+        batch_size=batch_size,
+        device=device,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+    )
+
+
+def _shared_bge_m3_dense_search_engine(
+    *,
+    corpus_key: _CorpusCacheKey,
+    artifact_root: Path,
+    model_name: str = "BAAI/bge-m3",
+    model_revision: str | None = None,
+    batch_size: int = 16,
+    device: str = "auto",
+    cache_dir: Path = Path("data/model_cache/bge_m3"),
+    local_files_only: bool = False,
+) -> Any:
+    """Single-flight and share an identical validated BGE dense contract."""
+
+    key: tuple[object, ...] = (
+        corpus_key,
+        str(artifact_root.resolve()),
+        str(model_name),
+        model_revision,
+        int(batch_size),
+        str(device),
+        str(cache_dir.resolve()),
+        bool(local_files_only),
+    )
+    with _BGE_DENSE_ENGINE_LOCK:
+        engine = _BGE_DENSE_ENGINES.get(key)
+        if engine is None:
+            engine = build_bge_m3_dense_search_engine(
+                artifact_root=artifact_root,
+                model_name=model_name,
+                model_revision=model_revision,
+                batch_size=batch_size,
+                device=device,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
+            engine.corpus_generation = corpus_key.bundle_generation
+            _BGE_DENSE_ENGINES[key] = engine
+        return engine
+
+
+def build_bge_candidate_reranker(
+    *,
+    model_name: str = "BAAI/bge-reranker-v2-m3",
+    model_revision: str = "main",
+    candidate_limit: int = 100,
+    retrieval_alpha: float = 0.5,
+    batch_size: int = 16,
+    device: str = "auto",
+    cache_dir: Path = Path("data/model_cache/bge_m3"),
+    local_files_only: bool = False,
+) -> BgeCandidateReranker:
+    """Build the shared lazy candidate-reranker adapter."""
+
+    return BgeCandidateReranker(
+        model_name=model_name,
+        model_revision=model_revision,
+        candidate_limit=candidate_limit,
+        retrieval_alpha=retrieval_alpha,
+        batch_size=batch_size,
+        device=device,
+        cache_dir=str(cache_dir),
+        local_files_only=local_files_only,
+    )
+
+
+def _required_trake_dependency_error(
+    message: str,
+    failure_code: str,
+) -> RuntimeError:
+    from backend.app.services.trake.event_retrieval import (
+        RequiredTrakePipelineError,
+    )
+
+    return RequiredTrakePipelineError(message, failure_code=failure_code)
 
 
 def _qa_routing_config() -> QaRoutingConfig:
@@ -549,14 +792,7 @@ def get_qa_evidence_search_engine(
     dense_root = _path_from_env("QA_BGE_INDEX_ROOT", Path("data/indexes/bge_m3"))
     bge_paths: dict[str, Path] = {}
     if dense_enabled:
-        from backend.app.services.retrieval.bge_dense import BgeM3ArtifactPaths
-
-        resolved_bge_paths = BgeM3ArtifactPaths.from_root(dense_root)
-        bge_paths = {
-            "bge_index": resolved_bge_paths.index,
-            "bge_frame_map": resolved_bge_paths.frame_map,
-            "bge_manifest": resolved_bge_paths.manifest,
-        }
+        bge_paths = _bge_artifact_overrides(dense_root)
     before = _validate_expected_corpus(
         corpus_key,
         required_roles=tuple(bge_paths) if dense_enabled else (),
@@ -564,11 +800,15 @@ def get_qa_evidence_search_engine(
         require_bge=dense_enabled,
     )
     if dense_enabled:
-        from backend.app.services.retrieval.bge_dense import BgeM3DenseSearchEngine
-
-        dense_text_engine = BgeM3DenseSearchEngine(
-            dense_root,
+        dense_text_engine = _shared_bge_m3_dense_search_engine(
+            corpus_key=corpus_key,
+            artifact_root=dense_root,
             model_revision=os.getenv("QA_BGE_MODEL_REVISION") or None,
+            batch_size=_positive_int_from_env(
+                "QA_BGE_BATCH_SIZE",
+                16,
+                maximum=10_000,
+            ),
             device=os.getenv("QA_BGE_DEVICE", "auto"),
             cache_dir=_path_from_env(
                 "QA_BGE_MODEL_CACHE_DIR",
@@ -578,7 +818,7 @@ def get_qa_evidence_search_engine(
         )
     reranker = None
     if _bool_from_env("QA_BGE_RERANKER_ENABLED", False):
-        reranker = BgeCandidateReranker(
+        reranker = build_bge_candidate_reranker(
             model_name=os.getenv(
                 "QA_BGE_RERANKER_MODEL",
                 "BAAI/bge-reranker-v2-m3",
@@ -587,11 +827,9 @@ def get_qa_evidence_search_engine(
             retrieval_alpha=float(os.getenv("QA_BGE_RERANKER_ALPHA", "0.5")),
             batch_size=int(os.getenv("QA_BGE_BATCH_SIZE", "16")),
             device=os.getenv("QA_BGE_DEVICE", "auto"),
-            cache_dir=str(
-                _path_from_env(
-                    "QA_BGE_MODEL_CACHE_DIR",
-                    Path("data/model_cache/bge_m3"),
-                )
+            cache_dir=_path_from_env(
+                "QA_BGE_MODEL_CACHE_DIR",
+                Path("data/model_cache/bge_m3"),
             ),
             local_files_only=_bool_from_env("QA_MODELS_LOCAL_ONLY", False),
         )
@@ -683,6 +921,373 @@ def get_qa_search_pipeline(
 
 
 @_corpus_generation_cached
+def get_trake_bge_dense_search_engine(
+    corpus_key: _CorpusCacheKey,
+) -> Any | None:
+    """Load TRAKE's optional BGE-M3 index under the corpus publication gate."""
+
+    config = get_runtime_config().trake
+    if not config.bge_dense_enabled:
+        return None
+
+    artifact_root = _path_from_env(
+        "RETRIEVAL_TRAKE_BGE_INDEX_ROOT",
+        Path("data/indexes/bge_m3"),
+    )
+    artifact_overrides = _bge_artifact_overrides(artifact_root)
+    try:
+        before = _validate_expected_corpus(
+            corpus_key,
+            required_roles=tuple(artifact_overrides),
+            artifact_overrides=artifact_overrides,
+            require_bge=True,
+        )
+        engine = _shared_bge_m3_dense_search_engine(
+            corpus_key=corpus_key,
+            artifact_root=artifact_root,
+            model_name=os.getenv(
+                "RETRIEVAL_TRAKE_BGE_MODEL_NAME",
+                "BAAI/bge-m3",
+            ),
+            model_revision=(
+                os.getenv("RETRIEVAL_TRAKE_BGE_MODEL_REVISION") or None
+            ),
+            batch_size=_positive_int_from_env(
+                "RETRIEVAL_TRAKE_BGE_BATCH_SIZE",
+                16,
+                maximum=10_000,
+            ),
+            device=os.getenv("RETRIEVAL_TRAKE_BGE_DEVICE", "auto"),
+            cache_dir=_path_from_env(
+                "RETRIEVAL_TRAKE_BGE_MODEL_CACHE_DIR",
+                Path("data/model_cache/bge_m3"),
+            ),
+            local_files_only=_bool_from_env(
+                "RETRIEVAL_TRAKE_BGE_LOCAL_FILES_ONLY",
+                False,
+            ),
+        )
+        after = _validate_expected_corpus(
+            corpus_key,
+            required_roles=tuple(artifact_overrides),
+            artifact_overrides=artifact_overrides,
+            require_bge=True,
+        )
+        if before != after:
+            raise ValueError(
+                "Offline corpus changed while TRAKE BGE-M3 retrieval was loading"
+            )
+    except Exception as exc:
+        # A corpus generation flip is never an optional model failure. Re-read
+        # the base gate so that a concurrent publication still fails closed.
+        _validate_expected_corpus(corpus_key)
+        if config.bge_required:
+            raise _required_trake_dependency_error(
+                "Required TRAKE BGE-M3 dense retrieval failed to initialize",
+                "required_bge_dense_initialization_failed",
+            ) from None
+        _LOGGER.warning(
+            "Optional TRAKE BGE-M3 dense retrieval is unavailable; "
+            "continuing with canonical hybrid retrieval "
+            "(reason=initialization_failed, failure_type=%s)",
+            type(exc).__name__,
+        )
+        return None
+
+    dense_model = _dense_model_contract(engine)
+    if config.bge_required:
+        if not _is_public_hub_model_id(dense_model.get("name")):
+            raise _required_trake_dependency_error(
+                "Required TRAKE BGE-M3 needs a public hub model id",
+                "required_bge_dense_model_unverifiable",
+            )
+        if not _is_immutable_model_revision(dense_model.get("revision")):
+            raise _required_trake_dependency_error(
+                "Required TRAKE BGE-M3 manifest revision must be an immutable commit",
+                "required_bge_dense_revision_unpinned",
+            )
+    engine.corpus_generation = corpus_key.bundle_generation
+    return engine
+
+
+def build_trake_bge_candidate_reranker() -> BgeCandidateReranker | None:
+    """Build TRAKE's independently configured optional BGE reranker."""
+
+    config = get_runtime_config().trake
+    if not config.bge_reranker_enabled:
+        return None
+    model_name = os.getenv(
+        "RETRIEVAL_TRAKE_BGE_RERANKER_MODEL",
+        "BAAI/bge-reranker-v2-m3",
+    )
+    model_revision = os.getenv(
+        "RETRIEVAL_TRAKE_BGE_RERANKER_REVISION",
+        "main",
+    )
+    if config.bge_required:
+        if not _is_public_hub_model_id(model_name):
+            raise _required_trake_dependency_error(
+                "Required TRAKE BGE reranker needs a public hub model id",
+                "required_bge_reranker_model_unverifiable",
+            )
+        if not _is_immutable_model_revision(model_revision):
+            raise _required_trake_dependency_error(
+                "Required TRAKE BGE reranker revision must be an immutable commit",
+                "required_bge_reranker_revision_unpinned",
+            )
+    try:
+        return build_bge_candidate_reranker(
+            model_name=model_name,
+            model_revision=model_revision,
+            candidate_limit=config.bge_reranker_top_k,
+            retrieval_alpha=_unit_float_from_env(
+                "RETRIEVAL_TRAKE_BGE_RERANKER_ALPHA",
+                0.5,
+            ),
+            batch_size=_positive_int_from_env(
+                "RETRIEVAL_TRAKE_BGE_RERANKER_BATCH_SIZE",
+                16,
+                maximum=10_000,
+            ),
+            device=os.getenv("RETRIEVAL_TRAKE_BGE_DEVICE", "auto"),
+            cache_dir=_path_from_env(
+                "RETRIEVAL_TRAKE_BGE_MODEL_CACHE_DIR",
+                Path("data/model_cache/bge_m3"),
+            ),
+            local_files_only=_bool_from_env(
+                "RETRIEVAL_TRAKE_BGE_LOCAL_FILES_ONLY",
+                False,
+            ),
+        )
+    except Exception as exc:
+        if config.bge_required:
+            raise _required_trake_dependency_error(
+                "Required TRAKE BGE candidate reranker failed to initialize",
+                "required_bge_reranker_initialization_failed",
+            ) from None
+        _LOGGER.warning(
+            "Optional TRAKE BGE candidate reranker is unavailable; "
+            "continuing without cross-encoder reranking "
+            "(reason=initialization_failed, failure_type=%s)",
+            type(exc).__name__,
+        )
+        return None
+
+
+def _trake_bge_contract(
+    *,
+    corpus_key: _CorpusCacheKey,
+    dense_event_engine: Any | None,
+    event_reranker: Any | None,
+) -> dict[str, Any]:
+    """Return a path-free immutable-style model/artifact contract for trace."""
+
+    config = get_runtime_config().trake
+    dense_manifest: Mapping[str, Any] = {}
+    artifacts = getattr(dense_event_engine, "artifacts", None)
+    manifest = getattr(artifacts, "manifest", None)
+    if isinstance(manifest, Mapping):
+        dense_manifest = manifest
+    model = _dense_model_contract(dense_event_engine)
+    artifact_contract = dense_manifest.get("artifacts", {})
+    if not isinstance(artifact_contract, Mapping):
+        artifact_contract = {}
+
+    def checksum(role: str) -> str | None:
+        value = artifact_contract.get(role, {})
+        if not isinstance(value, Mapping):
+            return None
+        digest = value.get("sha256")
+        return str(digest) if isinstance(digest, str) and digest else None
+
+    return {
+        "corpus_generation": corpus_key.bundle_generation,
+        "dense": {
+            "enabled": bool(config.bge_dense_enabled),
+            "available": dense_event_engine is not None,
+            "model_name": _public_model_identifier(model.get("name")),
+            "model_revision": _public_model_revision(model.get("revision")),
+            "revision_source": (
+                "manifest_resolved" if model.get("revision") is not None else None
+            ),
+            "revision_pinned": _is_immutable_model_revision(
+                model.get("revision")
+            ),
+            "index_schema_version": dense_manifest.get("schema_version"),
+            "vector_count": dense_manifest.get("vector_count"),
+            "index_sha256": checksum("index"),
+            "frame_map_sha256": checksum("frame_map"),
+        },
+        "reranker": {
+            "enabled": bool(config.bge_reranker_enabled),
+            "available": event_reranker is not None,
+            "model_name": _public_model_identifier(
+                getattr(event_reranker, "model_name", None)
+            ),
+            "model_revision": _public_model_revision(
+                getattr(event_reranker, "model_revision", None)
+            ),
+            "revision_source": "requested",
+            "revision_pinned": _is_immutable_model_revision(
+                getattr(event_reranker, "model_revision", None)
+            ),
+            "candidate_limit": getattr(event_reranker, "candidate_limit", None),
+        },
+        "fusion": {
+            "method": config.retrieval_fusion,
+            "rrf_k": config.rrf_k,
+            "hybrid_weight": config.hybrid_rrf_weight,
+            "bge_weight": config.bge_rrf_weight,
+            "required": config.bge_required,
+        },
+    }
+
+
+def _dense_model_contract(engine: Any | None) -> Mapping[str, Any]:
+    artifacts = getattr(engine, "artifacts", None)
+    manifest = getattr(artifacts, "manifest", None)
+    if not isinstance(manifest, Mapping):
+        return {}
+    model = manifest.get("model", {})
+    return model if isinstance(model, Mapping) else {}
+
+
+_PUBLIC_HUB_MODEL_ID = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+)
+_PUBLIC_MODEL_REVISION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SENSITIVE_IDENTIFIER_TERMS = ("token", "secret", "password", "credential")
+
+
+def _public_model_identifier(value: Any) -> str | None:
+    """Expose a hub-style id, never a local path/URL/opaque identifier."""
+
+    if value is None:
+        return None
+    identifier = str(value).strip()
+    folded = identifier.casefold()
+    if any(term in folded for term in _SENSITIVE_IDENTIFIER_TERMS):
+        return "local_or_redacted"
+    if not _PUBLIC_HUB_MODEL_ID.fullmatch(identifier):
+        return "local_or_redacted"
+    return identifier
+
+
+def _public_model_revision(value: Any) -> str | None:
+    """Expose a simple tag/commit while rejecting paths and secret-shaped text."""
+
+    if value is None:
+        return None
+    revision = str(value).strip()
+    folded = revision.casefold()
+    if any(term in folded for term in _SENSITIVE_IDENTIFIER_TERMS):
+        return "redacted"
+    if not _PUBLIC_MODEL_REVISION.fullmatch(revision):
+        return "redacted"
+    return revision
+
+
+def _is_public_hub_model_id(value: Any) -> bool:
+    if value is None:
+        return False
+    identifier = str(value).strip()
+    folded = identifier.casefold()
+    return (
+        not any(term in folded for term in _SENSITIVE_IDENTIFIER_TERMS)
+        and _PUBLIC_HUB_MODEL_ID.fullmatch(identifier) is not None
+    )
+
+
+def _is_immutable_model_revision(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    # Hugging Face resolved revisions are currently Git SHA-1 commits.  Accept
+    # longer hexadecimal object ids as well so the policy remains future-safe.
+    return re.fullmatch(r"[0-9a-fA-F]{40,64}", str(value).strip()) is not None
+
+
+@_corpus_generation_cached
+def get_trake_pipeline(
+    corpus_key: _CorpusCacheKey,
+) -> Any:
+    """Build the public TRAKE pipeline for one committed corpus generation."""
+
+    # Lazy import keeps retrieval configuration and the online orchestrator free
+    # from a cycle while preserving the expensive pipeline's on-demand loading.
+    from backend.app.services.trake.pipeline import TrakePipeline
+
+    runtime = get_runtime_config()
+    if runtime.trake.bge_required and corpus_key.bundle_generation is None:
+        raise _required_trake_dependency_error(
+            "Required TRAKE BGE needs a committed offline corpus manifest",
+            "required_corpus_manifest_unavailable",
+        )
+    dense_event_engine = (
+        get_trake_bge_dense_search_engine()
+        if runtime.trake.bge_dense_enabled
+        else None
+    )
+    event_reranker = (
+        build_trake_bge_candidate_reranker()
+        if runtime.trake.bge_reranker_enabled
+        else None
+    )
+    if runtime.trake.bge_required:
+        if runtime.trake.bge_dense_enabled and dense_event_engine is None:
+            raise _required_trake_dependency_error(
+                "Required TRAKE BGE-M3 dense retrieval is unavailable",
+                "required_bge_dense_unavailable",
+            )
+        if runtime.trake.bge_reranker_enabled and event_reranker is None:
+            raise _required_trake_dependency_error(
+                "Required TRAKE BGE candidate reranker is unavailable",
+                "required_bge_reranker_unavailable",
+            )
+    retrieval_engine = get_hybrid_search_engine()
+    if (
+        corpus_key.bundle_generation is not None
+        and getattr(retrieval_engine, "corpus_generation", None)
+        != corpus_key.bundle_generation
+    ):
+        raise ValueError("Cached TRAKE retrieval belongs to another corpus generation")
+    pipeline = TrakePipeline(
+        retrieval_engine=retrieval_engine,
+        dense_event_engine=dense_event_engine,
+        event_reranker=event_reranker,
+        bge_contract=_trake_bge_contract(
+            corpus_key=corpus_key,
+            dense_event_engine=dense_event_engine,
+            event_reranker=event_reranker,
+        ),
+        config=runtime.trake,
+    )
+    if dense_event_engine is not None:
+        if (
+            corpus_key.bundle_generation is not None
+            and getattr(dense_event_engine, "corpus_generation", None)
+            != corpus_key.bundle_generation
+        ):
+            raise ValueError(
+                "Cached TRAKE BGE retrieval belongs to another corpus generation"
+            )
+        bge_root = _path_from_env(
+            "RETRIEVAL_TRAKE_BGE_INDEX_ROOT",
+            Path("data/indexes/bge_m3"),
+        )
+        bge_overrides = _bge_artifact_overrides(bge_root)
+        _validate_expected_corpus(
+            corpus_key,
+            required_roles=tuple(bge_overrides),
+            artifact_overrides=bge_overrides,
+            require_bge=True,
+        )
+    else:
+        _validate_expected_corpus(corpus_key)
+    pipeline.corpus_generation = corpus_key.bundle_generation
+    return pipeline
+
+
+@_corpus_generation_cached
 def get_online_pipeline(
     corpus_key: _CorpusCacheKey,
 ) -> OnlinePipeline:
@@ -707,8 +1312,11 @@ def get_online_pipeline(
             if runtime.query_expansion.enabled
             else None
         ),
-        qa_pipeline=get_qa_search_pipeline(),
-        qa_evidence_engine=get_qa_evidence_search_engine(),
+        qa_pipeline=_LazyQaSearchPipeline(corpus_key.bundle_generation),
+        qa_evidence_engine=_LazyQaEvidenceSearchEngine(
+            corpus_key.bundle_generation
+        ),
+        trake_pipeline=_LazyTrakeSearchPipeline(corpus_key.bundle_generation),
         context_index=context_index,
         config=OnlinePipelineConfig(
             include_neighbors=neighbors_enabled,
@@ -792,6 +1400,8 @@ def clear_retrieval_caches() -> None:
         _query_expansion_provider_instance = None
     for cached in (
         get_online_pipeline,
+        get_trake_pipeline,
+        get_trake_bge_dense_search_engine,
         get_qa_search_pipeline,
         get_qa_evidence_search_engine,
         get_online_context_index,
@@ -804,6 +1414,13 @@ def clear_retrieval_caches() -> None:
         get_runtime_config,
     ):
         cached.cache_clear()
+    with _BGE_DENSE_ENGINE_LOCK:
+        _BGE_DENSE_ENGINES.clear()
+    from backend.app.services.retrieval.bge_reranker import (
+        clear_shared_bge_reranker_runners,
+    )
+
+    clear_shared_bge_reranker_runners()
 
 
 def search_visual(
@@ -865,6 +1482,18 @@ def search_temporal(
     top_k: int | None = None,
 ) -> list[TemporalMatch]:
     return get_hybrid_search_engine().temporal_search(query=query, top_k=top_k)
+
+
+def search_trake(
+    query: str,
+    top_k: int | None = None,
+) -> dict[str, Any]:
+    """Return ranked same-video TRAKE frame sequences, never flattened frames."""
+
+    config = get_runtime_config().trake
+    requested_top_k = config.max_answers if top_k is None else int(top_k)
+    requested_top_k = max(1, min(requested_top_k, config.max_answers, 100))
+    return get_trake_pipeline().search(query=query, top_k=requested_top_k)
 
 
 def search_qa_evidence(

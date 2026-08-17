@@ -9,6 +9,7 @@ from numbers import Integral
 class SubmissionTask(str, Enum):
     KIS = "kis"
     QA = "qa"
+    TRAKE = "trake"
 
 
 @dataclass(frozen=True)
@@ -23,12 +24,10 @@ class ExportRequest:
         if not cleaned_query:
             raise ValueError("query must not be empty")
         normalized_task = str(task).casefold().strip()
-        if normalized_task == "trake":
-            raise NotImplementedError("TRAKE is not implemented")
         try:
             parsed_task = SubmissionTask(normalized_task)
         except ValueError as exc:
-            raise ValueError("task must be 'kis' or 'qa'") from exc
+            raise ValueError("task must be 'kis', 'qa', or 'trake'") from exc
         if isinstance(top_k, bool) or not isinstance(top_k, Integral):
             raise ValueError("top_k must be an integer between 1 and 100")
         bounded_top_k = int(top_k)

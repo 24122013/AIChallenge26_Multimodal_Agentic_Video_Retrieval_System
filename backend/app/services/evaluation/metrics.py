@@ -11,6 +11,17 @@ from dataclasses import dataclass
 from numbers import Real
 from typing import Iterable, Sequence
 
+from .trake_metrics import (
+    best_r_at_k,
+    final_trake_score,
+    trake_final_score,
+    trake_metrics_report,
+    trake_r_score,
+    validate_trake_ground_truth,
+    validate_trake_prediction,
+    validate_trake_predictions,
+)
+
 
 @dataclass(frozen=True)
 class TemporalCoverageMetrics:
@@ -120,9 +131,17 @@ def retrieval_hit_at_k(
 
 __all__ = [
     "TemporalCoverageMetrics",
+    "best_r_at_k",
     "finite_non_negative",
+    "final_trake_score",
     "percentile",
     "ratio",
     "retrieval_hit_at_k",
     "temporal_coverage_metrics",
+    "trake_final_score",
+    "trake_metrics_report",
+    "trake_r_score",
+    "validate_trake_ground_truth",
+    "validate_trake_prediction",
+    "validate_trake_predictions",
 ]

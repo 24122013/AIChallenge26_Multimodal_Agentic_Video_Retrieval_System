@@ -473,9 +473,26 @@ class VisualSearchEngine:
                 raise ValueError("FAISS bundle changed while visual search was loading")
 
     def search(self, query: str, top_k: int | None = None) -> VisualSearchResponse:
-        started_at = time.perf_counter()
         requested_top_k = top_k if top_k is not None else self.config.default_top_k
         bounded_top_k = max(1, min(int(requested_top_k), self.config.max_top_k))
+        return self._search_bounded(query, bounded_top_k)
+
+    def search_pool(self, query: str, top_k: int) -> VisualSearchResponse:
+        """Retrieve a validated internal candidate pool beyond the public cap.
+
+        Public visual responses remain limited by ``config.max_top_k``.  TRAKE
+        needs a wider pre-alignment pool and applies its own validated bound;
+        this explicit method avoids silently turning ``event_top_k=300`` into
+        200 while retaining a defensive service-level ceiling.
+        """
+
+        requested = int(top_k)
+        if not 1 <= requested <= 10_000:
+            raise ValueError("internal visual candidate pool must be between 1 and 10000")
+        return self._search_bounded(query, requested)
+
+    def _search_bounded(self, query: str, bounded_top_k: int) -> VisualSearchResponse:
+        started_at = time.perf_counter()
 
         query_vector = normalize_query_vector(self.encoder.encode(query))
         if (

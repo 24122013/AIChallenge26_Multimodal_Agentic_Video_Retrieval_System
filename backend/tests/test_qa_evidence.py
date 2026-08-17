@@ -255,6 +255,14 @@ class QaEvidenceTest(unittest.TestCase):
             "constraint_rerank:RuntimeError",
             response["routing_trace"]["fallback_reasons"],
         )
+        self.assertEqual(
+            response["routing_trace"]["constraint_rerank"]["error_code"],
+            "constraint_rerank_failed",
+        )
+        self.assertNotIn(
+            "scorer unavailable",
+            str(response["routing_trace"]),
+        )
 
     def test_no_constraints_preserves_order_without_reranking(self) -> None:
         rows = [

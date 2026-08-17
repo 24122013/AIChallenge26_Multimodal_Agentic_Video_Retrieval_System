@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
-import re
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
@@ -30,39 +29,9 @@ from backend.app.services.ingestion.common import (
 )
 
 
-DEFAULT_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
-DEFAULT_MODEL_REVISION = "b5bc35aa2d1dc2db88ca1482375afc801511bffb"
-DEFAULT_PROMPT = """Describe this video keyframe specifically for multimedia retrieval.
-
-Focus only on visually observable information.
-
-Extract:
-1. Scene/environment
-2. People
-3. Clothing and visual attributes
-4. Main objects
-5. Actions
-6. Spatial relationships
-7. Important colors
-8. Visible text only when clearly readable
-9. One concise retrieval-oriented caption
-
-Do not infer identity, intention, emotion, location, or events that are not visibly supported.
-Use exactly this schema:
-{"scene":"string","people":[{"type":"string","attributes":["string"]}],"objects":["string"],"actions":["string"],"relationships":["string"],"colors":["string"],"visible_text":["string"],"caption":"string"}
-Return valid JSON only."""
-
-_FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.IGNORECASE | re.DOTALL)
-_STRUCTURED_KEYS = (
-    "scene",
-    "people",
-    "objects",
-    "actions",
-    "relationships",
-    "colors",
-    "visible_text",
-    "caption",
-)
+DEFAULT_MODEL_NAME = "florence-community/Florence-2-base-ft"
+DEFAULT_MODEL_REVISION = "0b03b6f15a4a211370fb204aee4e7dd48887ea37"
+DEFAULT_TASK_PROMPT = "<MORE_DETAILED_CAPTION>"
 
 
 class CaptionBackend(Protocol):
@@ -70,11 +39,19 @@ class CaptionBackend(Protocol):
     model_version: str
     model_revision: str | None
 
-    def infer(self, paths: Sequence[Path]) -> Sequence[str]: ...
+    def infer(self, paths: Sequence[Path]) -> Sequence[Any]: ...
 
 
-class QwenCaptionBackend:
-    """Lazy local Qwen3-VL image-to-text caption backend."""
+@dataclass(frozen=True)
+class FlorenceCaptionOutput:
+    """A normalized Florence caption plus its original decoded generation."""
+
+    caption: str
+    raw_output: str
+
+
+class FlorenceCaptionBackend:
+    """Lazy local Florence-2 task-prompt image caption backend."""
 
     def __init__(
         self,
@@ -83,10 +60,10 @@ class QwenCaptionBackend:
         revision: str | None = DEFAULT_MODEL_REVISION,
         device: str = "cpu",
         cache_dir: Path | None = Path("data/model_cache/caption"),
-        max_new_tokens: int = 384,
+        max_new_tokens: int = 256,
         dtype: str = "auto",
         quantization: str = "none",
-        prompt: str = DEFAULT_PROMPT,
+        task_prompt: str = DEFAULT_TASK_PROMPT,
     ) -> None:
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens must be >= 1")
@@ -94,8 +71,14 @@ class QwenCaptionBackend:
             raise ValueError("dtype must be auto, bfloat16, float16, or float32")
         if quantization not in {"none", "8bit", "4bit"}:
             raise ValueError("quantization must be none, 8bit, or 4bit")
-        if device == "cpu" and quantization != "none":
-            raise ValueError("bitsandbytes quantization requires CUDA")
+        if quantization != "none":
+            raise ValueError(
+                "Florence-2 4/8-bit quantization is not supported or tested by "
+                "this caption pipeline; use quantization='none'."
+            )
+        task_prompt = str(task_prompt).strip()
+        if not task_prompt:
+            raise ValueError("task_prompt must not be empty")
         self.model_name = model_name
         self.model_version = package_version("transformers")
         self.requested_model_revision = revision
@@ -105,7 +88,7 @@ class QwenCaptionBackend:
         self.max_new_tokens = max_new_tokens
         self.dtype = dtype
         self.quantization = quantization
-        self.prompt = prompt
+        self.task_prompt = task_prompt
         self._model: Any | None = None
         self._processor: Any | None = None
         self._torch_dtype: Any | None = None
@@ -129,8 +112,8 @@ class QwenCaptionBackend:
             from transformers import AutoModelForImageTextToText, AutoProcessor
         except ImportError as exc:
             raise RuntimeError(
-                "Qwen3-VL captioning requires torch and a Transformers release with "
-                "AutoModelForImageTextToText support. Install requirements.txt."
+                "Florence-2 captioning requires torch and a Transformers release "
+                "with native Florence-2 support. Install requirements.txt."
             ) from exc
 
         kwargs: dict[str, Any] = {}
@@ -139,59 +122,37 @@ class QwenCaptionBackend:
             kwargs["cache_dir"] = str(self.cache_dir)
         if self.model_revision:
             kwargs["revision"] = self.model_revision
+        # transformers>=5.2 has native Florence-2 support, so executing model-repo
+        # Python is unnecessary. Keep this identical for processor and model.
+        kwargs["trust_remote_code"] = False
         self._processor = AutoProcessor.from_pretrained(self.model_name, **kwargs)
         self._torch_dtype = self._resolve_dtype(torch)
         model_kwargs = dict(kwargs)
-        model_kwargs["torch_dtype"] = self._torch_dtype
-        if self.quantization != "none":
-            try:
-                from transformers import BitsAndBytesConfig
-            except ImportError as exc:
-                raise RuntimeError("4/8-bit captioning requires bitsandbytes support") from exc
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=self.quantization == "4bit",
-                load_in_8bit=self.quantization == "8bit",
-                bnb_4bit_compute_dtype=self._torch_dtype,
-            )
-            model_kwargs["device_map"] = "auto"
+        model_kwargs["dtype"] = self._torch_dtype
         self._model = AutoModelForImageTextToText.from_pretrained(
             self.model_name,
             **model_kwargs,
         )
-        if self.quantization == "none":
-            self._model = self._model.to(self.device)
+        self._model = self._model.to(self.device)
         self._model.eval()
         resolved = getattr(self._model.config, "_commit_hash", None)
         if resolved:
             self.model_revision = str(resolved)
 
-    def infer(self, paths: Sequence[Path]) -> Sequence[str]:
+    def infer(self, paths: Sequence[Path]) -> Sequence[FlorenceCaptionOutput]:
         self._load()
         import torch
 
         images: list[Image.Image] = []
         try:
-            messages: list[list[dict[str, Any]]] = []
             for path in paths:
-                image = Image.open(path).convert("RGB")
+                with Image.open(path) as source:
+                    image = source.convert("RGB")
                 images.append(image)
-                messages.append(
-                    [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "image": image},
-                                {"type": "text", "text": self.prompt},
-                            ],
-                        }
-                    ]
-                )
-            inputs = self._processor.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                enable_thinking=False,
-                tokenize=True,
-                return_dict=True,
+            image_sizes = [image.size for image in images]
+            inputs = self._processor(
+                text=[self.task_prompt] * len(images),
+                images=images,
                 return_tensors="pt",
                 padding=True,
             )
@@ -207,105 +168,64 @@ class QwenCaptionBackend:
                     and value.is_floating_point()
                 ):
                     inputs[key] = value.to(dtype=self._torch_dtype)
-            input_length = int(inputs["input_ids"].shape[1])
             with torch.inference_mode():
                 tokens = self._model.generate(
                     **inputs,
                     max_new_tokens=self.max_new_tokens,
                     do_sample=False,
+                    num_beams=3,
                 )
-            generated = tokens[:, input_length:]
-            return [
-                value.strip()
-                for value in self._processor.batch_decode(
-                    generated,
-                    skip_special_tokens=True,
+            decoded = self._processor.batch_decode(
+                tokens,
+                skip_special_tokens=False,
+            )
+            if len(decoded) != len(images):
+                raise RuntimeError(
+                    f"Florence-2 decoded {len(decoded)} outputs for {len(images)} images."
                 )
-            ]
+            outputs: list[FlorenceCaptionOutput] = []
+            for raw_output, image_size in zip(decoded, image_sizes, strict=True):
+                processed = self._processor.post_process_generation(
+                    raw_output,
+                    task=self.task_prompt,
+                    image_size=image_size,
+                )
+                if not isinstance(processed, dict) or self.task_prompt not in processed:
+                    raise ValueError(
+                        "Florence-2 post-processing did not return the configured "
+                        f"task key {self.task_prompt!r}."
+                    )
+                caption = " ".join(str(processed[self.task_prompt]).split()).strip()
+                if not caption:
+                    raise ValueError("Florence-2 returned an empty English caption")
+                outputs.append(
+                    FlorenceCaptionOutput(
+                        caption=caption,
+                        raw_output=str(raw_output).strip(),
+                    )
+                )
+            return outputs
         finally:
             for image in images:
                 image.close()
 
 
-def _clean_string(value: Any, field: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{field} must be a string")
-    return " ".join(value.split()).strip()
-
-
-def _clean_string_list(value: Any, field: str) -> list[str]:
-    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-        raise TypeError(f"{field} must be a list of strings")
-    return [cleaned for item in value if (cleaned := " ".join(item.split()).strip())]
-
-
-def _validate_structured_caption(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise TypeError("caption output must be a JSON object")
-    missing = [key for key in _STRUCTURED_KEYS if key not in value]
-    if missing:
-        raise ValueError("missing structured caption fields: " + ", ".join(missing))
-    people_raw = value["people"]
-    if not isinstance(people_raw, list):
-        raise TypeError("people must be a list")
-    people: list[dict[str, Any]] = []
-    for index, person in enumerate(people_raw):
-        if not isinstance(person, dict):
-            raise TypeError(f"people[{index}] must be an object")
-        people.append(
-            {
-                "type": _clean_string(person.get("type", ""), f"people[{index}].type"),
-                "attributes": _clean_string_list(
-                    person.get("attributes", []),
-                    f"people[{index}].attributes",
-                ),
-            }
-        )
-    structured = {
-        "scene": _clean_string(value["scene"], "scene"),
-        "people": people,
-        "objects": _clean_string_list(value["objects"], "objects"),
-        "actions": _clean_string_list(value["actions"], "actions"),
-        "relationships": _clean_string_list(value["relationships"], "relationships"),
-        "colors": _clean_string_list(value["colors"], "colors"),
-        "visible_text": _clean_string_list(value["visible_text"], "visible_text"),
-        "caption": _clean_string(value["caption"], "caption"),
-    }
-    if not structured["caption"]:
+def parse_caption_output(raw: Any) -> dict[str, Any]:
+    """Adapt Florence task output to the stable downstream caption schema."""
+    if isinstance(raw, FlorenceCaptionOutput):
+        caption = " ".join(raw.caption.split()).strip()
+        raw_output = raw.raw_output.strip()
+    else:
+        # A plain-string path keeps injected/test backends backward compatible.
+        caption = " ".join(str(raw).split()).strip()
+        raw_output = str(raw).strip()
+    if not caption:
         raise ValueError("caption must not be empty")
-    return structured
-
-
-def _strip_markdown_fence(text: str) -> str:
-    match = _FENCE.match(text)
-    return match.group(1).strip() if match else text.strip()
-
-
-def _fallback_caption(cleaned: str) -> str:
-    match = re.search(r'''["']caption["']\s*:\s*["']([^"']+)''', cleaned, re.IGNORECASE)
-    if match:
-        return " ".join(match.group(1).split())
-    return " ".join(cleaned.split())
-
-
-def parse_caption_output(raw: str) -> dict[str, Any]:
-    """Parse Qwen JSON without losing useful text on malformed generations."""
-    cleaned = _strip_markdown_fence(str(raw))
-    try:
-        structured = _validate_structured_caption(json.loads(cleaned))
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        return {
-            "caption": _fallback_caption(cleaned),
-            "structured_caption": None,
-            "caption_parse_status": "fallback",
-            "caption_parse_error": str(exc),
-            "raw_caption_output": str(raw).strip(),
-        }
     return {
-        "caption": structured["caption"],
-        "structured_caption": structured,
+        "caption": caption,
+        "structured_caption": None,
         "caption_parse_status": "success",
-        "raw_caption_output": str(raw).strip(),
+        "raw_caption_output": raw_output,
     }
 
 
@@ -333,11 +253,12 @@ def run_caption_file(
     backend: CaptionBackend | None = None,
     model_name: str = DEFAULT_MODEL_NAME,
     revision: str | None = DEFAULT_MODEL_REVISION,
-    max_new_tokens: int = 384,
+    max_new_tokens: int = 256,
     dtype: str = "auto",
     quantization: str = "none",
     model_cache_dir: Path = Path("data/model_cache/caption"),
-    prompt: str = DEFAULT_PROMPT,
+    task_prompt: str = DEFAULT_TASK_PROMPT,
+    prompt: str | None = None,
 ) -> dict[str, Any]:
     if batch_size < 1:
         raise ValueError("batch_size must be >= 1")
@@ -348,7 +269,9 @@ def run_caption_file(
     report_path = report_path or output_dir / f"captions_{video_id}_report.json"
     selected_device = choose_device(device)
     backend_was_supplied = backend is not None
-    backend = backend or QwenCaptionBackend(
+    if prompt is not None:
+        task_prompt = prompt
+    backend = backend or FlorenceCaptionBackend(
         model_name=model_name,
         revision=revision,
         device=selected_device,
@@ -356,7 +279,7 @@ def run_caption_file(
         max_new_tokens=max_new_tokens,
         dtype=dtype,
         quantization=quantization,
-        prompt=prompt,
+        task_prompt=task_prompt,
     )
     requested_revision = getattr(backend, "requested_model_revision", None)
     if requested_revision is None:
@@ -409,6 +332,8 @@ def run_caption_file(
                         "caption": "",
                         "structured_caption": None,
                         "caption_parse_status": "error",
+                        "raw_caption_output": "",
+                        "caption_language": "en",
                     }
                     error_count += 1
             for position, record, (raw, error) in zip(
@@ -433,25 +358,49 @@ def run_caption_file(
                         "caption": "",
                         "structured_caption": None,
                         "caption_parse_status": "error",
+                        "raw_caption_output": "",
+                        "caption_language": "en",
                     }
                     error_count += 1
                 else:
-                    parsed = parse_caption_output(str(raw))
-                    value = {
-                        **identity(record),
-                        **processing_fields(
-                            pipeline="caption",
-                            model_name=backend.model_name,
-                            model_version=backend.model_version,
-                            model_revision=getattr(backend, "model_revision", None),
-                            requested_model_revision=requested_revision,
-                            status="success",
-                            run_at=run_at,
-                        ),
-                        **parsed,
-                        "caption_language": "en",
-                    }
-                    success_count += 1
+                    try:
+                        parsed = parse_caption_output(raw)
+                    except (TypeError, ValueError) as exc:
+                        value = {
+                            **identity(record),
+                            **processing_fields(
+                                pipeline="caption",
+                                model_name=backend.model_name,
+                                model_version=backend.model_version,
+                                model_revision=getattr(backend, "model_revision", None),
+                                requested_model_revision=requested_revision,
+                                status="error",
+                                run_at=run_at,
+                                error=str(exc),
+                            ),
+                            "caption": "",
+                            "structured_caption": None,
+                            "caption_parse_status": "error",
+                            "raw_caption_output": str(raw).strip(),
+                            "caption_language": "en",
+                        }
+                        error_count += 1
+                    else:
+                        value = {
+                            **identity(record),
+                            **processing_fields(
+                                pipeline="caption",
+                                model_name=backend.model_name,
+                                model_version=backend.model_version,
+                                model_revision=getattr(backend, "model_revision", None),
+                                requested_model_revision=requested_revision,
+                                status="success",
+                                run_at=run_at,
+                            ),
+                            **parsed,
+                            "caption_language": "en",
+                        }
+                        success_count += 1
                 batch_values[position] = value
             for position in range(len(batch)):
                 value = batch_values[position]
@@ -497,7 +446,8 @@ def run_caption_file(
             "dtype": dtype,
             "quantization": quantization,
             "segment_caption_enabled": include_segment_caption,
-            "prompt": prompt,
+            "task_prompt": task_prompt,
+            "prompt": task_prompt,
         }
     )
     write_json(report_path, result)
