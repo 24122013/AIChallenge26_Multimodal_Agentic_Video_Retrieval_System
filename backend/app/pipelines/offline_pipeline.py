@@ -3,8 +3,9 @@
 The expensive unit of work is one video.  A video completes dense candidate
 generation, full-pool materialization, every configured feature extractor,
 multimodal selection, canonical publication, and validation before the next
-video starts.  Corpus indexes are built only from the explicit set of videos
-that completed that contract.
+video starts.  Corpus indexes, selected-keyframe neighbor mappings, and
+segment/event metadata are built only from the explicit set of videos that
+completed that contract.
 
 This module intentionally orchestrates existing algorithms.  Shot detection,
 dense sampling, image decoding, feature inference, selection, and index
@@ -73,6 +74,11 @@ from backend.app.services.indexing.keyframe_selection import (
 from backend.app.services.indexing.materialize_keyframe_candidates import (
     MATERIALIZATION_MODE,
     materialize_generated_keyframe_candidates_for_video,
+)
+from backend.app.services.indexing.neighbor_index import build_neighbor_index
+from backend.app.services.indexing.extract_segments import (
+    build_segment_records,
+    build_segments,
 )
 from backend.app.services.indexing.validate_frame_map import validate_frame_map
 from backend.app.services.indexing.validate_keyframes import validate_records
@@ -199,6 +205,11 @@ class OfflinePipelineConfig:
     bge_local_files_only: bool = False
     bge_model_cache_dir: Path = Path("data/model_cache/bge_m3")
 
+    neighbor_window_seconds: float = 5.0
+    segment_strategy: str = "auto"
+    segment_fixed_duration_seconds: float = 10.0
+    segment_caption_similarity_threshold: float = 0.92
+
     min_image_width: int = 16
     min_image_height: int = 16
 
@@ -230,6 +241,7 @@ class OfflinePipelineConfig:
             "tiny_shot_max_sec",
             "gap_tolerance_seconds",
             "dedup_temporal_window_seconds",
+            "neighbor_window_seconds",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0:
@@ -259,6 +271,17 @@ class OfflinePipelineConfig:
             density = float(self.target_density_per_second)
             if not math.isfinite(density) or density <= 0:
                 raise ValueError("target_density_per_second must be positive")
+        if self.segment_strategy not in {"auto", "boundary", "fixed"}:
+            raise ValueError("segment_strategy must be one of: auto, boundary, fixed")
+        if (
+            not math.isfinite(float(self.segment_fixed_duration_seconds))
+            or self.segment_fixed_duration_seconds <= 0
+        ):
+            raise ValueError("segment_fixed_duration_seconds must be positive")
+        if not 0 <= float(self.segment_caption_similarity_threshold) <= 1:
+            raise ValueError(
+                "segment_caption_similarity_threshold must be between 0 and 1"
+            )
 
     def selection_config(self) -> SelectionConfig:
         return SelectionConfig(
@@ -2715,6 +2738,8 @@ class CorpusPaths:
     visual_manifest: Path
     visual_report: Path
     text_index: Path
+    neighbor_metadata: Path
+    segment_metadata: Path
     bge_root: Path
     state_manifest: Path
     validation_report: Path
@@ -2731,6 +2756,8 @@ class CorpusPaths:
             visual_manifest=metadata / f"{ARTIFACT_TAG}_faiss_manifest.json",
             visual_report=metadata / f"{ARTIFACT_TAG}_index_report.json",
             text_index=root / "indexes" / "retrieval_text_index.json",
+            neighbor_metadata=metadata / "neighbors_all.jsonl",
+            segment_metadata=metadata / "segments_all.jsonl",
             bge_root=root / "indexes" / "bge_m3",
             state_manifest=root / "reports" / "offline" / "corpus_state.json",
             validation_report=root / "reports" / "offline" / "corpus_report.json",
@@ -2761,6 +2788,12 @@ def _corpus_source_contract(
         "bge_enabled": config.bge_enabled,
         "bge_model_name": config.bge_model_name,
         "bge_requested_revision": config.bge_model_revision,
+        "neighbor_window_seconds": config.neighbor_window_seconds,
+        "segment_strategy": config.segment_strategy,
+        "segment_fixed_duration_seconds": config.segment_fixed_duration_seconds,
+        "segment_caption_similarity_threshold": (
+            config.segment_caption_similarity_threshold
+        ),
     }
     return {**contract, "contract_sha256": _sha256_value(contract)}
 
@@ -3161,6 +3194,299 @@ def _build_text_corpus_index(
     return result
 
 
+def _canonical_identity(
+    record: Mapping[str, Any],
+    *,
+    label: str,
+) -> tuple[str, str]:
+    video_id = str(record.get("video_id") or "").strip()
+    frame_id = str(record.get("frame_id") or record.get("keyframe_id") or "").strip()
+    if not video_id or not frame_id:
+        raise ValueError(f"{label} record is missing video_id/frame_id")
+    return video_id, frame_id
+
+
+def _load_explicit_selected_modalities(
+    videos: Sequence[VideoArtifacts],
+    canonical_records: Sequence[Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Load only modality files belonging to the explicit successful videos."""
+
+    expected = {
+        _canonical_identity(record, label="canonical selected")
+        for record in canonical_records
+    }
+    path_fields = {
+        "captions": "selected_captions",
+        "ocr": "selected_ocr",
+        "objects": "selected_objects",
+    }
+    output: dict[str, list[dict[str, Any]]] = {}
+    for label, path_field in path_fields.items():
+        records: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for video in sorted(videos, key=lambda item: item.video_id):
+            path = getattr(video.paths, path_field)
+            for record in _read_jsonl(path):
+                identity = _canonical_identity(record, label=label)
+                if identity[0] != video.video_id:
+                    raise ValueError(
+                        f"{label} file for {video.video_id} contains {identity[0]}"
+                    )
+                if identity in seen:
+                    raise ValueError(f"duplicate selected {label} identity: {identity}")
+                seen.add(identity)
+                records.append(record)
+        if seen != expected:
+            missing = sorted(expected - seen)
+            extra = sorted(seen - expected)
+            raise ValueError(
+                f"selected {label} identities do not match canonical keyframes: "
+                f"missing={missing[:10]} extra={extra[:10]}"
+            )
+        output[label] = records
+    return output
+
+
+def _neighbor_sort_key(record: Mapping[str, Any]) -> tuple[str, float, int, str]:
+    identity = _canonical_identity(record, label="neighbor source")
+    frame_index = record.get("frame_index")
+    normalized_index = -1 if frame_index in {None, ""} else int(frame_index)
+    return identity[0], float(record.get("timestamp")), normalized_index, identity[1]
+
+
+def _expected_neighbor_records(
+    canonical_records: Sequence[Mapping[str, Any]],
+    *,
+    window_seconds: float,
+) -> list[dict[str, Any]]:
+    ordered = sorted(canonical_records, key=_neighbor_sort_key)
+    by_video: dict[str, list[Mapping[str, Any]]] = {}
+    for record in ordered:
+        video_id, _ = _canonical_identity(record, label="neighbor source")
+        by_video.setdefault(video_id, []).append(record)
+
+    output: list[dict[str, Any]] = []
+    for center in ordered:
+        video_id, frame_id = _canonical_identity(center, label="neighbor source")
+        timestamp = round(float(center.get("timestamp")), 6)
+        lower = max(0.0, timestamp - window_seconds)
+        upper = timestamp + window_seconds
+        before = [
+            record
+            for record in by_video[video_id]
+            if lower <= float(record.get("timestamp")) < timestamp
+        ]
+        after = [
+            record
+            for record in by_video[video_id]
+            if timestamp < float(record.get("timestamp")) <= upper
+        ]
+
+        def compact(record: Mapping[str, Any]) -> dict[str, Any]:
+            _, neighbor_id = _canonical_identity(record, label="neighbor source")
+            return {
+                "frame_id": neighbor_id,
+                "delta_seconds": round(float(record.get("timestamp")) - timestamp, 6),
+            }
+
+        value: dict[str, Any] = {
+            "schema_version": "1.0",
+            "video_id": video_id,
+            "frame_id": frame_id,
+            "timestamp": timestamp,
+            "timestamp_source": str(center.get("timestamp_source") or "metadata"),
+            "neighbors_before": [compact(record) for record in before],
+            "neighbors_after": [compact(record) for record in after],
+        }
+        if center.get("frame_index") not in {None, ""}:
+            value["frame_index"] = int(center["frame_index"])
+        output.append(value)
+    return output
+
+
+def _validate_neighbor_corpus_metadata(
+    paths: CorpusPaths,
+    *,
+    canonical_records: Sequence[Mapping[str, Any]],
+    config: OfflinePipelineConfig,
+) -> dict[str, Any]:
+    actual = _read_jsonl(paths.neighbor_metadata)
+    expected = _expected_neighbor_records(
+        canonical_records,
+        window_seconds=config.neighbor_window_seconds,
+    )
+    if actual != expected:
+        raise ValueError(
+            "neighbor mapping does not exactly match selected keyframe timestamps"
+        )
+    return {
+        "status": "passed",
+        "record_count": len(actual),
+        "neighbor_reference_count": sum(
+            len(record["neighbors_before"]) + len(record["neighbors_after"])
+            for record in actual
+        ),
+        "window_seconds": config.neighbor_window_seconds,
+    }
+
+
+def _build_neighbor_corpus_metadata(
+    paths: CorpusPaths,
+    canonical_records: Sequence[Mapping[str, Any]],
+    source_contract: Mapping[str, Any],
+    config: OfflinePipelineConfig,
+) -> dict[str, Any]:
+    stage = "neighbor_mapping"
+    artifact_paths = (paths.neighbor_metadata,)
+    state = _corpus_stage_state(paths, source_contract, stage)
+    if config.resume and not config.force and state is not None:
+        try:
+            result = _validate_neighbor_corpus_metadata(
+                paths,
+                canonical_records=canonical_records,
+                config=config,
+            )
+            if not _hash_map_matches(state.get("artifact_hashes"), artifact_paths):
+                raise ValueError("neighbor mapping checksum changed")
+        except CHECKPOINT_INVALID_ERRORS as exc:
+            LOGGER.info("[RUN] corpus :: neighbor mapping | checkpoint invalid: %s", exc)
+        else:
+            LOGGER.info("[SKIP] corpus :: neighbor mapping")
+            return result
+    else:
+        LOGGER.info("[RUN] corpus :: neighbor mapping")
+
+    staging_parent = config.output_dir / "reports" / "offline" / ".staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    paths.neighbor_metadata.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=staging_parent) as temporary_dir:
+        selected_input = Path(temporary_dir) / "selected_keyframes.jsonl"
+        _atomic_write_jsonl(selected_input, canonical_records)
+        build_neighbor_index(
+            selected_input,
+            paths.neighbor_metadata,
+            window_seconds=config.neighbor_window_seconds,
+        )
+    result = _validate_neighbor_corpus_metadata(
+        paths,
+        canonical_records=canonical_records,
+        config=config,
+    )
+    _write_corpus_stage_state(
+        paths,
+        source_contract=source_contract,
+        stage=stage,
+        detail={"artifact_hashes": _artifact_hash_map(artifact_paths), **result},
+    )
+    return result
+
+
+def _expected_segment_records(
+    canonical_records: Sequence[Mapping[str, Any]],
+    modalities: Mapping[str, Sequence[dict[str, Any]]],
+    config: OfflinePipelineConfig,
+) -> list[dict[str, Any]]:
+    segments = build_segments(
+        [dict(record) for record in canonical_records],
+        strategy=config.segment_strategy,
+        fixed_duration_seconds=config.segment_fixed_duration_seconds,
+    )
+    return build_segment_records(
+        segments,
+        captions=modalities["captions"],
+        ocr=modalities["ocr"],
+        objects=modalities["objects"],
+        caption_similarity_threshold=config.segment_caption_similarity_threshold,
+    )
+
+
+def _validate_segment_corpus_metadata(
+    paths: CorpusPaths,
+    *,
+    canonical_records: Sequence[Mapping[str, Any]],
+    modalities: Mapping[str, Sequence[dict[str, Any]]],
+    config: OfflinePipelineConfig,
+) -> dict[str, Any]:
+    actual = _read_jsonl(paths.segment_metadata)
+    expected = _expected_segment_records(canonical_records, modalities, config)
+    if actual != expected:
+        raise ValueError(
+            "segment metadata does not match selected keyframes and modalities"
+        )
+    identities = [
+        (str(record.get("video_id") or ""), str(record.get("segment_id") or ""))
+        for record in actual
+    ]
+    if len(set(identities)) != len(identities):
+        raise ValueError("segment metadata contains duplicate video/segment identities")
+    covered_keyframes = [
+        (str(record.get("video_id") or ""), str(frame_id))
+        for record in actual
+        for frame_id in record.get("keyframe_ids", [])
+    ]
+    expected_keyframes = [
+        _canonical_identity(record, label="segment source")
+        for record in canonical_records
+    ]
+    if len(set(covered_keyframes)) != len(covered_keyframes) or set(
+        covered_keyframes
+    ) != set(expected_keyframes):
+        raise ValueError("segments do not cover every selected keyframe exactly once")
+    return {
+        "status": "passed",
+        "record_count": len(actual),
+        "selected_keyframe_count": len(covered_keyframes),
+        "video_ids": sorted({identity[0] for identity in identities}),
+        "strategy": config.segment_strategy,
+    }
+
+
+def _build_segment_corpus_metadata(
+    paths: CorpusPaths,
+    canonical_records: Sequence[Mapping[str, Any]],
+    modalities: Mapping[str, Sequence[dict[str, Any]]],
+    source_contract: Mapping[str, Any],
+    config: OfflinePipelineConfig,
+) -> dict[str, Any]:
+    stage = "segments_events"
+    artifact_paths = (paths.segment_metadata,)
+    state = _corpus_stage_state(paths, source_contract, stage)
+    if config.resume and not config.force and state is not None:
+        try:
+            result = _validate_segment_corpus_metadata(
+                paths,
+                canonical_records=canonical_records,
+                modalities=modalities,
+                config=config,
+            )
+            if not _hash_map_matches(state.get("artifact_hashes"), artifact_paths):
+                raise ValueError("segment metadata checksum changed")
+        except CHECKPOINT_INVALID_ERRORS as exc:
+            LOGGER.info("[RUN] corpus :: segments/events | checkpoint invalid: %s", exc)
+        else:
+            LOGGER.info("[SKIP] corpus :: segments/events")
+            return result
+    else:
+        LOGGER.info("[RUN] corpus :: segments/events")
+
+    records = _expected_segment_records(canonical_records, modalities, config)
+    _atomic_write_jsonl(paths.segment_metadata, records)
+    result = _validate_segment_corpus_metadata(
+        paths,
+        canonical_records=canonical_records,
+        modalities=modalities,
+        config=config,
+    )
+    _write_corpus_stage_state(
+        paths,
+        source_contract=source_contract,
+        stage=stage,
+        detail={"artifact_hashes": _artifact_hash_map(artifact_paths), **result},
+    )
+    return result
+
+
 def _validate_bge_corpus_index(
     paths: CorpusPaths,
     *,
@@ -3294,6 +3620,8 @@ def _corpus_bundle_artifacts(
         "visual_manifest": paths.visual_manifest,
         "visual_report": paths.visual_report,
         "text_index": paths.text_index,
+        "neighbor_metadata": paths.neighbor_metadata,
+        "segment_metadata": paths.segment_metadata,
         "corpus_state": paths.state_manifest,
         "corpus_report": paths.validation_report,
     }
@@ -3481,7 +3809,7 @@ def build_corpus_indexes(
     videos: Sequence[VideoArtifacts],
     config: OfflinePipelineConfig,
 ) -> dict[str, Any]:
-    """Build retrieval indexes from the explicit successfully processed videos."""
+    """Build and atomically publish indexes plus neighbor/segment metadata."""
 
     if not videos:
         raise ValueError("Corpus indexing requires at least one successful video")
@@ -3522,6 +3850,10 @@ def build_corpus_indexes(
         canonical_records,
         allowed_video_ids=set(video_ids),
     )
+    selected_modalities = _load_explicit_selected_modalities(
+        ordered,
+        canonical_records,
+    )
 
     if config.resume and not config.force:
         try:
@@ -3533,6 +3865,17 @@ def build_corpus_indexes(
             )
             _validate_visual_corpus_index(paths, videos=ordered)
             _validate_text_corpus_index(paths, canonical_records)
+            _validate_neighbor_corpus_metadata(
+                paths,
+                canonical_records=canonical_records,
+                config=config,
+            )
+            _validate_segment_corpus_metadata(
+                paths,
+                canonical_records=canonical_records,
+                modalities=selected_modalities,
+                config=config,
+            )
             if config.bge_enabled:
                 _validate_bge_corpus_index(
                     paths,
@@ -3572,6 +3915,19 @@ def build_corpus_indexes(
             source_contract,
             staged_config,
         )
+        neighbors = _build_neighbor_corpus_metadata(
+            staged_paths,
+            canonical_records,
+            source_contract,
+            staged_config,
+        )
+        segments = _build_segment_corpus_metadata(
+            staged_paths,
+            canonical_records,
+            selected_modalities,
+            source_contract,
+            staged_config,
+        )
         bge: Mapping[str, Any] | None = None
         if config.bge_enabled:
             bge = _build_bge_corpus_index(
@@ -3599,12 +3955,16 @@ def build_corpus_indexes(
             "source_contract_sha256": source_contract["contract_sha256"],
             "visual_index": visual,
             "text_index": text,
+            "neighbor_mapping": neighbors,
+            "segments_events": segments,
             "bge_m3": bge,
             "artifacts": {
                 "visual_index": paths.visual_index.as_posix(),
                 "visual_frame_map": paths.visual_frame_map.as_posix(),
                 "visual_manifest": paths.visual_manifest.as_posix(),
                 "text_index": paths.text_index.as_posix(),
+                "neighbor_metadata": paths.neighbor_metadata.as_posix(),
+                "segment_metadata": paths.segment_metadata.as_posix(),
                 "bge_root": paths.bge_root.as_posix() if config.bge_enabled else None,
                 "corpus_manifest": paths.corpus_manifest.as_posix(),
             },
@@ -3620,6 +3980,8 @@ def build_corpus_indexes(
                 "video_ids": list(video_ids),
                 "visual_index": visual,
                 "text_index": text,
+                "neighbor_mapping": neighbors,
+                "segments_events": segments,
                 "bge_m3": bge,
             },
         )
@@ -3645,6 +4007,17 @@ def build_corpus_indexes(
     )
     _validate_visual_corpus_index(paths, videos=ordered)
     _validate_text_corpus_index(paths, canonical_records)
+    _validate_neighbor_corpus_metadata(
+        paths,
+        canonical_records=canonical_records,
+        config=config,
+    )
+    _validate_segment_corpus_metadata(
+        paths,
+        canonical_records=canonical_records,
+        modalities=selected_modalities,
+        config=config,
+    )
     if config.bge_enabled:
         _validate_bge_corpus_index(
             paths,
@@ -3734,6 +4107,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-autocast", action="store_true")
     parser.add_argument("--skip-bge", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument(
+        "--neighbor-window-seconds",
+        type=float,
+        default=5.0,
+        help="Map selected keyframes to selected neighbors within this time window.",
+    )
+    parser.add_argument(
+        "--segment-strategy",
+        choices=("auto", "boundary", "fixed"),
+        default="auto",
+        help="Use shot/segment lineage when available, or fixed temporal windows.",
+    )
+    parser.add_argument(
+        "--segment-fixed-duration-seconds",
+        type=float,
+        default=10.0,
+    )
+    parser.add_argument(
+        "--segment-caption-similarity-threshold",
+        type=float,
+        default=0.92,
+    )
 
     resume = parser.add_mutually_exclusive_group()
     resume.add_argument("--resume", dest="resume", action="store_true", default=True)
@@ -3853,6 +4248,12 @@ def _config_from_args(args: argparse.Namespace) -> OfflinePipelineConfig:
         bge_batch_size=args.bge_batch_size,
         bge_local_files_only=args.local_files_only,
         bge_model_cache_dir=output_dir / "model_cache" / "bge_m3",
+        neighbor_window_seconds=args.neighbor_window_seconds,
+        segment_strategy=args.segment_strategy,
+        segment_fixed_duration_seconds=args.segment_fixed_duration_seconds,
+        segment_caption_similarity_threshold=(
+            args.segment_caption_similarity_threshold
+        ),
     )
 
 

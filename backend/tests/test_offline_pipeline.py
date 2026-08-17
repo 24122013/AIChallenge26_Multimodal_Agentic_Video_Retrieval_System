@@ -1200,24 +1200,40 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             "artifact_role": "selected_keyframe",
             "keyframe_path": f"keyframes/{video_id}/{frame_id}.jpg",
             "timestamp": 1.0,
+            "timestamp_source": "video_fps",
+            "frame_index": 25,
             "shot_id": f"SHOT_{video_id}_000000",
+            "segment_id": f"SHOT_{video_id}_000000",
+            "shot_start": 0.0,
+            "shot_end": 2.0,
+            "selection_phase": "protected",
+            "protected": True,
+            "covered_event_ids": [f"EVENT_{video_id}_000000"],
         }
         families = {
             f"keyframes_{video_id}.jsonl": selected,
             f"captions_{video_id}.jsonl": {
                 "video_id": video_id,
                 "frame_id": frame_id,
+                "timestamp": 1.0,
+                "status": "success",
                 "caption": caption,
             },
             f"ocr_{video_id}.jsonl": {
                 "video_id": video_id,
                 "frame_id": frame_id,
+                "timestamp": 1.0,
+                "status": "success",
                 "ocr_text": f"ocr-{video_id}",
             },
             f"objects_{video_id}.jsonl": {
                 "video_id": video_id,
                 "frame_id": frame_id,
-                "objects": [f"object-{video_id}"],
+                "timestamp": 1.0,
+                "status": "success",
+                "objects": [
+                    {"class_name": f"object-{video_id}", "confidence": 0.9}
+                ],
             },
         }
         for name, record in families.items():
@@ -1226,6 +1242,132 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 encoding="utf-8",
             )
         return selected
+
+    def test_neighbor_and_segment_stages_use_selected_keyframes_and_modalities(
+        self,
+    ) -> None:
+        config = pipeline.replace(
+            self.config,
+            neighbor_window_seconds=5.0,
+            segment_strategy="auto",
+        )
+        paths = pipeline.CorpusPaths.from_config(config)
+        video_id = "video_temporal"
+        records = [
+            {
+                "video_id": video_id,
+                "frame_id": "F1",
+                "artifact_role": "selected_keyframe",
+                "timestamp": 1.0,
+                "timestamp_source": "video_fps",
+                "frame_index": 25,
+                "shot_id": "SHOT_1",
+                "segment_id": "SHOT_1",
+                "shot_start": 0.0,
+                "shot_end": 5.0,
+                "selection_phase": "protected",
+                "covered_event_ids": ["E1"],
+            },
+            {
+                "video_id": video_id,
+                "frame_id": "F2",
+                "artifact_role": "selected_keyframe",
+                "timestamp": 3.0,
+                "timestamp_source": "video_fps",
+                "frame_index": 75,
+                "shot_id": "SHOT_1",
+                "segment_id": "SHOT_1",
+                "shot_start": 0.0,
+                "shot_end": 5.0,
+                "selection_phase": "coverage",
+                "covered_event_ids": ["E2"],
+            },
+        ]
+        modalities = {
+            "captions": [
+                {
+                    "video_id": video_id,
+                    "frame_id": "F1",
+                    "timestamp": 1.0,
+                    "status": "success",
+                    "caption": "A red car is parked.",
+                },
+                {
+                    "video_id": video_id,
+                    "frame_id": "F2",
+                    "timestamp": 3.0,
+                    "status": "success",
+                    "caption": "A person walks past the car.",
+                },
+            ],
+            "ocr": [
+                {
+                    "video_id": video_id,
+                    "frame_id": "F1",
+                    "timestamp": 1.0,
+                    "status": "success",
+                    "ocr_text": "HELLO",
+                },
+                {
+                    "video_id": video_id,
+                    "frame_id": "F2",
+                    "timestamp": 3.0,
+                    "status": "success",
+                    "ocr_text": "WORLD",
+                },
+            ],
+            "objects": [
+                {
+                    "video_id": video_id,
+                    "frame_id": "F1",
+                    "timestamp": 1.0,
+                    "status": "success",
+                    "objects": [{"class_name": "car", "confidence": 0.9}],
+                },
+                {
+                    "video_id": video_id,
+                    "frame_id": "F2",
+                    "timestamp": 3.0,
+                    "status": "success",
+                    "objects": [{"class_name": "person", "confidence": 0.8}],
+                },
+            ],
+        }
+        source_contract = {"contract_sha256": "temporal-contract"}
+
+        neighbor_report = pipeline._build_neighbor_corpus_metadata(
+            paths,
+            records,
+            source_contract,
+            config,
+        )
+        segment_report = pipeline._build_segment_corpus_metadata(
+            paths,
+            records,
+            modalities,
+            source_contract,
+            config,
+        )
+
+        neighbors = pipeline._read_jsonl(paths.neighbor_metadata)
+        self.assertEqual(neighbor_report["record_count"], 2)
+        self.assertEqual(
+            neighbors[0]["neighbors_after"],
+            [{"frame_id": "F2", "delta_seconds": 2.0}],
+        )
+        self.assertEqual(
+            neighbors[1]["neighbors_before"],
+            [{"frame_id": "F1", "delta_seconds": -2.0}],
+        )
+        segments = pipeline._read_jsonl(paths.segment_metadata)
+        self.assertEqual(segment_report["record_count"], 1)
+        self.assertEqual(segments[0]["keyframe_ids"], ["F1", "F2"])
+        self.assertEqual(segments[0]["covered_event_ids"], ["E1", "E2"])
+        self.assertIn("A red car is parked.", segments[0]["captions_aggregated"])
+        self.assertEqual(
+            {item["label"] for item in segments[0]["objects"]},
+            {"car", "person"},
+        )
 
     def test_corpus_uses_explicit_multi_video_inputs_and_excludes_stale_metadata(
         self,
@@ -1278,6 +1420,16 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 "_build_text_corpus_index",
                 return_value={"status": "passed", "input_record_count": 2},
             ) as text_builder,
+            patch.object(
+                pipeline,
+                "_build_neighbor_corpus_metadata",
+                return_value={"status": "passed", "record_count": 2},
+            ) as neighbor_builder,
+            patch.object(
+                pipeline,
+                "_build_segment_corpus_metadata",
+                return_value={"status": "passed", "record_count": 2},
+            ) as segment_builder,
             patch.object(pipeline, "_build_bge_corpus_index") as bge_builder,
             patch.object(pipeline, "_rebase_staged_visual_bundle"),
             patch.object(
@@ -1289,6 +1441,16 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 pipeline,
                 "_validate_text_corpus_index",
                 return_value={"status": "passed", "input_record_count": 2},
+            ),
+            patch.object(
+                pipeline,
+                "_validate_neighbor_corpus_metadata",
+                return_value={"status": "passed", "record_count": 2},
+            ),
+            patch.object(
+                pipeline,
+                "_validate_segment_corpus_metadata",
+                return_value={"status": "passed", "record_count": 2},
             ),
             patch.object(
                 pipeline,
@@ -1320,6 +1482,24 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         self.assertNotIn(
             "video_STALE",
             {record["video_id"] for record in indexed_records},
+        )
+        neighbor_records = neighbor_builder.call_args.args[1]
+        segment_records = segment_builder.call_args.args[1]
+        segment_modalities = segment_builder.call_args.args[2]
+        self.assertEqual(
+            {record["video_id"] for record in neighbor_records},
+            {"video_A", "video_B"},
+        )
+        self.assertEqual(
+            {record["video_id"] for record in segment_records},
+            {"video_A", "video_B"},
+        )
+        self.assertTrue(
+            all(
+                {record["video_id"] for record in records}
+                == {"video_A", "video_B"}
+                for records in segment_modalities.values()
+            )
         )
         self.assertEqual(report["video_ids"], ["video_A", "video_B"])
         self.assertEqual(report["video_count"], 2)
@@ -1386,6 +1566,23 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         self.assertEqual(first["selected_keyframe_count"], 1)
         self.assertTrue(corpus_paths.visual_index.is_file())
         self.assertTrue(corpus_paths.text_index.is_file())
+        self.assertTrue(corpus_paths.neighbor_metadata.is_file())
+        self.assertTrue(corpus_paths.segment_metadata.is_file())
+        neighbors = pipeline._read_jsonl(corpus_paths.neighbor_metadata)
+        segments = pipeline._read_jsonl(corpus_paths.segment_metadata)
+        self.assertEqual(len(neighbors), 1)
+        self.assertEqual(neighbors[0]["frame_id"], selected["frame_id"])
+        self.assertEqual(neighbors[0]["neighbors_before"], [])
+        self.assertEqual(neighbors[0]["neighbors_after"], [])
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["keyframe_ids"], [selected["frame_id"]])
+        self.assertEqual(segments[0]["captions_aggregated"], "atomic caption")
+        self.assertEqual(
+            {"neighbor_metadata", "segment_metadata"}.issubset(
+                committed["artifacts"]
+            ),
+            True,
+        )
         from backend.app.services.retrieval import retrieval_manager
 
         with patch.dict(
@@ -1393,10 +1590,17 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             {"RETRIEVAL_CORPUS_MANIFEST_PATH": str(corpus_paths.corpus_manifest)},
         ):
             runtime_manifest = retrieval_manager.validate_runtime_corpus_bundle(
-                required_roles=("visual_index", "text_index"),
+                required_roles=(
+                    "visual_index",
+                    "text_index",
+                    "neighbor_metadata",
+                    "segment_metadata",
+                ),
                 artifact_overrides={
                     "visual_index": corpus_paths.visual_index,
                     "text_index": corpus_paths.text_index,
+                    "neighbor_metadata": corpus_paths.neighbor_metadata,
+                    "segment_metadata": corpus_paths.segment_metadata,
                 },
             )
             self.assertEqual(
@@ -1456,6 +1660,65 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(corpus_paths.visual_index.read_bytes(), b"OLD-VISUAL")
         self.assertEqual(corpus_paths.text_index.read_bytes(), b"OLD-TEXT")
+        self.assertFalse(corpus_paths.corpus_manifest.exists())
+
+    def test_failed_staged_segments_never_partially_replace_existing_corpus(
+        self,
+    ) -> None:
+        video = self._video("video_segment_failure")
+        selected = self._write_canonical_family(video.stem, "stable caption")
+        artifact = self._video_artifacts(video)
+        artifact.paths.completion_report.parent.mkdir(parents=True, exist_ok=True)
+        artifact.paths.completion_report.write_text(
+            json.dumps({"status": "passed", "artifact_hashes": {}}) + "\n",
+            encoding="utf-8",
+        )
+        corpus_paths = pipeline.CorpusPaths.from_config(self.config)
+        old_artifacts = {
+            corpus_paths.visual_index: b"OLD-VISUAL",
+            corpus_paths.text_index: b"OLD-TEXT",
+            corpus_paths.neighbor_metadata: b"OLD-NEIGHBORS",
+            corpus_paths.segment_metadata: b"OLD-SEGMENTS",
+        }
+        for path, payload in old_artifacts.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+
+        with (
+            patch.object(
+                pipeline,
+                "_validate_selected_bundle",
+                return_value=(
+                    {"dense_candidate_count": 3, "status": "passed"},
+                    (selected,),
+                ),
+            ),
+            patch.object(
+                pipeline,
+                "_build_visual_corpus_index",
+                return_value={"status": "passed"},
+            ),
+            patch.object(
+                pipeline,
+                "_build_text_corpus_index",
+                return_value={"status": "passed"},
+            ),
+            patch.object(
+                pipeline,
+                "_build_neighbor_corpus_metadata",
+                return_value={"status": "passed"},
+            ),
+            patch.object(
+                pipeline,
+                "_build_segment_corpus_metadata",
+                side_effect=RuntimeError("segment build failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "segment build failed"):
+                pipeline.build_corpus_indexes((artifact,), self.config)
+
+        for path, payload in old_artifacts.items():
+            self.assertEqual(path.read_bytes(), payload)
         self.assertFalse(corpus_paths.corpus_manifest.exists())
 
 

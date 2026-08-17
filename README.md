@@ -169,7 +169,8 @@ Entrypoint dưới đây chạy toàn bộ video `*.mp4` trong `data/raw/video/`
 tự deterministic. Mỗi video phải hoàn tất dense candidates → materialize toàn
 bộ ảnh → SigLIP2/OCR/object/caption cho toàn pool → multimodal selection →
 canonical publish/validation trước khi video kế tiếp bắt đầu. Chỉ sau khi mọi
-video requested thành công, pipeline mới build FAISS, BM25 và BGE-M3.
+video requested thành công, pipeline mới build FAISS, BM25, BGE-M3, neighbor
+mapping và segment/event metadata rồi commit tất cả thành một corpus generation.
 
 ```powershell
 python -m backend.app.pipelines.offline_pipeline `
@@ -203,43 +204,26 @@ alignment và artifact validator đều pass. `--force` recompute toàn bộ;
 `--skip-bge` tắt riêng BGE-M3; `--allow-partial-corpus` cho phép index các video
 thành công khi video khác fail (mặc định corpus indexing bị chặn). Full-dataset
 mode build corpus mặc định; `--skip-corpus` chỉ chạy/publish các stage per-video.
+Neighbor mặc định nối các selected keyframe cùng video trong cửa sổ ±5 giây;
+segment mặc định dùng shot/segment boundary có sẵn và fallback cửa sổ 10 giây.
+Có thể đổi bằng `--neighbor-window-seconds`, `--segment-strategy` và
+`--segment-fixed-duration-seconds`.
 
 Dense workspace được cô lập tại `data/candidates/`, `data/dense_keyframes/` và
 `data/candidate_features/`, nên không thể lọt vào glob retrieval canonical.
 Selected artifacts nằm tại `data/keyframes/`, `data/embeddings/` và
 `data/metadata/`; per-video/corpus reports nằm dưới `data/reports/offline/`.
-FAISS, BM25 và BGE-M3 được build/validate trong staging trước; manifest corpus
-được publish cuối cùng. Nếu crash giữa lúc promote, runtime fail-closed thay vì
-trộn index thuộc hai generation khác nhau.
+`data/metadata/neighbors_all.jsonl` và `segments_all.jsonl` cũng được build từ
+đúng tập selected keyframe vừa hoàn tất, không scan artifact stale. FAISS, BM25,
+BGE-M3, neighbor và segment đều được build/validate trong staging; manifest
+corpus được publish cuối cùng. Nếu crash giữa lúc promote, runtime fail-closed
+thay vì trộn artifact thuộc hai generation khác nhau.
 
 Các CLI service riêng lẻ vẫn hữu ích để debug một stage, nhưng không thay thế
 entrypoint canonical vì chúng không tự đảm bảo thứ tự full-pool multimodal.
 
-Sau canonical run, có thể tạo thêm neighbor index cho các keyframe đã chọn. Mỗi
-record giữ các frame lân cận trong cùng video ở cửa sổ ±5 giây:
-
-```powershell
-python -m backend.app.services.indexing.neighbor_index `
-  --input data/metadata `
-  --output data/metadata/neighbors_all.jsonl `
-  --window-seconds 5
-```
-
-Tạo segment metadata cho toàn bộ corpus, đồng thời tổng hợp caption, OCR và
-object evidence:
-
-```powershell
-python -m backend.app.services.indexing.extract_segments `
-  --input data/metadata `
-  --captions data/metadata `
-  --ocr data/metadata `
-  --objects data/metadata `
-  --output data/metadata/segments_all.jsonl `
-  --strategy auto
-```
-
-Neighbor và segment cũng là hai bước explicit, không được ingestion tự động gọi.
-Kiểm tra artifact tùy chọn:
+Neighbor/segment CLI riêng vẫn dùng được để debug từng builder, nhưng canonical
+offline entrypoint đã tự chạy và commit hai artifact này. Kiểm tra output:
 
 ```powershell
 Test-Path data/metadata/neighbors_all.jsonl
