@@ -130,6 +130,36 @@ class _TemporalEvidence:
         }
 
 
+class _TrakePipeline:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def search(self, query, top_k=100):
+        self.calls.append((query, top_k))
+        return {
+            "schema_version": "trake.v1",
+            "query": query,
+            "task": "trake",
+            "event_plan": {
+                "original_query": query,
+                "events": [
+                    {"index": 0, "original_text": "enters"},
+                    {"index": 1, "original_text": "sits"},
+                ],
+            },
+            "hypotheses": [
+                {
+                    "rank": 1,
+                    "video_id": "V1",
+                    "frame_ids": [10, 20],
+                    "score": 0.9,
+                }
+            ],
+            "trace": {"route": "trake"},
+            "latency_ms": 1.0,
+        }
+
+
 class OnlinePipelineTest(unittest.TestCase):
     def test_kis_plans_expands_routes_and_normalizes_candidates(self) -> None:
         hybrid, visual, text = _hybrid()
@@ -286,6 +316,40 @@ class OnlinePipelineTest(unittest.TestCase):
             "chain-1",
         )
         self.assertEqual(temporal_response["temporal_matches"][0]["chain_id"], "chain-1")
+
+    def test_trake_route_preserves_ranked_sequences_and_temporal_semantics(
+        self,
+    ) -> None:
+        hybrid, _visual, _text = _hybrid()
+        temporal = _TemporalEvidence()
+        trake = _TrakePipeline()
+        pipeline = OnlinePipeline(
+            hybrid_engine=hybrid,
+            runtime_config=RetrievalRuntimeConfig(
+                query_expansion=QueryExpansionConfig(enabled=False)
+            ),
+            qa_evidence_engine=temporal,
+            trake_pipeline=trake,
+        )
+
+        trake_response = pipeline.run(
+            "a man enters then sits down",
+            task="trake",
+            top_k=500,
+        )
+        temporal_response = pipeline.run(
+            "a man enters then sits down",
+            task="temporal",
+            top_k=2,
+        )
+
+        self.assertEqual(trake.calls, [("a man enters then sits down", 100)])
+        self.assertEqual(trake_response["task"], "trake")
+        self.assertEqual(trake_response["top_k"], 100)
+        self.assertEqual(trake_response["hypotheses"][0]["frame_ids"], [10, 20])
+        self.assertNotIn("candidates", trake_response)
+        self.assertEqual(temporal.calls[0][2:], ("temporal", ()))
+        self.assertEqual(temporal_response["task"], "temporal")
 
     def test_qa_temporal_matching_maps_canonical_segments_before_chain(self) -> None:
         hybrid, _visual, _text = _hybrid()

@@ -57,12 +57,14 @@ class SubmissionCsvTests(unittest.TestCase):
         self.assertEqual([row[:2] for row in parsed[1:]], [["b", "20"], ["a", "10"], ["c", "30"]])
         self.assertTrue(all(row[2] == answer for row in parsed[1:]))
 
-    def test_top_k_bounds_and_trake_are_rejected(self) -> None:
+    def test_top_k_bounds_and_trake_are_supported(self) -> None:
         for value in (0, 101):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 ExportRequest.parse("query", "kis", value)
-        with self.assertRaisesRegex(NotImplementedError, "not implemented"):
-            ExportRequest.parse("query", "trake", 10)
+        self.assertIs(
+            ExportRequest.parse("query", "trake", 10).task,
+            SubmissionTask.TRAKE,
+        )
 
     def test_qa_abstain_and_invalid_citation_fail(self) -> None:
         with self.assertRaises(SubmissionExportError):
@@ -133,7 +135,7 @@ class SubmissionApiTests(unittest.TestCase):
         )
         self.assertNotIn("..", response.headers["content-disposition"])
 
-    def test_api_rejects_trake_and_out_of_range_top_k(self) -> None:
+    def test_api_accepts_trake_and_rejects_out_of_range_top_k(self) -> None:
         try:
             from fastapi import FastAPI
             from fastapi.testclient import TestClient
@@ -143,11 +145,21 @@ class SubmissionApiTests(unittest.TestCase):
         app = FastAPI()
         app.include_router(search_api.router)
         client = TestClient(app)
-        trake = client.post(
-            "/search/export", json={"query": "events", "task": "trake", "top_k": 10}
+        exported = ExportedCsv(
+            "video_id,frame_id_1,frame_id_2\r\nV1,3,7\r\n",
+            "trake_result.csv",
+            1,
+            SubmissionTask.TRAKE,
         )
-        self.assertEqual(trake.status_code, 501)
-        self.assertIn("not implemented", trake.json()["detail"])
+        with mock.patch.object(search_api, "export_query_csv", return_value=exported):
+            trake = client.post(
+                "/search/export", json={"query": "events", "task": "trake", "top_k": 10}
+            )
+        self.assertEqual(trake.status_code, 200)
+        self.assertEqual(
+            trake.headers["content-disposition"],
+            'attachment; filename="trake_result.csv"',
+        )
         for top_k in (0, 101):
             with self.subTest(top_k=top_k):
                 response = client.post(

@@ -10,9 +10,11 @@ from backend.app.services.retrieval.retrieval_manager import (
     search_object,
     search_ocr,
     search_online,
+    search_trake,
     search_visual,
 )
 from backend.app.services.retrieval.qa_pipeline import RequiredQaPipelineError
+from backend.app.services.trake import RequiredTrakePipelineError
 
 try:  # pragma: no cover - depends on optional API runtime.
     from fastapi import APIRouter, HTTPException
@@ -44,6 +46,10 @@ if APIRouter is not None:
         task: str = "auto"
         top_k: int = Field(default=20, ge=1, le=200)
         expanded_queries: list[str] = Field(default_factory=list, max_length=20)
+
+    class TrakeSearchBody(BaseModel):
+        query: str
+        top_k: int = Field(default=100, ge=1, le=100)
 
     @router.post("/online")
     def online_search_endpoint(body: OnlineSearchBody) -> dict:
@@ -84,6 +90,10 @@ if APIRouter is not None:
             lambda: search_online(body.query, task="temporal", top_k=body.top_k)
         )
 
+    @router.post("/trake")
+    def trake_search_endpoint(body: TrakeSearchBody) -> dict:
+        return _response(lambda: search_trake(body.query, top_k=body.top_k))
+
     @router.post("/qa-evidence")
     def qa_evidence_search_endpoint(body: VisualSearchBody) -> dict:
         return _response(
@@ -109,6 +119,15 @@ if APIRouter is not None:
                 "message": None,
             }
         except RequiredQaPipelineError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "data": exc.response,
+                    "message": str(exc),
+                },
+            )
+        except RequiredTrakePipelineError as exc:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -150,6 +169,10 @@ def object_search(query: str, top_k: int = 20) -> dict:
 
 def temporal_search(query: str, top_k: int = 20) -> list[dict]:
     return search_online(query=query, task="temporal", top_k=top_k)["candidates"]
+
+
+def trake_search(query: str, top_k: int = 100) -> dict:
+    return search_trake(query=query, top_k=top_k)
 
 
 def qa_evidence_search(question: str, top_k: int = 10) -> dict:

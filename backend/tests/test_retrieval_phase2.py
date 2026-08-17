@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from backend.app.services.indexing.build_text_index import (
     load_records,
@@ -11,6 +13,7 @@ from backend.app.services.indexing.build_text_index import (
 )
 from backend.app.services.retrieval.retrieval_config import (
     RetrievalConfigError,
+    TrakeConfig,
     load_retrieval_runtime_config,
 )
 from backend.app.services.retrieval.query_terms import (
@@ -340,6 +343,78 @@ class Phase2RetrievalTest(unittest.TestCase):
                 config.text_index.path,
                 Path("data/index # current.json"),
             )
+
+    def test_runtime_config_loads_and_validates_trake_section_and_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "retrieval.yaml"
+            path.write_text(
+                "\n".join(
+                    [
+                        "trake:",
+                        "  event_top_k: 321",
+                        "  top_videos: 25",
+                        "  max_candidates_per_event_per_video: 19",
+                        "  max_candidates_per_shot: 3",
+                        "  score_normalization: percentile",
+                        "  context_weight: 0.2",
+                        "  coverage_weight: 0.5",
+                        "  event_support_weight: 0.3",
+                        "  alignment_method: dp",
+                        "  beam_width: 150",
+                        "  k_best_paths_per_video: 8",
+                        "  gap_penalty: linear",
+                        "  gap_lambda: 0.01",
+                        "  refinement_enabled: false",
+                        "  refinement_top_paths: 12",
+                        "  window_before_frames: 0",
+                        "  window_after_frames: 30",
+                        "  dense_stride_frames: 2",
+                        "  local_hypotheses_per_event: 2",
+                        "  max_answers: 75",
+                        "  ranking_cutoffs: [1, 5, 20, 50, 100]",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "RETRIEVAL_TRAKE_TOP_VIDEOS": "27",
+                    "RETRIEVAL_TRAKE_RANKING_CUTOFFS": "1,10,100",
+                },
+                clear=False,
+            ):
+                config = load_retrieval_runtime_config(path).trake
+
+        self.assertEqual(config.event_top_k, 321)
+        self.assertEqual(config.top_videos, 27)
+        self.assertEqual(config.score_normalization, "percentile")
+        self.assertEqual(config.alignment_method, "dp")
+        self.assertEqual(config.gap_penalty, "linear")
+        self.assertFalse(config.refinement_enabled)
+        self.assertEqual(config.window_before_frames, 0)
+        self.assertEqual(config.max_answers, 75)
+        self.assertEqual(config.ranking_cutoffs, (1, 10, 100))
+
+    def test_trake_config_rejects_public_answer_and_cutoff_bounds(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_answers"):
+            TrakeConfig(max_answers=101)
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            TrakeConfig(ranking_cutoffs=(1, 20, 5))
+        with self.assertRaisesRegex(ValueError, "event_top_k"):
+            TrakeConfig(event_top_k=10_001)
+
+        self.assert_invalid_config(
+            "trake:\n  score_normalization: raw",
+            line_number=2,
+            message="trake.score_normalization",
+        )
+        self.assert_invalid_config(
+            "trake:\n  max_answers: 101",
+            line_number=2,
+            message="trake.max_answers",
+        )
 
 
 if __name__ == "__main__":

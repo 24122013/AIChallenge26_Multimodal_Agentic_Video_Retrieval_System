@@ -9,6 +9,7 @@ from backend.app.services.retrieval.retrieval_manager import (
     search_visual,
 )
 from backend.app.services.retrieval.qa_pipeline import RequiredQaPipelineError
+from backend.app.services.trake import RequiredTrakePipelineError
 from backend.app.services.submission.csv_export import (
     SubmissionExportError,
     export_query_csv,
@@ -64,6 +65,15 @@ if APIRouter is not None:
                     "message": str(exc),
                 },
             )
+        except RequiredTrakePipelineError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "data": exc.response,
+                    "message": str(exc),
+                },
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
@@ -87,6 +97,8 @@ if APIRouter is not None:
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
         except RequiredQaPipelineError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except RequiredTrakePipelineError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except SubmissionExportError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -153,6 +165,8 @@ def _dispatch_search(
         )
     if normalized == "temporal":
         return search_online(query=query, task="temporal", top_k=top_k)
+    if normalized == "trake":
+        return search_online(query=query, task="trake", top_k=min(100, int(top_k)))
 
     # Modality-only modes are retained as diagnostics. User-facing task routes
     # above all pass through the canonical OnlinePipeline.
@@ -165,6 +179,6 @@ def _dispatch_search(
     if normalized in {"object", "objects"}:
         return search_object(query=query, top_k=top_k).to_dict()
     raise ValueError(
-        "Unsupported search mode. Expected online, KIS, AVS, temporal, QA, "
+        "Unsupported search mode. Expected online, KIS, AVS, temporal, TRAKE, QA, "
         "or a modality diagnostic (visual, caption, OCR, object)."
     )

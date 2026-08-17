@@ -6,7 +6,9 @@ temporal QA retrieves every parsed event through this same routing stack.
 """
 from __future__ import annotations
 
+import math
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Protocol, Sequence
@@ -50,34 +52,70 @@ class BgeCandidateReranker:
         *,
         model_name: str = "BAAI/bge-reranker-v2-m3",
         model_revision: str = "main",
+        candidate_limit: int = 100,
         retrieval_alpha: float = 0.5,
         batch_size: int = 16,
         device: str = "auto",
         cache_dir: str | None = None,
         local_files_only: bool = False,
     ) -> None:
-        self.model_name = model_name
-        self.model_revision = model_revision
-        self.retrieval_alpha = float(retrieval_alpha)
-        self.batch_size = int(batch_size)
-        self.device = device
+        if isinstance(candidate_limit, bool) or not isinstance(candidate_limit, int):
+            raise ValueError("BGE reranker candidate_limit must be a positive integer")
+        if candidate_limit <= 0:
+            raise ValueError("BGE reranker candidate_limit must be a positive integer")
+        if not str(model_name).strip() or not str(model_revision).strip():
+            raise ValueError("BGE reranker model name and revision must be non-empty")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("BGE reranker batch_size must be a positive integer")
+        alpha = float(retrieval_alpha)
+        if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+            raise ValueError("BGE reranker retrieval_alpha must be within [0, 1]")
+        if device not in {"auto", "cpu", "cuda"} and not str(device).startswith("cuda:"):
+            raise ValueError("BGE reranker device must be auto, cpu, cuda, or cuda:<index>")
+        self.model_name = str(model_name).strip()
+        self.model_revision = str(model_revision).strip()
+        self.candidate_limit = candidate_limit
+        self.retrieval_alpha = alpha
+        self.batch_size = batch_size
+        self.device = str(device)
         self.cache_dir = cache_dir
         self.local_files_only = bool(local_files_only)
-        self.last_report: dict[str, Any] | None = None
+        self._last_report: dict[str, Any] | None = None
+        self._report_lock = threading.Lock()
+        from backend.app.services.retrieval.bge_reranker import (
+            get_shared_bge_reranker_runner,
+        )
 
-    def rerank(
+        self._runner = get_shared_bge_reranker_runner(
+            model_name=self.model_name,
+            model_revision=self.model_revision,
+            batch_size=self.batch_size,
+            device=self.device,
+            cache_dir=self.cache_dir,
+            local_files_only=self.local_files_only,
+        )
+
+    def rerank_with_report(
         self,
         query: str,
         candidates: Sequence[RetrievalResult],
         top_k: int | None = None,
-    ) -> list[RetrievalResult]:
+    ) -> tuple[list[RetrievalResult], dict[str, Any]]:
+        """Return results and a call-local sanitized report.
+
+        TRAKE uses this method so concurrent requests never race through the
+        compatibility-only ``last_report`` attribute.
+        """
+
         from backend.app.services.retrieval.bge_reranker import rerank_with_bge
 
         results, report = rerank_with_bge(
             candidates,
             query=query,
+            runner=self._runner,
             model_name=self.model_name,
             model_revision=self.model_revision,
+            candidate_limit=self.candidate_limit,
             output_k=20 if top_k is None else int(top_k),
             retrieval_alpha=self.retrieval_alpha,
             batch_size=self.batch_size,
@@ -85,8 +123,57 @@ class BgeCandidateReranker:
             cache_dir=self.cache_dir,
             local_files_only=self.local_files_only,
         )
-        self.last_report = report.to_dict()
+        public_report = _sanitized_bge_report(report)
+        self.last_report = public_report
+        return results, public_report
+
+    def rerank(
+        self,
+        query: str,
+        candidates: Sequence[RetrievalResult],
+        top_k: int | None = None,
+    ) -> list[RetrievalResult]:
+        results, report = self.rerank_with_report(
+            query,
+            candidates,
+            top_k=top_k,
+        )
         return results
+
+    @property
+    def last_report(self) -> dict[str, Any] | None:
+        with self._report_lock:
+            return dict(self._last_report) if self._last_report is not None else None
+
+    @last_report.setter
+    def last_report(self, value: Mapping[str, Any] | None) -> None:
+        with self._report_lock:
+            self._last_report = dict(value) if value is not None else None
+
+
+def _sanitized_bge_report(report: Any) -> dict[str, Any]:
+    raw = report.to_dict() if hasattr(report, "to_dict") else report
+    if not isinstance(raw, Mapping):
+        return {}
+    output: dict[str, Any] = {}
+    for name in ("status", "model_name", "model_revision"):
+        value = raw.get(name)
+        if isinstance(value, str) and value.strip():
+            output[name] = value.strip()
+    for name in ("candidate_count", "scored_count", "output_count"):
+        value = raw.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            output[name] = value
+    alpha = raw.get("retrieval_alpha")
+    if isinstance(alpha, (int, float)) and not isinstance(alpha, bool):
+        output["retrieval_alpha"] = float(alpha)
+    reason = raw.get("fallback_reason")
+    if isinstance(reason, str) and reason:
+        failure_type = reason.partition(":")[0].strip()
+        output["failure_code"] = "reranker_execution_failed"
+        if failure_type and failure_type.replace("_", "").isalnum():
+            output["failure_type"] = failure_type
+    return output
 
 
 QaEvidencePlan = QueryPlan
@@ -764,7 +851,8 @@ class QaEvidenceSearchEngine:
                         "query": query,
                         "modality": "dense_text",
                         "candidate_count": 0,
-                        "error": f"{type(exc).__name__}: {exc}",
+                        "error_code": "dense_text_retrieval_failed",
+                        "failure_type": type(exc).__name__,
                     }
                 )
         return groups
@@ -778,18 +866,26 @@ class QaEvidenceSearchEngine:
         if self.candidate_reranker is None:
             return candidates
         try:
-            output = self.candidate_reranker.rerank(
-                query,
-                candidates,
-                top_k=self.config.rerank_pool_size,
-            )
+            reporting = getattr(self.candidate_reranker, "rerank_with_report", None)
+            if callable(reporting):
+                output, report = reporting(
+                    query,
+                    candidates,
+                    top_k=self.config.rerank_pool_size,
+                )
+            else:
+                output = self.candidate_reranker.rerank(
+                    query,
+                    candidates,
+                    top_k=self.config.rerank_pool_size,
+                )
+                report = getattr(self.candidate_reranker, "last_report", None)
             if hasattr(output, "results"):
                 output = output.results
             if not isinstance(output, Sequence):
                 raise TypeError("reranker output must be a sequence")
-            report = getattr(self.candidate_reranker, "last_report", None)
             trace.reranker = (
-                f"fallback:{report.get('fallback_reason', 'model_error')}"
+                f"fallback:{report.get('failure_code', 'model_error')}"
                 if isinstance(report, Mapping) and report.get("status") == "fallback"
                 else "applied"
             )
@@ -903,7 +999,8 @@ class QaEvidenceSearchEngine:
                 "status": "scorer_error",
                 "weight": self.config.constraint_weight,
                 "min_signal": self.config.constraint_min_signal,
-                "error": f"{type(exc).__name__}: {exc}",
+                "error_code": "constraint_rerank_failed",
+                "failure_type": type(exc).__name__,
             }
             return candidates, base_details
 

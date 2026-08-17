@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+import threading
+import weakref
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -17,6 +19,12 @@ DEFAULT_BGE_RERANKER_REVISION = "main"
 DEFAULT_CANDIDATE_LIMIT = 100
 DEFAULT_OUTPUT_K = 20
 DEFAULT_RETRIEVAL_ALPHA = 0.5
+
+
+_SHARED_RUNNER_LOCK = threading.RLock()
+_SHARED_RUNNERS: weakref.WeakValueDictionary[
+    tuple[object, ...], "LazyBgeReranker"
+] = weakref.WeakValueDictionary()
 
 
 class PairScorer(Protocol):
@@ -62,11 +70,13 @@ def rerank_with_bge(
     cache_dir: str | Path | None = None,
     local_files_only: bool = False,
 ) -> tuple[list[RetrievalResult], BgeRerankReport]:
-    """Rerank at most 100 candidates and return at most 20.
+    """Rerank a caller-bounded candidate pool and return a bounded head.
 
     Candidates without caption/OCR/object text remain in the pool with their
     original retrieval score.  Any model/scoring error falls back to the input
-    Phase-5 order instead of dropping results.
+    Phase-5 order instead of dropping results.  The public defaults remain
+    100 input candidates and 20 outputs; task adapters may choose stricter or
+    wider validated bounds explicitly.
     """
 
     normalized_query = " ".join(str(query).split())
@@ -211,10 +221,18 @@ class LazyBgeReranker:
         self._tokenizer: Any | None = None
         self._torch: Any | None = None
         self._device = "cpu"
+        # A cached runner can serve QA and TRAKE concurrently.  Serialize model
+        # loading and inference on that instance so two requests cannot load a
+        # duplicate checkpoint or race shared tokenizer/model state.
+        self._call_lock = threading.RLock()
 
     def __call__(self, pairs: Sequence[tuple[str, str]]) -> Sequence[float]:
         if not pairs:
             return []
+        with self._call_lock:
+            return self._score_pairs(pairs)
+
+    def _score_pairs(self, pairs: Sequence[tuple[str, str]]) -> Sequence[float]:
         self._load()
         assert self._torch is not None and self._model is not None and self._tokenizer is not None
         output_scores: list[float] = []
@@ -280,6 +298,51 @@ class LazyBgeReranker:
         self._tokenizer = tokenizer
         self._model = model
         self._device = device
+
+
+def get_shared_bge_reranker_runner(
+    *,
+    model_name: str = DEFAULT_BGE_RERANKER_MODEL,
+    model_revision: str = DEFAULT_BGE_RERANKER_REVISION,
+    batch_size: int = 16,
+    max_length: int = 1024,
+    device: str = "auto",
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+) -> LazyBgeReranker:
+    """Return one thread-safe lazy runner for an identical model contract."""
+
+    normalized_cache = str(Path(cache_dir)) if cache_dir else ""
+    key: tuple[object, ...] = (
+        str(model_name),
+        str(model_revision),
+        int(batch_size),
+        int(max_length),
+        str(device),
+        normalized_cache,
+        bool(local_files_only),
+    )
+    with _SHARED_RUNNER_LOCK:
+        runner = _SHARED_RUNNERS.get(key)
+        if runner is None:
+            runner = LazyBgeReranker(
+                model_name=model_name,
+                model_revision=model_revision,
+                batch_size=batch_size,
+                max_length=max_length,
+                device=device,
+                cache_dir=Path(cache_dir) if cache_dir else None,
+                local_files_only=local_files_only,
+            )
+            _SHARED_RUNNERS[key] = runner
+        return runner
+
+
+def clear_shared_bge_reranker_runners() -> None:
+    """Drop cached lazy runners after retrieval runtime caches are cleared."""
+
+    with _SHARED_RUNNER_LOCK:
+        _SHARED_RUNNERS.clear()
 
 
 def _document_has_content(document: str) -> bool:
