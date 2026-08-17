@@ -87,6 +87,7 @@ from backend.app.services.indexing.validate_keyframes import validate_records
 from backend.app.services.ingestion.caption_pipeline import (
     DEFAULT_MODEL_NAME as DEFAULT_CAPTION_MODEL,
     DEFAULT_MODEL_REVISION as DEFAULT_CAPTION_REVISION,
+    DEFAULT_TASK_PROMPT as DEFAULT_CAPTION_TASK_PROMPT,
     run_caption_file,
 )
 from backend.app.services.ingestion.object_pipeline import (
@@ -181,9 +182,10 @@ class OfflinePipelineConfig:
     caption_model_revision: str | None = DEFAULT_CAPTION_REVISION
     caption_model_cache_dir: Path = Path("data/model_cache/caption")
     caption_batch_size: int = 2
-    caption_max_new_tokens: int = 384
+    caption_max_new_tokens: int = 256
     caption_dtype: str = "auto"
     caption_quantization: str = "none"
+    caption_task_prompt: str = DEFAULT_CAPTION_TASK_PROMPT
 
     ocr_detection_model: str = DEFAULT_DETECTION_MODEL
     ocr_recognition_model: str = DEFAULT_RECOGNITION_MODEL
@@ -255,6 +257,7 @@ class OfflinePipelineConfig:
             "siglip_num_workers",
             "siglip_prefetch_factor",
             "caption_batch_size",
+            "caption_max_new_tokens",
             "ocr_batch_size",
             "object_batch_size",
             "bge_batch_size",
@@ -264,6 +267,17 @@ class OfflinePipelineConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or int(value) < (0 if name == "siglip_num_workers" else 1):
                 raise ValueError(f"{name} has an invalid value: {value!r}")
+        if self.caption_dtype not in {"auto", "bfloat16", "float16", "float32"}:
+            raise ValueError(
+                "caption_dtype must be auto, bfloat16, float16, or float32"
+            )
+        if self.caption_quantization != "none":
+            raise ValueError(
+                "Florence-2 caption quantization is not supported or tested; "
+                "caption_quantization must be 'none'"
+            )
+        if not str(self.caption_task_prompt).strip():
+            raise ValueError("caption_task_prompt must not be empty")
         if self.target_keyframes is not None and self.target_density_per_second is not None:
             raise ValueError(
                 "target_keyframes and target_density_per_second are mutually exclusive"
@@ -1909,6 +1923,7 @@ def _load_or_run_caption_features(
         max_new_tokens=config.caption_max_new_tokens,
         dtype=config.caption_dtype,
         quantization=config.caption_quantization,
+        task_prompt=config.caption_task_prompt,
     )
     if config.resume and not config.force:
         try:
@@ -1954,6 +1969,7 @@ def _load_or_run_caption_features(
             max_new_tokens=config.caption_max_new_tokens,
             dtype=config.caption_dtype,
             quantization=config.caption_quantization,
+            task_prompt=config.caption_task_prompt,
             model_cache_dir=config.caption_model_cache_dir,
         )
         records = _read_jsonl(paths.dense_captions)
@@ -4146,7 +4162,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-batch-size", type=int, default=8)
     parser.add_argument("--bge-batch-size", type=int, default=16)
     parser.add_argument("--siglip-model-revision", default=None)
+    parser.add_argument("--caption-model-name", default=DEFAULT_CAPTION_MODEL)
     parser.add_argument("--caption-model-revision", default=DEFAULT_CAPTION_REVISION)
+    parser.add_argument(
+        "--caption-task-prompt",
+        default=DEFAULT_CAPTION_TASK_PROMPT,
+        help="Florence-2 task token used for keyframe captioning.",
+    )
+    parser.add_argument("--caption-max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--caption-dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--caption-quantization",
+        choices=("none", "8bit", "4bit"),
+        default="none",
+        help="Only 'none' is supported for the Florence-2 caption backend.",
+    )
     parser.add_argument("--bge-model-revision", default=DEFAULT_BGE_M3_REVISION)
     parser.add_argument("--no-autocast", action="store_true")
     parser.add_argument("--skip-bge", action="store_true")
@@ -4280,9 +4314,14 @@ def _config_from_args(args: argparse.Namespace) -> OfflinePipelineConfig:
         siglip_batch_size=args.siglip_batch_size,
         siglip_num_workers=args.num_workers,
         siglip_use_autocast=not args.no_autocast,
+        caption_model_name=args.caption_model_name,
         caption_model_revision=args.caption_model_revision,
         caption_model_cache_dir=output_dir / "model_cache" / "caption",
         caption_batch_size=args.caption_batch_size,
+        caption_max_new_tokens=args.caption_max_new_tokens,
+        caption_dtype=args.caption_dtype,
+        caption_quantization=args.caption_quantization,
+        caption_task_prompt=args.caption_task_prompt,
         ocr_model_cache_dir=output_dir / "model_cache" / "ocr",
         ocr_batch_size=args.ocr_batch_size,
         object_model_cache_dir=output_dir / "model_cache" / "objects",

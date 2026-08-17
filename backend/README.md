@@ -5,8 +5,8 @@ temporal evidence, TRAKE và grounded QA.
 
 ## Ingestion
 
-- `run_caption.py`: Qwen3-VL-8B-Instruct image-to-text, JSON retrieval schema, lazy loading,
-  batch, dtype và quantization.
+- `run_caption.py`: Florence-2-base-ft (~0.23B) image-to-text với task token
+  `<MORE_DETAILED_CAPTION>`, stable JSONL retrieval schema, lazy loading, batch và dtype.
 - `run_ocr.py`: PP-OCRv5 detection + Latin recognition cho tiếng Việt/Anh,
   polygon/confidence và Unicode normalization.
 - `run_object_detection.py`: YOLOE open-vocabulary, configurable vocabulary và
@@ -75,10 +75,31 @@ $env:QA_ANSWER_MODE = "off"
 `required` nâng answer/model failure thành lỗi. Thiếu evidence hoặc strict temporal
 chain luôn trả `insufficient_evidence` thay vì dùng kiến thức ngoài video.
 
-Caption mặc định dùng `Qwen/Qwen3-VL-8B-Instruct` tại revision bất biến
-`b5bc35aa2d1dc2db88ca1482375afc801511bffb`, cache dưới
-`data/model_cache/caption`. Hãy profile VRAM trên máy đích theo dtype,
-quantization và batch size; không tái sử dụng ước lượng của model 4B.
+Caption mặc định dùng `florence-community/Florence-2-base-ft` (~0.23B tham số), task token
+`<MORE_DETAILED_CAPTION>` và revision bất biến
+`0b03b6f15a4a211370fb204aee4e7dd48887ea37`, cache dưới
+`data/model_cache/caption`. CPU luôn dùng float32; CUDA hỗ trợ float16, bfloat16
+và auto. Checkpoint này dùng Florence-2 native trong Transformers, không cần
+remote code. Backend chưa kiểm thử quantization 4/8-bit nên từ chối các chế độ này.
+
+```powershell
+# CPU
+.\.venv\Scripts\python.exe backend\app\services\ingestion\run_caption.py `
+  --metadata-path data\metadata\keyframes_video7155.jsonl --device cpu --dtype float32
+
+# CUDA
+.\.venv\Scripts\python.exe backend\app\services\ingestion\run_caption.py `
+  --metadata-path data\metadata\keyframes_video7155.jsonl --device cuda --dtype auto
+
+# Chuẩn bị cache trên máy có mạng; sao chép nguyên cache và đặt HF_HUB_OFFLINE=1 ở máy đích.
+hf download florence-community/Florence-2-base-ft `
+  --revision 0b03b6f15a4a211370fb204aee4e7dd48887ea37 `
+  --cache-dir data/model_cache/caption
+```
+
+Florence-2 không phải chat model và không được ép sinh JSON. Adapter ghi caption
+text vào contract cũ với `structured_caption: null`. Qwen3.5 của grounded QA và
+query expansion không bị thay đổi.
 
 Gọi trực tiếp từ Python:
 
@@ -166,8 +187,8 @@ QA dùng cùng canonical corpus nhưng có feature flags riêng:
 | `QA_ANSWER_MODE` | `off` | `off`, `optional` hoặc `required` |
 | `QA_MODELS_LOCAL_ONLY` | `false` | Chỉ dùng checkpoint đã có trong cache khi bật |
 
-QA BGE flags không bật TRAKE BGE và ngược lại. Repository không tự load `.env`;
-đặt biến trong process manager hoặc đúng shell chạy CLI.
+QA BGE flags không bật TRAKE BGE và ngược lại. Retrieval CLI entrypoint tự load
+`.env`; biến trong process manager hoặc shell chạy CLI có độ ưu tiên cao hơn.
 
 ## TRAKE config và refinement
 

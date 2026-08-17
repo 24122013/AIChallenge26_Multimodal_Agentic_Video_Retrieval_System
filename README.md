@@ -61,7 +61,7 @@ Chi tiết truy vết theo file/function và risk register nằm tại
 |---|---|---|---|---|---|
 | Shot detection | `TransNetV2` | Shot boundaries + dense sampling | `indexing/extract_keyframes.py`, `keyframe_candidates.py` | CPU/CUDA (`auto`) | keyframe JSONL/report |
 | Visual embedding | `google/siglip2-so400m-patch16-384` | normalized embedding, FAISS IP | `build_siglip2_index.py`, `search_visual.py` | CPU/CUDA | `.npy`, FAISS, map/manifest |
-| Caption | `Qwen/Qwen3-VL-8B-Instruct` @ `b5bc35aa2d1dc2db88ca1482375afc801511bffb` | Structured frame caption | `ingestion/caption_pipeline.py` | CPU/CUDA | caption JSONL/report |
+| Caption | `florence-community/Florence-2-base-ft` (~0.23B) @ `0b03b6f15a4a211370fb204aee4e7dd48887ea37` | `<MORE_DETAILED_CAPTION>` frame caption | `ingestion/caption_pipeline.py` | CPU/CUDA | caption JSONL/report |
 | OCR | `PP-OCRv5_server_det` + `latin_PP-OCRv5_mobile_rec` | Vietnamese/English OCR | `ingestion/ocr_pipeline.py` | CPU/CUDA | OCR JSONL/report |
 | Object evidence | `yoloe-26l-seg.pt` | Open-vocabulary soft evidence | `ingestion/object_pipeline.py` | CPU/CUDA | object JSONL/report |
 | Keyframe selection | Không có checkpoint | protected events, gap repair, dedup, MMR | `keyframe_selection.py` | CPU | selected metadata/ledgers |
@@ -136,8 +136,9 @@ python -c "import torch, paddle, transformers, faiss; print({'torch': torch.__ve
 
 [`configs/retrieval.yaml`](configs/retrieval.yaml) giữ hybrid weights, query
 expansion và section `trake`. [`.env.example`](.env.example) liệt kê các biến
-artifact/QA quan trọng.
-Repository **không tự load file `.env`**; đặt biến bằng shell hoặc process manager.
+artifact/QA quan trọng. Sao chép file này thành `.env` để cấu hình local; các
+retrieval CLI entrypoint tự load `.env`. Biến đã đặt bằng shell hoặc process manager
+được ưu tiên hơn giá trị trong file.
 
 | Biến/config | Bắt buộc | Mặc định | Phạm vi | Ý nghĩa |
 |---|---|---|---|---|
@@ -341,11 +342,11 @@ python -m backend.app.pipelines.offline_pipeline `
   --output-dir data `
   --dense-interval 0.5 `
   --device cuda `
-  --resume
+  --resume `
+  --build-corpus
 ```
 
-Quick mode cho một video (mặc định chỉ publish/validate artifact per-video và
-giữ nguyên corpus index hiện có):
+Quick mode cho một video và build corpus retrieval chứa video đó:
 
 ```powershell
 python -m backend.app.pipelines.offline_pipeline `
@@ -353,13 +354,15 @@ python -m backend.app.pipelines.offline_pipeline `
   --video-id L01_V001 `
   --output-dir data `
   --device cuda `
-  --resume
+  --resume `
+  --build-corpus
 ```
 
-Chỉ thêm `--build-corpus` nếu thực sự muốn **thay** global FAISS/BM25/BGE bằng
-corpus chứa đúng tập video đang request. Với quick mode một video, flag này sẽ
-tạo corpus một-video; pipeline không tự quét artifact cũ vì làm vậy có thể kéo
-metadata stale vào index.
+Workflow retrieval phải build global FAISS/BM25/BGE, vì vậy các lệnh canonical
+ở trên luôn ghi rõ `--build-corpus`. Corpus mới chứa đúng tập video đang request;
+với quick mode một video, corpus chỉ chứa video đó. Pipeline không tự quét artifact
+cũ vì làm vậy có thể kéo metadata stale vào index. Chỉ dùng `--skip-corpus` khi
+chủ đích muốn tạo/publish artifact per-video mà chưa dùng chúng cho retrieval.
 
 `--resume` là mặc định và chỉ skip stage khi contract, checksum, identity
 alignment và artifact validator đều pass. `--force` recompute toàn bộ;
@@ -605,8 +608,8 @@ $env:QA_BGE_DEVICE = "cuda"
 
 Không bỏ `--canonical-only` chỉ để smoke qua validation. Nếu build báo metadata
 không phải `selected_keyframe` hoặc canonical segment, hãy tạo lại canonical
-metadata trước. Repository không tự load `.env`; các biến phải tồn tại trong
-đúng terminal đang chạy lệnh.
+metadata trước. Có thể đặt các biến trong `.env` hoặc trong terminal đang chạy
+lệnh; giá trị trong terminal được ưu tiên.
 
 Chạy với query mặc định:
 
@@ -730,11 +733,37 @@ và matched-event ratio. Evaluator từ chối event-count mismatch, interval đ
 âm, frame âm, duplicate whole hypothesis và hơn 100 hypothesis. Xem protocol đầy
 đủ tại [`docs/eval_protocol.md`](docs/eval_protocol.md).
 
-Để chuẩn bị caption offline, tải đúng `Qwen/Qwen3-VL-8B-Instruct` revision
-`b5bc35aa2d1dc2db88ca1482375afc801511bffb` vào
-`data/model_cache/caption` trên máy có mạng, sau đó chuyển nguyên cache sang máy
-chạy. Cần profile VRAM theo dtype, quantization và batch size của model 8B; repo
-không công bố một con số VRAM cố định chưa được đo.
+Caption keyframe mặc định dùng `florence-community/Florence-2-base-ft` (~0.23B tham số),
+task token `<MORE_DETAILED_CAPTION>` và revision bất biến
+`0b03b6f15a4a211370fb204aee4e7dd48887ea37`. Đây là checkpoint đã chuyển đổi
+cho Florence-2 native trong Transformers và không cần thực thi remote code.
+Florence-2 sinh văn bản caption,
+không sinh JSON instruction-following; adapter giữ schema JSONL cũ với
+`structured_caption: null`. Quantization 4/8-bit chưa được kiểm thử cho checkpoint
+này và bị từ chối rõ ràng.
+
+Ví dụ sinh caption trên CPU và CUDA:
+
+```powershell
+.\.venv\Scripts\python.exe backend\app\services\ingestion\run_caption.py `
+  --metadata-path data\metadata\keyframes_video7155.jsonl --device cpu --dtype float32
+
+.\.venv\Scripts\python.exe backend\app\services\ingestion\run_caption.py `
+  --metadata-path data\metadata\keyframes_video7155.jsonl --device cuda `
+  --dtype auto --batch-size 4
+```
+
+Để chuẩn bị máy chạy offline, tải đúng revision vào cache trên máy có mạng:
+
+```powershell
+hf download florence-community/Florence-2-base-ft `
+  --revision 0b03b6f15a4a211370fb204aee4e7dd48887ea37 `
+  --cache-dir data/model_cache/caption
+```
+
+Sau đó chuyển nguyên `data/model_cache/caption` sang máy đích và đặt
+`HF_HUB_OFFLINE=1`. Pipeline caption không thay đổi Qwen3.5 dùng cho grounded QA
+hoặc query expansion.
 
 ## Artifact và lineage
 

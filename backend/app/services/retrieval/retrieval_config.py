@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import load_dotenv
 from yaml.nodes import MappingNode, Node, ScalarNode
 
 from backend.app.services.retrieval.hybrid_search import HybridSearchConfig
@@ -16,6 +17,13 @@ from backend.app.services.agent.query_expansion import QueryExpansionConfig
 
 
 DEFAULT_RETRIEVAL_CONFIG_PATH = Path("configs/retrieval.yaml")
+DEFAULT_ENV_PATH = Path(__file__).resolve().parents[4] / ".env"
+
+
+def load_project_env() -> bool:
+    """Load the repository-local .env without overriding process variables."""
+
+    return load_dotenv(DEFAULT_ENV_PATH, override=False)
 
 _CONFIG_SCHEMA = {
     "hybrid": {

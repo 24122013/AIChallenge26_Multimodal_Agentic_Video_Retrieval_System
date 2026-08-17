@@ -453,6 +453,14 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 )
 
         caption_runner.assert_called_once()
+        self.assertEqual(
+            caption_runner.call_args.kwargs["model_name"],
+            "florence-community/Florence-2-base-ft",
+        )
+        self.assertEqual(
+            caption_runner.call_args.kwargs["task_prompt"],
+            "<MORE_DETAILED_CAPTION>",
+        )
 
     def test_ocr_worker_isolates_paddle_from_parent_torch_runtime(self) -> None:
         metadata_path = self.root / "dense.jsonl"
@@ -647,6 +655,12 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         self.assertFalse(quick.build_corpus)
         self.assertTrue(explicit.build_corpus)
         self.assertTrue(full.build_corpus)
+        self.assertEqual(quick.caption_model_name, "florence-community/Florence-2-base-ft")
+        self.assertEqual(
+            quick.caption_model_revision,
+            "0b03b6f15a4a211370fb204aee4e7dd48887ea37",
+        )
+        self.assertEqual(quick.caption_task_prompt, "<MORE_DETAILED_CAPTION>")
 
         video = self._video("video_A")
         artifact = self._video_artifacts(video)

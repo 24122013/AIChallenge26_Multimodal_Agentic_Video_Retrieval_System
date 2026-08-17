@@ -15,7 +15,10 @@ from backend.app.services.retrieval.planned_hybrid import planned_hybrid_search
 from backend.app.services.retrieval.qa_evidence import QaEvidenceSearchEngine
 from backend.app.services.retrieval.qa_pipeline import QaSearchPipeline
 from backend.app.services.retrieval.query_plan import QueryPlan, build_query_plan
-from backend.app.services.retrieval.retrieval_config import RetrievalRuntimeConfig
+from backend.app.services.retrieval.retrieval_config import (
+    RetrievalRuntimeConfig,
+    load_project_env,
+)
 
 
 ONLINE_SCHEMA_VERSION = "1.0"
@@ -558,6 +561,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    load_project_env()
     # Lazy import avoids a module cycle: retrieval_manager owns the cached
     # production OnlinePipeline instance and imports this class definition.
     from backend.app.services.retrieval.retrieval_manager import search_online

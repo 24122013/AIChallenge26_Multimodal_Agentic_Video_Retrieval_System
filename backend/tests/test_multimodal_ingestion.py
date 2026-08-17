@@ -17,7 +17,9 @@ from PIL import Image
 from backend.app.services.ingestion.caption_pipeline import (
     DEFAULT_MODEL_NAME,
     DEFAULT_MODEL_REVISION,
-    QwenCaptionBackend,
+    DEFAULT_TASK_PROMPT,
+    FlorenceCaptionBackend,
+    FlorenceCaptionOutput,
     parse_caption_output,
     run_caption_file,
 )
@@ -38,18 +40,10 @@ from backend.app.services.ingestion.ocr_pipeline import (
 )
 
 
-def structured_caption(name: str) -> str:
-    return json.dumps(
-        {
-            "scene": "studio",
-            "people": [{"type": "person", "attributes": ["red shirt"]}],
-            "objects": ["table"],
-            "actions": ["standing"],
-            "relationships": ["person beside table"],
-            "colors": ["red"],
-            "visible_text": [],
-            "caption": f"a visible frame named {name}",
-        }
+def florence_caption(name: str) -> FlorenceCaptionOutput:
+    return FlorenceCaptionOutput(
+        caption=f"a visible frame named {name}",
+        raw_output=f"<s>a visible frame named {name}</s>",
     )
 
 
@@ -58,8 +52,8 @@ class FakeCaptionBackend:
     model_version = "1"
     model_revision = "test-revision"
 
-    def infer(self, paths: Sequence[Path]) -> Sequence[str]:
-        return [structured_caption(path.stem) for path in paths]
+    def infer(self, paths: Sequence[Path]) -> Sequence[FlorenceCaptionOutput]:
+        return [florence_caption(path.stem) for path in paths]
 
 
 class FailingCaptionBackend(FakeCaptionBackend):
@@ -73,6 +67,15 @@ class RevisedCaptionBackend(FakeCaptionBackend):
 
 class AlternateCaptionModelBackend(FakeCaptionBackend):
     model_name = "alternate-caption"
+
+
+class CountingCaptionBackend(FakeCaptionBackend):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def infer(self, paths: Sequence[Path]) -> Sequence[FlorenceCaptionOutput]:
+        self.calls += 1
+        return super().infer(paths)
 
 
 class FakeOcrBackend:
@@ -143,7 +146,7 @@ class MultimodalIngestionTest(unittest.TestCase):
         self.two = self.root / "two.png"
         self.broken = self.root / "broken.png"
         Image.new("RGB", (64, 32), color="red").save(self.one)
-        Image.new("RGB", (64, 32), color="blue").save(self.two)
+        Image.new("RGB", (80, 48), color="blue").save(self.two)
         self.broken.write_bytes(b"not an image")
         self.metadata = self.root / "keyframes_TEST.jsonl"
         self.records = [
@@ -174,40 +177,43 @@ class MultimodalIngestionTest(unittest.TestCase):
             "source_video_path": "source.mp4",
         }
 
-    def test_caption_parser_valid_fenced_and_malformed(self) -> None:
-        valid = parse_caption_output(structured_caption("valid"))
+    def test_florence_caption_adapter_is_nonempty_and_schema_compatible(self) -> None:
+        valid = parse_caption_output(florence_caption("valid"))
         self.assertEqual(valid["caption_parse_status"], "success")
-        self.assertEqual(valid["structured_caption"]["colors"], ["red"])
-
-        fenced = parse_caption_output(f"```json\n{structured_caption('fenced')}\n```")
-        self.assertEqual(fenced["caption"], "a visible frame named fenced")
-        self.assertEqual(fenced["caption_parse_status"], "success")
-
-        malformed = parse_caption_output('{"caption": "useful fallback", broken}')
-        self.assertEqual(malformed["caption"], "useful fallback")
-        self.assertEqual(malformed["caption_parse_status"], "fallback")
-        self.assertTrue(malformed["caption_parse_error"])
+        self.assertEqual(valid["structured_caption"], None)
+        self.assertEqual(valid["raw_caption_output"], "<s>a visible frame named valid</s>")
 
         plain = parse_caption_output("person standing beside a red car")
         self.assertEqual(plain["caption"], "person standing beside a red car")
         self.assertEqual(plain["structured_caption"], None)
+        self.assertRaises(ValueError, parse_caption_output, "   ")
 
-    def test_caption_cli_uses_pinned_qwen3_vl_8b_defaults(self) -> None:
+    def test_caption_cli_uses_pinned_florence_2_defaults(self) -> None:
         args = build_caption_parser().parse_args(
             ["--metadata-path", str(self.metadata)]
         )
-        self.assertEqual(DEFAULT_MODEL_NAME, "Qwen/Qwen3-VL-8B-Instruct")
+        self.assertEqual(DEFAULT_MODEL_NAME, "florence-community/Florence-2-base-ft")
         self.assertEqual(
             DEFAULT_MODEL_REVISION,
-            "b5bc35aa2d1dc2db88ca1482375afc801511bffb",
+            "0b03b6f15a4a211370fb204aee4e7dd48887ea37",
         )
         self.assertEqual(args.model_name, DEFAULT_MODEL_NAME)
         self.assertEqual(args.model_revision, DEFAULT_MODEL_REVISION)
+        self.assertEqual(args.task_prompt, "<MORE_DETAILED_CAPTION>")
+        legacy = build_caption_parser().parse_args(
+            ["--metadata-path", str(self.metadata), "--prompt", "<CAPTION>"]
+        )
+        self.assertEqual(legacy.task_prompt, "<CAPTION>")
 
-    def test_caption_loader_uses_image_text_to_text_factory_without_download(self) -> None:
+    def test_florence_loader_and_batch_postprocessing_without_download(self) -> None:
+        import torch
+
         transformers = ModuleType("transformers")
         model_calls: list[tuple[str, dict[str, Any]]] = []
         processor_calls: list[tuple[str, dict[str, Any]]] = []
+        processor_inputs: list[dict[str, Any]] = []
+        post_process_calls: list[tuple[str, str, tuple[int, int]]] = []
+        generate_calls: list[dict[str, Any]] = []
 
         class FakeConfig:
             _commit_hash = DEFAULT_MODEL_REVISION
@@ -222,6 +228,10 @@ class MultimodalIngestionTest(unittest.TestCase):
             def eval(self) -> None:
                 return None
 
+            def generate(self, **kwargs: Any) -> Any:
+                generate_calls.append(kwargs)
+                return torch.tensor([[1, 2], [3, 4]])
+
         class FakeModelFactory:
             @classmethod
             def from_pretrained(cls, name: str, **kwargs: Any) -> FakeModel:
@@ -230,19 +240,64 @@ class MultimodalIngestionTest(unittest.TestCase):
 
         class FakeProcessorFactory:
             @classmethod
-            def from_pretrained(cls, name: str, **kwargs: Any) -> object:
+            def from_pretrained(cls, name: str, **kwargs: Any) -> "FakeProcessorFactory":
                 processor_calls.append((name, kwargs))
-                return object()
+                return cls()
+
+            def __call__(self, **kwargs: Any) -> dict[str, Any]:
+                processor_inputs.append(kwargs)
+                return {
+                    "input_ids": torch.tensor([[1], [1]]),
+                    "pixel_values": torch.zeros((2, 3, 2, 2)),
+                }
+
+            def batch_decode(self, tokens: Any, **kwargs: Any) -> list[str]:
+                self.decode_kwargs = kwargs
+                return ["decoded first", "decoded second"]
+
+            def post_process_generation(
+                self,
+                text: str,
+                *,
+                task: str,
+                image_size: tuple[int, int],
+            ) -> dict[str, str]:
+                post_process_calls.append((text, task, image_size))
+                return {task: f"caption for {image_size[0]}x{image_size[1]}"}
 
         transformers.AutoModelForImageTextToText = FakeModelFactory  # type: ignore[attr-defined]
         transformers.AutoProcessor = FakeProcessorFactory  # type: ignore[attr-defined]
-        backend = QwenCaptionBackend(device="cpu", cache_dir=self.root / "caption-cache")
+        backend = FlorenceCaptionBackend(device="cpu", cache_dir=self.root / "caption-cache")
         with mock.patch.dict(sys.modules, {"transformers": transformers}):
-            backend._load()
+            outputs = backend.infer([self.one, self.two])
 
         self.assertEqual(model_calls[0][0], DEFAULT_MODEL_NAME)
         self.assertEqual(processor_calls[0][0], DEFAULT_MODEL_NAME)
         self.assertEqual(model_calls[0][1]["revision"], DEFAULT_MODEL_REVISION)
+        self.assertIs(model_calls[0][1]["trust_remote_code"], False)
+        self.assertIs(processor_calls[0][1]["trust_remote_code"], False)
+        self.assertEqual(processor_inputs[0]["text"], [DEFAULT_TASK_PROMPT] * 2)
+        self.assertEqual(processor_inputs[0]["images"][0].size, (64, 32))
+        self.assertIs(processor_inputs[0]["padding"], True)
+        self.assertEqual(
+            post_process_calls,
+            [
+                ("decoded first", DEFAULT_TASK_PROMPT, (64, 32)),
+                ("decoded second", DEFAULT_TASK_PROMPT, (80, 48)),
+            ],
+        )
+        self.assertEqual(
+            [item.caption for item in outputs],
+            ["caption for 64x32", "caption for 80x48"],
+        )
+        self.assertIs(generate_calls[0]["do_sample"], False)
+        self.assertEqual(generate_calls[0]["num_beams"], 3)
+        with self.assertRaises(ValueError):
+            processor_inputs[0]["images"][0].getpixel((0, 0))
+
+    def test_florence_rejects_untested_quantization(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not supported or tested"):
+            FlorenceCaptionBackend(device="cuda", quantization="4bit")
 
     def test_caption_batch_order_model_error_and_segment_determinism(self) -> None:
         output = self.root / "captions.jsonl"
@@ -297,6 +352,33 @@ class MultimodalIngestionTest(unittest.TestCase):
         values = read_jsonl(output)
         self.assertEqual(len(values), 3)
         self.assertEqual({item["model_revision"] for item in values}, {"new-revision"})
+
+    def test_caption_resume_skips_compatible_success_records(self) -> None:
+        metadata = self.root / "keyframes_SUCCESS.jsonl"
+        write_jsonl(metadata, self.records[:2])
+        output = self.root / "captions_success.jsonl"
+        report_path = self.root / "caption_success_report.json"
+        backend = CountingCaptionBackend()
+        first = run_caption_file(
+            metadata,
+            output_path=output,
+            report_path=report_path,
+            device="cpu",
+            backend=backend,
+        )
+        calls = backend.calls
+        resumed = run_caption_file(
+            metadata,
+            output_path=output,
+            report_path=report_path,
+            device="cpu",
+            backend=backend,
+        )
+
+        self.assertEqual(first["success_count"], 2)
+        self.assertEqual(resumed["skipped_count"], 2)
+        self.assertEqual(backend.calls, calls)
+        self.assertEqual(len(read_jsonl(output)), 2)
 
     def test_caption_model_change_replaces_only_its_artifact(self) -> None:
         output = self.root / "captions.jsonl"

@@ -10,6 +10,7 @@ if __package__ in {None, ""}:
 from backend.app.services.ingestion.caption_pipeline import (
     DEFAULT_MODEL_NAME,
     DEFAULT_MODEL_REVISION,
+    DEFAULT_TASK_PROMPT,
     run_caption_file,
 )
 from backend.app.services.ingestion.common import configure_logging, discover_files
@@ -21,18 +22,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=Path("data/metadata"))
     parser.add_argument("--output-path", type=Path, help="Only valid for one input file.")
     parser.add_argument("--report-path", type=Path, help="Only valid for one input file.")
-    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
-    parser.add_argument("--model-revision", default=DEFAULT_MODEL_REVISION)
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME, help="Florence-2 checkpoint name.")
+    parser.add_argument("--model-revision", default=DEFAULT_MODEL_REVISION, help="Pinned Hugging Face commit revision.")
     parser.add_argument("--model-cache-dir", type=Path, default=Path("data/model_cache/caption"))
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--max-new-tokens", type=int, default=384)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument(
         "--dtype",
         choices=("auto", "bfloat16", "float16", "float32"),
         default="auto",
     )
-    parser.add_argument("--quantization", choices=("none", "8bit", "4bit"), default="none")
+    parser.add_argument(
+        "--quantization",
+        choices=("none", "8bit", "4bit"),
+        default="none",
+        help="Florence-2 currently supports only 'none'; 4/8-bit fail explicitly.",
+    )
+    parser.add_argument(
+        "--task-prompt",
+        "--prompt",
+        dest="task_prompt",
+        default=DEFAULT_TASK_PROMPT,
+        help="Florence-2 task token (legacy alias: --prompt).",
+    )
     parser.add_argument("--segment-caption", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -61,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
             max_new_tokens=args.max_new_tokens,
             dtype=args.dtype,
             quantization=args.quantization,
+            task_prompt=args.task_prompt,
         )
     return 0
 

@@ -19,6 +19,7 @@ from typing import Any, Mapping
 
 from backend.app.services.retrieval.bge_dense import BGE_M3_SCHEMA_VERSION
 from backend.app.services.retrieval.qa_pipeline import RequiredQaPipelineError
+from backend.app.services.retrieval.retrieval_config import load_project_env
 from backend.app.services.retrieval.retrieval_manager import (
     clear_retrieval_caches,
     get_qa_runtime_lineage,
@@ -648,6 +649,7 @@ def _run_tasks(
 
 
 def main() -> int:
+    load_project_env()
     args = build_parser().parse_args()
     payload = run(args)
     print(json.dumps(payload, ensure_ascii=False, indent=2))

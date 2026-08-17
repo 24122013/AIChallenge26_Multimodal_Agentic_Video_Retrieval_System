@@ -12,7 +12,7 @@ indexing helpers under `src/`.
 1. Read original videos from `data/raw/video/`.
 2. Extract keyframes and preserve each original zero-based `frame_index` in
    canonical metadata.
-3. Generate Qwen3-VL captions, OCR and object evidence.
+3. Generate Florence-2 keyframe captions, OCR and object evidence.
 4. Build visual/text embeddings and indexes under `data/embeddings/` and
    `data/indexes/`.
 5. Keep model/cache/report artifacts under their respective `data/` directories.
