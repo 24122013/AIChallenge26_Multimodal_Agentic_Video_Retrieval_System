@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
+import numpy as np
+
 from backend.app.services.retrieval.retrieval_config import TrakeConfig
 from backend.app.services.trake.models import BoundaryType, TemporalEvent, TemporalEventPlan, TemporalPath
 
@@ -42,6 +44,105 @@ class LocalFrameScorer(Protocol):
         frames: Sequence[DecodedFrame],
     ) -> Sequence[float]:
         ...
+
+
+class Siglip2EmbeddingEncoder(Protocol):
+    """Shared text/image surface exposed by the canonical SigLIP2 encoder."""
+
+    def encode(self, query: str) -> np.ndarray: ...
+
+    def encode_images(
+        self,
+        images: Sequence[Any],
+        *,
+        batch_size: int = 16,
+    ) -> np.ndarray: ...
+
+
+class Siglip2LocalFrameScorer:
+    """Cheap semantic scorer over bounded, decoded TRAKE frame windows.
+
+    The scorer owns no model.  Production injects the encoder already held by
+    the canonical visual search engine, so both text and local image features
+    use one lazy SigLIP2 checkpoint and one manifest-compatible vector space.
+    """
+
+    def __init__(
+        self,
+        encoder: Siglip2EmbeddingEncoder,
+        *,
+        batch_size: int = 16,
+    ) -> None:
+        if not callable(getattr(encoder, "encode", None)):
+            raise TypeError("TRAKE local scorer requires SigLIP2 text encoding")
+        if not callable(getattr(encoder, "encode_images", None)):
+            raise TypeError("TRAKE local scorer requires SigLIP2 image encoding")
+        if isinstance(batch_size, bool) or int(batch_size) <= 0:
+            raise ValueError("TRAKE local scorer batch_size must be positive")
+        self.encoder = encoder
+        self.batch_size = int(batch_size)
+
+    def score(
+        self,
+        event: TemporalEvent,
+        frames: Sequence[DecodedFrame],
+    ) -> Sequence[float]:
+        if not frames:
+            return []
+        query = " ".join(str(event.retrieval_query).split())
+        if not query:
+            raise ValueError("TRAKE local refinement query must not be empty")
+
+        query_vector = np.asarray(self.encoder.encode(query), dtype=np.float32)
+        if query_vector.ndim == 2 and query_vector.shape[0] == 1:
+            query_vector = query_vector[0]
+        if query_vector.ndim != 1 or not np.isfinite(query_vector).all():
+            raise ValueError("TRAKE local query embedding must be one finite vector")
+        query_norm = float(np.linalg.norm(query_vector))
+        if not math.isfinite(query_norm) or query_norm <= 0:
+            raise ValueError("TRAKE local query embedding must not be zero")
+        query_vector = query_vector / query_norm
+
+        rgb_images = [_to_rgb_image(frame.image) for frame in frames]
+        image_vectors = np.asarray(
+            self.encoder.encode_images(
+                rgb_images,
+                batch_size=self.batch_size,
+            ),
+            dtype=np.float32,
+        )
+        if image_vectors.ndim != 2 or image_vectors.shape[0] != len(frames):
+            raise ValueError("TRAKE local image embeddings must align with frames")
+        if image_vectors.shape[1] != query_vector.shape[0]:
+            raise ValueError("TRAKE local text/image embedding dimensions differ")
+        if not np.isfinite(image_vectors).all():
+            raise ValueError("TRAKE local image embeddings must be finite")
+        image_norms = np.linalg.norm(image_vectors, axis=1, keepdims=True)
+        if not np.isfinite(image_norms).all() or np.any(image_norms <= 0):
+            raise ValueError("TRAKE local image embeddings must not be zero")
+        image_vectors = image_vectors / image_norms
+
+        # Expose bounded [0, 1] semantic similarities while preserving cosine
+        # ordering for the boundary-aware selector.
+        scores = np.clip((image_vectors @ query_vector + 1.0) / 2.0, 0.0, 1.0)
+        if scores.shape != (len(frames),) or not np.isfinite(scores).all():
+            raise ValueError("TRAKE local scorer produced invalid scores")
+        return [float(value) for value in scores]
+
+
+def _to_rgb_image(image: Any) -> Any:
+    """Convert default OpenCV BGR/BGRA frames to processor-ready RGB."""
+
+    if isinstance(image, np.ndarray):
+        if image.ndim == 2:
+            return np.ascontiguousarray(np.repeat(image[..., None], 3, axis=2))
+        if image.ndim != 3 or image.shape[2] not in {3, 4}:
+            raise ValueError("TRAKE decoded frame must have 1, 3, or 4 channels")
+        return np.ascontiguousarray(image[..., [2, 1, 0]])
+    converter = getattr(image, "convert", None)
+    if callable(converter):
+        return converter("RGB")
+    raise TypeError("TRAKE decoded frame must be an OpenCV array or PIL image")
 
 
 @dataclass(frozen=True)
@@ -462,6 +563,8 @@ __all__ = [
     "LocalFrameScorer",
     "OpenCVLocalFrameDecoder",
     "RefinementVariant",
+    "Siglip2EmbeddingEncoder",
+    "Siglip2LocalFrameScorer",
     "TemporalRefiner",
     "refine_temporal_path",
     "resolve_video_path",

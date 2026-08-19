@@ -6,10 +6,16 @@ from dataclasses import replace
 from typing import Any
 
 from backend.app.models.retrieval import RetrievalResult, VisualSearchResponse
-from backend.app.services.retrieval.candidate_merger import merge_candidates
+from backend.app.services.retrieval.candidate_merger import (
+    candidate_identity,
+    merge_candidates,
+)
 from backend.app.services.retrieval.hybrid_search import HybridSearchEngine
 from backend.app.services.retrieval.query_plan import QueryPlan
-from backend.app.services.retrieval.rank_fusion import fuse_query_variants
+from backend.app.services.retrieval.rank_fusion import (
+    fuse_query_variants,
+    weighted_rrf,
+)
 
 
 _TEXT_MODALITIES = ("caption", "ocr", "objects")
@@ -36,7 +42,7 @@ def planned_hybrid_search(
     }
     retrieval_calls: list[dict[str, Any]] = []
     searched_modalities: list[str] = []
-    modality_groups: list[list[RetrievalResult]] = []
+    modality_groups: dict[str, list[RetrievalResult]] = {}
     intra_modality_trace: dict[str, list[dict[str, object]]] = {}
     skipped_modalities: dict[str, str] = {}
 
@@ -55,7 +61,9 @@ def planned_hybrid_search(
         weights=variant_weights,
         max_expansion_contribution=max_expansion_contribution,
     )
-    modality_groups.append([item.as_retrieval_result() for item in visual_fused])
+    modality_groups["visual"] = [
+        item.as_retrieval_result() for item in visual_fused
+    ]
     intra_modality_trace["visual"] = [item.to_dict() for item in visual_fused]
     searched_modalities.append("visual")
 
@@ -79,9 +87,9 @@ def planned_hybrid_search(
                 weights=variant_weights,
                 max_expansion_contribution=max_expansion_contribution,
             )
-            modality_groups.append(
-                [item.as_retrieval_result() for item in caption_fused]
-            )
+            modality_groups[modality] = [
+                item.as_retrieval_result() for item in caption_fused
+            ]
             intra_modality_trace[modality] = [
                 item.to_dict() for item in caption_fused
             ]
@@ -92,35 +100,44 @@ def planned_hybrid_search(
         if not modality_query:
             skipped_modalities[modality] = "no_reliable_modality_terms"
             continue
-        modality_groups.append(
-            text_engine.search_results(
-                modality_query,
-                top_k=engine.config.text_stage1_top_k,
-            )
+        modality_groups[modality] = text_engine.search_results(
+            modality_query,
+            top_k=engine.config.text_stage1_top_k,
         )
         retrieval_calls.append(
             _call_trace(modality, modality_query, "decomposition", 1.0)
         )
         searched_modalities.append(modality)
 
-    merged_pool = merge_candidates(
-        modality_groups,
-        top_k=engine.config.rerank_pool_size,
+    # Merge metadata/scores by stable frame identity, but rank the coarse pool
+    # with proper cross-modality weighted RRF.  The final HybridReranker does
+    # not consume the RRF value, avoiding a double-counted signal.
+    merged_metadata = merge_candidates(
+        modality_groups.values(),
+        top_k=None,
         dedupe_same_shot=False,
     )
-    # Preserve the pre-rerank fusion value before ``HybridReranker`` replaces
-    # ``score`` with the final score.  The canonical online Candidate schema can
-    # then report both stages without changing any retriever contract.
-    merged_pool = [
-        replace(
-            candidate,
-            modality_scores={
-                **candidate.modality_scores,
-                "fusion": float(candidate.score),
-            },
+    metadata_by_identity = {
+        candidate_identity(candidate): candidate for candidate in merged_metadata
+    }
+    inter_fused = weighted_rrf(modality_groups, plan=plan)
+    merged_pool = []
+    for fused in inter_fused[: engine.config.rerank_pool_size]:
+        candidate = metadata_by_identity.get(
+            candidate_identity(fused.result),
+            fused.result,
         )
-        for candidate in merged_pool
-    ]
+        merged_pool.append(
+            replace(
+                candidate,
+                score=float(fused.rrf_score),
+                modality_scores={
+                    **candidate.modality_scores,
+                    "rrf": float(fused.rrf_score),
+                    "fusion": float(fused.rrf_score),
+                },
+            )
+        )
     results = engine.reranker.rerank(
         query=plan.original_query,
         candidates=merged_pool,
@@ -133,6 +150,7 @@ def planned_hybrid_search(
         "searched_modalities": searched_modalities,
         "skipped_modalities": skipped_modalities,
         "intra_modality_fusion": intra_modality_trace,
+        "inter_modality_fusion": [item.to_dict() for item in inter_fused],
         "rerank_canonical_query": plan.original_query,
     }
     return VisualSearchResponse(

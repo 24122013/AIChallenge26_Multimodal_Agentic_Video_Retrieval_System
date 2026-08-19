@@ -50,7 +50,9 @@ Retrieval Layer
     ▼
 Index Layer
     │
-    ├── Vector Database
+    ├── Selected-keyframe visual FAISS (coarse)
+    ├── Full dense-candidate visual FAISS (global rescue + CSES)
+    ├── Sparse/optional dense text indexes
     ├── Metadata Store
     └── Neighbor Index
     │
@@ -68,38 +70,37 @@ Offline Pipeline chịu trách nhiệm chuẩn bị dữ liệu.
 Raw Videos
     │
     ▼
-Keyframe Extraction
+Shot detection + dense-candidate materialization
     │
     ▼
-Segment Extraction
+Multimodal extraction (SigLIP2/caption/OCR/objects)
     │
-    ▼
-Metadata Extraction
+    ├── Full dense-candidate pool
+    │     └── FAISS + metadata + frame map + manifest + report
     │
-    ├── Caption
-    ├── OCR
-    └── Objects
-    │
-    ▼
-Embedding Generation
-    │
-    ▼
-Index Building
+    └── Multimodal selection
+          └── Canonical selected keyframes
+                ├── Selected-keyframe visual FAISS
+                ├── BM25/optional BGE text index
+                └── Neighbor/segment metadata
 ```
 
 Output:
 
-* Keyframes
+* Full dense-candidate bundle
+* Canonical selected keyframes
 * Segments
 * Metadata
 * Embeddings
 * Search Index
 
-Offline keyframes là **technical keyframes**: sparse frames được chọn để lập chỉ
-mục và luôn giữ original zero-based `frame_index`. TRAKE tìm **semantic
-keyframes** thỏa criterion của từng event. Semantic frame có thể được refinement
-trong một local window quanh technical keyframe; kiến trúc không xây dense-frame
-index cho toàn corpus.
+Offline selected keyframes là **technical keyframes**: sparse frames được chọn
+để lập coarse index và luôn giữ original zero-based `frame_index`. Offline cũng
+publish một **full dense-candidate index** từ toàn bộ materialized candidates
+trước selection; bundle này rộng hơn selected index nhưng vẫn không chứa mọi raw
+video frame. TRAKE tìm **semantic keyframes** thỏa criterion của từng event bằng
+cách decode local windows quanh technical frame và không phụ thuộc vào dense
+candidate FAISS.
 
 ---
 
@@ -111,12 +112,18 @@ Online Pipeline chạy khi người dùng gửi truy vấn.
 User Query + explicit task
     │
     ▼
-OnlinePipeline
-    ├── KIS / AVS / temporal / QA
-    │     └── shared planning, retrieval, evidence and reranking
+search_online -> get_online_pipeline -> OnlinePipeline.run
+    ├── KIS / AVS
+    │     └── query plan + optional expansion
+    │         -> selected visual/caption/OCR/object retrieval
+    │         -> weighted RRF -> coarse clips
+    │         -> full dense FAISS global rescue -> per-clip CSES
+    │         -> deterministic evidence rerank -> exact dedup
+    ├── temporal / QA
+    │     └── existing evidence-oriented routes
     └── TRAKE
           └── event parser -> per-event retrieval -> video gating
-              -> K-best frame alignment -> optional local refinement
+              -> K-best frame alignment -> bounded shared-SigLIP2 refinement
               -> diverse ranked sequence hypotheses
     │
     ▼
@@ -127,6 +134,14 @@ Task-specific response
 sequence-first task; it is selected explicitly and is not inferred by `auto`.
 Both reuse canonical retrieval artifacts, but they keep different response
 semantics.
+
+The full dense-candidate loader is lazy and cached by committed corpus
+generation, so QA and TRAKE are not blocked merely because the dense KIS/AVS
+bundle is absent. KIS/AVS use `online.dense_missing_behavior` to choose explicit
+`selected_only_fallback` or an error on missing files. Integrity/lineage/encoder
+contract failures always fail closed. Learned and VLM retrieval rerankers are
+disabled by default; the canonical final rerank is deterministic and exposes a
+score breakdown plus per-stage latency trace.
 
 ---
 
@@ -249,15 +264,16 @@ Retrieval Layer gồm nhiều search engine độc lập.
 ```text
 Query
  │
- ├── Visual Search
+ ├── KIS / AVS
+ │     ├── Selected-keyframe visual search
+ │     ├── Caption / OCR / object search
+ │     ├── Query-variant + weighted reciprocal-rank fusion
+ │     ├── Coarse clip aggregation
+ │     ├── Full dense-candidate global FAISS rescue
+ │     ├── Per-clip CSES visual/temporal coverage selection
+ │     └── Deterministic evidence rerank + exact dedup
  │
- ├── Caption Search
- │
- ├── OCR Search
- │
- ├── Object Search
- │
- ├── Temporal Evidence Search
+ ├── Temporal Evidence / QA
  │
  └── TRAKE (explicit task)
           │
@@ -279,7 +295,11 @@ Query
      Final Results
 ```
 
-Mỗi search engine có thể phát triển độc lập.
+Mỗi search engine có thể phát triển độc lập, nhưng KIS/AVS production không gọi
+`advanced_search` như một orphan utility: nó được route trực tiếp từ
+`OnlinePipeline.run` qua canonical public manager entrypoint. Coarse RRF chỉ chọn
+clip pool; dense similarity và evidence features được tính riêng ở deterministic
+rerank, tránh cộng một raw score hai lần như thể chúng cùng thang đo.
 
 TRAKE is orchestrated by `backend/app/services/trake/pipeline.py` and is cached
 with the same corpus generation as the hybrid engine. Every complete hypothesis
@@ -292,11 +312,14 @@ penalty is soft; duplicate locations receive an additional soft penalty. Global
 ranking preserves the best raw hypothesis, exact-deduplicates the whole sequence,
 applies near-sequence NMS and distributes a first pass across videos/coarse paths.
 
-Local refinement is an injectable interface over canonical video files. The
-default cached runtime has no semantic `LocalFrameScorer`, so it returns coarse
-canonical frames with a warning. Boundary-aware first-transition/first-leave/
-peak selection is exercised only when a scorer is injected. There is no active
-pose/contact model or VLM verification branch.
+Local refinement remains an injectable interface over canonical video files.
+The production cached runtime now injects `Siglip2LocalFrameScorer`, reusing the
+canonical visual engine's lazy encoder for both event text and decoded RGB frame
+embeddings. It scores only bounded windows and owns no second model/index. Missing
+video, decode failure or invalid scoring falls back to the coarse canonical frame
+with warnings. Boundary-aware first-transition/first-leave/peak selection uses
+the resulting cosine-similarity sequence; there is still no pose/contact model or
+VLM verification branch, and no full-corpus semantic-boundary quality claim.
 
 ---
 

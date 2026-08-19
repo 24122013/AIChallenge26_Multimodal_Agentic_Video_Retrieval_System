@@ -1000,6 +1000,14 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             pipeline._stage_contract("test_selection", fixture=True),
             paths,
         )
+        pipeline._atomic_save_npy(paths.dense_embeddings, result.final_embeddings)
+        pipeline._atomic_write_jsonl(
+            paths.dense_embedding_metadata,
+            result.final_embedding_records,
+        )
+        pipeline._atomic_write_jsonl(paths.dense_captions, result.final_caption_records)
+        pipeline._atomic_write_jsonl(paths.dense_ocr, result.final_ocr_records)
+        pipeline._atomic_write_jsonl(paths.dense_objects, result.final_object_records)
         shot_contract = pipeline._shot_contract(video, self.config)
         pipeline._atomic_write_json(
             paths.shot_report,
@@ -1235,6 +1243,7 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
     def _write_canonical_family(self, video_id: str, caption: str) -> dict:
         metadata = self.config.output_dir / "metadata"
         metadata.mkdir(parents=True, exist_ok=True)
+        paths = pipeline.PerVideoPaths.from_config(video_id, self.config)
         frame_id = f"{video_id}:F0000"
         selected = {
             "candidate_id": f"{video_id}:C0000",
@@ -1282,6 +1291,89 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         for name, record in families.items():
             (metadata / name).write_text(
                 json.dumps(record, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        dense_vectors = np.asarray(
+            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]],
+            dtype=np.float32,
+        )
+        paths.dense_embeddings.parent.mkdir(parents=True, exist_ok=True)
+        np.save(paths.dense_embeddings, dense_vectors)
+        dense_records = []
+        dense_captions = []
+        dense_ocr = []
+        dense_objects = []
+        dense_ledger = []
+        for index in range(3):
+            candidate_id = f"{video_id}:C{index:04d}"
+            dense_frame_id = f"{video_id}:F{index:04d}"
+            common = {
+                "candidate_id": candidate_id,
+                "frame_id": dense_frame_id,
+                "video_id": video_id,
+                "shot_id": f"SHOT_{video_id}_000000",
+                "segment_id": f"SHOT_{video_id}_000000",
+                "timestamp": float(index + 1),
+                "frame_index": (index + 1) * 25,
+                "keyframe_path": f"dense_keyframes/{video_id}/{dense_frame_id}.jpg",
+            }
+            dense_records.append(
+                {
+                    **common,
+                    "embedding_id": f"EMB_{dense_frame_id}",
+                    "embedding_index": index,
+                    "model_family": "siglip2",
+                    "model_name": "google/siglip2-so400m-patch16-384",
+                    "model_revision": "unit-test-revision",
+                    "processor_name": "google/siglip2-so400m-patch16-384",
+                    "vector_dim": 2,
+                    "input_resolution": 384,
+                    "normalized": True,
+                    "similarity": "cosine",
+                    "output_dtype": "float32",
+                }
+            )
+            dense_captions.append(
+                {**common, "status": "success", "caption": f"{caption} {index}"}
+            )
+            dense_ocr.append(
+                {**common, "status": "success", "ocr_text": f"ocr-{video_id}-{index}"}
+            )
+            dense_objects.append(
+                {
+                    **common,
+                    "status": "success",
+                    "objects": [
+                        {"class_name": f"object-{video_id}-{index}", "confidence": 0.9}
+                    ],
+                }
+            )
+            dense_ledger.append(
+                {
+                    **common,
+                    "selected": index == 0,
+                    "importance_score": 1.0 - index * 0.1,
+                    "semantic_novelty": index * 0.1,
+                    "component_scores": {"caption": 0.8},
+                    "available_modalities": ["caption", "ocr", "objects"],
+                    "feature_protected_event_ids": (
+                        [f"EVENT_{video_id}_000001"] if index == 1 else []
+                    ),
+                    "selection_rank": 1 if index == 0 else None,
+                    "selection_phase": "protected" if index == 0 else None,
+                    "selection_reasons": ["unit_test"] if index == 0 else [],
+                }
+            )
+        for path, records in (
+            (paths.dense_embedding_metadata, dense_records),
+            (paths.dense_captions, dense_captions),
+            (paths.dense_ocr, dense_ocr),
+            (paths.dense_objects, dense_objects),
+            (paths.candidate_ledger, dense_ledger),
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
                 encoding="utf-8",
             )
         return selected
@@ -1460,6 +1552,11 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             ),
             patch.object(
                 pipeline,
+                "_build_dense_corpus_index",
+                return_value={"status": "passed", "vector_count": 6},
+            ),
+            patch.object(
+                pipeline,
                 "_build_text_corpus_index",
                 return_value={"status": "passed", "input_record_count": 2},
             ) as text_builder,
@@ -1475,10 +1572,16 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             ) as segment_builder,
             patch.object(pipeline, "_build_bge_corpus_index") as bge_builder,
             patch.object(pipeline, "_rebase_staged_visual_bundle"),
+            patch.object(pipeline, "_rebase_staged_dense_bundle"),
             patch.object(
                 pipeline,
                 "_validate_visual_corpus_index",
                 return_value={"status": "passed", "vector_count": 2},
+            ),
+            patch.object(
+                pipeline,
+                "_validate_dense_corpus_index",
+                return_value={"status": "passed", "vector_count": 6},
             ),
             patch.object(
                 pipeline,
@@ -1608,6 +1711,10 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         self.assertEqual(first, resumed)
         self.assertEqual(first["selected_keyframe_count"], 1)
         self.assertTrue(corpus_paths.visual_index.is_file())
+        self.assertTrue(corpus_paths.dense_index.is_file())
+        self.assertTrue(corpus_paths.dense_metadata.is_file())
+        self.assertTrue(corpus_paths.dense_frame_map.is_file())
+        self.assertTrue(corpus_paths.dense_manifest.is_file())
         self.assertTrue(corpus_paths.text_index.is_file())
         self.assertTrue(corpus_paths.neighbor_metadata.is_file())
         self.assertTrue(corpus_paths.segment_metadata.is_file())
@@ -1621,26 +1728,55 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         self.assertEqual(segments[0]["keyframe_ids"], [selected["frame_id"]])
         self.assertEqual(segments[0]["captions_aggregated"], "atomic caption")
         self.assertEqual(
-            {"neighbor_metadata", "segment_metadata"}.issubset(
+            {
+                "dense_index",
+                "dense_metadata",
+                "dense_frame_map",
+                "dense_manifest",
+                "dense_report",
+                "neighbor_metadata",
+                "segment_metadata",
+            }.issubset(
                 committed["artifacts"]
             ),
             True,
         )
         from backend.app.services.retrieval import retrieval_manager
 
+        runtime_environment = {
+            "RETRIEVAL_CORPUS_MANIFEST_PATH": str(corpus_paths.corpus_manifest),
+            "RETRIEVAL_INDEX_PATH": str(corpus_paths.visual_index),
+            "RETRIEVAL_FRAME_MAP_PATH": str(corpus_paths.visual_frame_map),
+            "RETRIEVAL_MANIFEST_PATH": str(corpus_paths.visual_manifest),
+            "RETRIEVAL_DENSE_INDEX_PATH": str(corpus_paths.dense_index),
+            "RETRIEVAL_DENSE_METADATA_PATH": str(corpus_paths.dense_metadata),
+            "RETRIEVAL_DENSE_FRAME_MAP_PATH": str(corpus_paths.dense_frame_map),
+            "RETRIEVAL_DENSE_MANIFEST_PATH": str(corpus_paths.dense_manifest),
+            "RETRIEVAL_DENSE_REPORT_PATH": str(corpus_paths.dense_report),
+        }
         with patch.dict(
             os.environ,
-            {"RETRIEVAL_CORPUS_MANIFEST_PATH": str(corpus_paths.corpus_manifest)},
+            runtime_environment,
         ):
             runtime_manifest = retrieval_manager.validate_runtime_corpus_bundle(
                 required_roles=(
                     "visual_index",
+                    "dense_index",
+                    "dense_metadata",
+                    "dense_frame_map",
+                    "dense_manifest",
+                    "dense_report",
                     "text_index",
                     "neighbor_metadata",
                     "segment_metadata",
                 ),
                 artifact_overrides={
                     "visual_index": corpus_paths.visual_index,
+                    "dense_index": corpus_paths.dense_index,
+                    "dense_metadata": corpus_paths.dense_metadata,
+                    "dense_frame_map": corpus_paths.dense_frame_map,
+                    "dense_manifest": corpus_paths.dense_manifest,
+                    "dense_report": corpus_paths.dense_report,
                     "text_index": corpus_paths.text_index,
                     "neighbor_metadata": corpus_paths.neighbor_metadata,
                     "segment_metadata": corpus_paths.segment_metadata,
@@ -1650,6 +1786,16 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 runtime_manifest["bundle_generation"],
                 committed["bundle_generation"],
             )
+            retrieval_manager.clear_retrieval_caches()
+            try:
+                dense_index = retrieval_manager.get_dense_candidate_index()
+                self.assertEqual(len(dense_index.records), 3)
+                self.assertEqual(
+                    dense_index.corpus_generation,
+                    committed["bundle_generation"],
+                )
+            finally:
+                retrieval_manager.clear_retrieval_caches()
             corpus_paths.text_index.write_text("tampered", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "committed corpus"):
                 retrieval_manager.validate_runtime_corpus_bundle(
@@ -1671,6 +1817,7 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         corpus_paths.visual_index.parent.mkdir(parents=True, exist_ok=True)
         corpus_paths.text_index.parent.mkdir(parents=True, exist_ok=True)
         corpus_paths.visual_index.write_bytes(b"OLD-VISUAL")
+        corpus_paths.dense_index.write_bytes(b"OLD-DENSE")
         corpus_paths.text_index.write_bytes(b"OLD-TEXT")
 
         with (
@@ -1702,6 +1849,7 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 pipeline.build_corpus_indexes((artifact,), config)
 
         self.assertEqual(corpus_paths.visual_index.read_bytes(), b"OLD-VISUAL")
+        self.assertEqual(corpus_paths.dense_index.read_bytes(), b"OLD-DENSE")
         self.assertEqual(corpus_paths.text_index.read_bytes(), b"OLD-TEXT")
         self.assertFalse(corpus_paths.corpus_manifest.exists())
 
@@ -1719,6 +1867,7 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         corpus_paths = pipeline.CorpusPaths.from_config(self.config)
         old_artifacts = {
             corpus_paths.visual_index: b"OLD-VISUAL",
+            corpus_paths.dense_index: b"OLD-DENSE",
             corpus_paths.text_index: b"OLD-TEXT",
             corpus_paths.neighbor_metadata: b"OLD-NEIGHBORS",
             corpus_paths.segment_metadata: b"OLD-SEGMENTS",

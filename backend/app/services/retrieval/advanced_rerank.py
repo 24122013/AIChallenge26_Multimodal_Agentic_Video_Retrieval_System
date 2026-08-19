@@ -1,6 +1,7 @@
 """Deterministic multimodal reranking for dense CSES candidates."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -22,6 +23,19 @@ class AdvancedRerankWeights:
     temporal_consistency: float = 0.03
     modality_alignment: float = 0.02
 
+    def __post_init__(self) -> None:
+        values: dict[str, float] = {}
+        for name, raw_value in self.__dict__.items():
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise ValueError("Advanced rerank weights must be finite numbers")
+            values[name] = float(raw_value)
+        if any(not math.isfinite(value) for value in values.values()):
+            raise ValueError("Advanced rerank weights must be finite")
+        if any(value < 0 for value in values.values()):
+            raise ValueError("Advanced rerank weights must be non-negative")
+        if sum(values.values()) <= 0:
+            raise ValueError("At least one advanced rerank weight must be positive")
+
 
 @dataclass(frozen=True)
 class AdvancedRankedFrame:
@@ -33,17 +47,62 @@ class AdvancedRankedFrame:
     temporal_chain_id: str = ""
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            "dense_row": self.dense_row,
-            "candidate_id": self.record.get("candidate_id"),
-            "video_id": self.record.get("video_id"),
-            "timestamp": self.record.get("timestamp"),
-            "frame_index": self.record.get("frame_index"),
-            "score": self.score,
-            "breakdown": dict(self.breakdown),
-            "selection": self.selection.to_dict(),
-            "temporal_chain_id": self.temporal_chain_id,
+        """Return the backward-compatible mapping used by online candidates."""
+
+        return self.to_result_mapping()
+
+    def to_result_mapping(self) -> dict[str, object]:
+        """Preserve dense lineage while overlaying final ranking diagnostics.
+
+        Dense records carry the canonical frame/image/text fields expected by
+        ``OnlinePipeline.Candidate.from_mapping``.  Starting from that record is
+        therefore safer than rebuilding a narrow result and accidentally
+        dropping ``frame_id``, ``shot_id``, paths, or modality evidence.
+        """
+
+        output = dict(self.record)
+        breakdown = {
+            str(name): float(value)
+            for name, value in self.breakdown.items()
+            if math.isfinite(float(value))
         }
+        modality_scores = _float_mapping(output.get("modality_scores"))
+        for name in (
+            "coarse_rrf",
+            "dense_visual",
+            "caption",
+            "ocr",
+            "objects",
+            "cses_gain",
+            "temporal_consistency",
+            "modality_alignment",
+        ):
+            if name in breakdown:
+                modality_scores[name] = breakdown[name]
+        # The existing Candidate contract calls its visual field ``visual``.
+        # Keep the more precise dense name as well for debug/ablation consumers.
+        if "dense_visual" in breakdown:
+            modality_scores["visual"] = breakdown["dense_visual"]
+
+        selection = self.selection.to_dict()
+        output.update(
+            {
+                "dense_row": int(self.dense_row),
+                "score": float(self.score),
+                "rerank_score": float(self.score),
+                "dense_visual_score": breakdown.get("dense_visual"),
+                "modality_scores": modality_scores,
+                "breakdown": breakdown,
+                "score_breakdown": breakdown,
+                "selection": selection,
+                "cses": selection,
+                "cses_selection": selection,
+                "temporal_chain_id": self.temporal_chain_id,
+            }
+        )
+        if output.get("fusion_score") is None:
+            output["fusion_score"] = breakdown.get("coarse_rrf")
+        return output
 
 
 def rerank_dense_candidates(
@@ -61,11 +120,9 @@ def rerank_dense_candidates(
     if not selections:
         return []
     weights = weights or AdvancedRerankWeights()
-    if any(float(value) < 0 for value in weights.__dict__.values()):
-        raise ValueError("Advanced rerank weights must be non-negative")
+    if not isinstance(weights, AdvancedRerankWeights):
+        raise TypeError("weights must be an AdvancedRerankWeights instance")
     total_weight = sum(float(value) for value in weights.__dict__.values())
-    if total_weight <= 0:
-        raise ValueError("At least one advanced rerank weight must be positive")
 
     rows = [selection.row for selection in selections]
     matrix = np.asarray(vectors[rows], dtype=np.float32)
@@ -77,7 +134,11 @@ def rerank_dense_candidates(
     query_tokens = set(content_tokens(plan.original_query, fallback_to_all=True))
     max_cses = max(selection.selection_gain for selection in selections) or 1.0
     raw_coarse = dict(coarse_scores or {})
-    max_coarse = max(raw_coarse.values(), default=1.0) or 1.0
+    coarse_scale = max(
+        (abs(float(value)) for value in raw_coarse.values()),
+        default=1.0,
+    ) or 1.0
+    has_negative_coarse = any(float(value) < 0 for value in raw_coarse.values())
     temporal_scores, temporal_chain_ids = temporal_chain_consistency(
         rows=rows,
         records=records,
@@ -103,8 +164,15 @@ def rerank_dense_candidates(
         }
         hinted = [modality[name] for name in plan.modality_hints if name in modality]
         hint_alignment = max(hinted, default=0.0)
+        raw_coarse_score = float(raw_coarse.get(clip_key, 0.0))
+        normalized_coarse = raw_coarse_score / coarse_scale
+        if has_negative_coarse:
+            # Visual cosine scores may be negative.  Mapping the signed range
+            # to [0, 1] preserves ordering; dividing by a negative maximum would
+            # otherwise make the weakest hit look strongest.
+            normalized_coarse = (normalized_coarse + 1.0) / 2.0
         breakdown = {
-            "coarse_rrf": float(raw_coarse.get(clip_key, 0.0)) / max_coarse,
+            "coarse_rrf": normalized_coarse,
             "dense_visual": float(dense_scores[local_index]),
             **modality,
             "cses_gain": float(selection.selection_gain) / max_cses,
@@ -221,3 +289,17 @@ def _text_score(query_tokens: set[str], text: str) -> float:
         return 0.0
     evidence = set(content_tokens(text, fallback_to_all=True))
     return float(weighted_term_coverage(query_tokens, evidence)) if evidence else 0.0
+
+
+def _float_mapping(value: object) -> dict[str, float]:
+    if not isinstance(value, Mapping):
+        return {}
+    output: dict[str, float] = {}
+    for name, raw in value.items():
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            output[str(name)] = parsed
+    return output

@@ -211,6 +211,33 @@ class RetrievalManagerGenerationCacheTest(unittest.TestCase):
         self.assertIsNone(first.corpus_generation)
         factory.assert_called_once()
 
+    def test_legacy_committed_corpus_reports_dense_bundle_as_missing(self) -> None:
+        self._publish("legacy-without-dense")
+
+        with (
+            mock.patch.dict(os.environ, self.environment, clear=False),
+            self.assertRaisesRegex(FileNotFoundError, "dense-candidate bundle"),
+        ):
+            retrieval_manager.get_dense_candidate_index()
+
+    def test_online_dense_loader_rejects_cross_generation_mix(self) -> None:
+        corpus_key = retrieval_manager._CorpusCacheKey(
+            manifest_path=str(self.corpus_manifest),
+            bundle_generation="expected-generation",
+            manifest_contract_sha256="expected-contract",
+        )
+        wrong = SimpleNamespace(corpus_generation="other-generation")
+
+        with (
+            mock.patch.object(
+                retrieval_manager,
+                "get_dense_candidate_index",
+                return_value=wrong,
+            ),
+            self.assertRaisesRegex(ValueError, "another corpus generation"),
+        ):
+            retrieval_manager._get_online_dense_index_for_generation(corpus_key)
+
     def test_trake_factory_is_cached_per_committed_corpus_generation(self) -> None:
         generation_1 = self._publish("g1")
         current_generation = generation_1
@@ -224,20 +251,31 @@ class RetrievalManagerGenerationCacheTest(unittest.TestCase):
                 dense_event_engine=None,
                 event_reranker=None,
                 bge_contract=None,
+                local_scorer=None,
                 config,
             ) -> None:
                 self.retrieval_engine = retrieval_engine
                 self.dense_event_engine = dense_event_engine
                 self.event_reranker = event_reranker
                 self.bge_contract = bge_contract
+                self.local_scorer = local_scorer
                 self.config = config
                 constructed.append(self)
 
         fake_module = types.ModuleType("backend.app.services.trake.pipeline")
+        fake_module.TRAKE_SCHEMA_VERSION = "1.0"
         fake_module.TrakePipeline = FakeTrakePipeline
 
         def retrieval_engine() -> SimpleNamespace:
-            return SimpleNamespace(corpus_generation=current_generation)
+            return SimpleNamespace(
+                corpus_generation=current_generation,
+                visual_engine=SimpleNamespace(
+                    encoder=SimpleNamespace(
+                        encode=mock.Mock(),
+                        encode_images=mock.Mock(),
+                    )
+                ),
+            )
 
         with (
             mock.patch.dict(os.environ, self.environment, clear=False),
@@ -260,6 +298,8 @@ class RetrievalManagerGenerationCacheTest(unittest.TestCase):
         self.assertIsNot(first, second)
         self.assertEqual(first.corpus_generation, generation_1)
         self.assertEqual(second.corpus_generation, current_generation)
+        self.assertIsNotNone(first.local_scorer)
+        self.assertIsNotNone(second.local_scorer)
         self.assertEqual(len(constructed), 2)
 
 

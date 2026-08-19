@@ -152,7 +152,14 @@ class TrakeBgeManagerTest(unittest.TestCase):
         dense: object | None = None,
         reranker: object | None = None,
     ) -> tuple[object, mock.Mock, mock.Mock]:
-        hybrid = SimpleNamespace(corpus_generation=None)
+        visual_encoder = SimpleNamespace(
+            encode=mock.Mock(),
+            encode_images=mock.Mock(),
+        )
+        hybrid = SimpleNamespace(
+            corpus_generation=None,
+            visual_engine=SimpleNamespace(encoder=visual_encoder),
+        )
         dense_getter = mock.Mock(return_value=dense)
         reranker_factory = mock.Mock(return_value=reranker)
 
@@ -164,12 +171,14 @@ class TrakeBgeManagerTest(unittest.TestCase):
                 dense_event_engine,
                 event_reranker,
                 bge_contract,
+                local_scorer,
                 config,
             ) -> None:
                 self.retrieval_engine = retrieval_engine
                 self.dense_event_engine = dense_event_engine
                 self.event_reranker = event_reranker
                 self.bge_contract = bge_contract
+                self.local_scorer = local_scorer
                 self.config = config
 
         with (
@@ -223,6 +232,7 @@ class TrakeBgeManagerTest(unittest.TestCase):
 
         self.assertIsNone(pipeline.dense_event_engine)
         self.assertIsNone(pipeline.event_reranker)
+        self.assertIsNotNone(pipeline.local_scorer)
         dense_getter.assert_not_called()
         reranker_factory.assert_not_called()
 

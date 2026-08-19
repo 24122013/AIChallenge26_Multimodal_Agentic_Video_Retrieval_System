@@ -26,10 +26,16 @@ cache dưới `data/model_cache/` và resume theo model/revision.
   event, gate video theo coverage, sinh K-best ordered paths trên original
   `frame_index`, rồi xếp hạng tối đa 100 complete sequence.
 
-Keyframe kỹ thuật là frame sparse đã được offline selector đưa vào index. Semantic
-keyframe của TRAKE là frame thỏa criterion event và có thể được tìm bằng bounded
-local refinement quanh coarse technical keyframe; không có dense-frame corpus
-index trong runtime này.
+Ba nguồn frame không được đánh đồng:
+
+- **Selected-keyframe index**: technical keyframes sparse do offline selector chọn;
+  đây là coarse visual source cùng caption/OCR/object evidence cho KIS/AVS.
+- **Full dense-candidate index**: toàn bộ materialized dense candidates trước
+  selection, publish thành FAISS + metadata/map/manifest/report riêng; KIS/AVS dùng
+  nó cho global rescue và per-clip CSES. Đây vẫn không phải mọi raw video frame.
+- **TRAKE local refinement**: decode raw frames trong một bounded window quanh
+  coarse frame rồi chấm bằng shared SigLIP2 text/image embeddings; nhánh này không
+  search full dense-candidate FAISS.
 
 ### Task contract
 
@@ -53,8 +59,9 @@ vì TRAKE phải giữ chính xác event count/order do caller cung cấp.
 .\.venv\Scripts\python.exe backend\app\services\ingestion\run_ocr.py --help
 .\.venv\Scripts\python.exe backend\app\services\ingestion\run_object_detection.py --help
 
+$env:RETRIEVAL_QUERY_EXPANSION_ENABLED = "false" # optional low-latency smoke
 .\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline `
-  --task kis --top-k 20 `
+  --task kis --top-k 20 --debug `
   --query "người đàn ông mặc áo đỏ đang mở cửa xe" `
   --output data/reports/kis_query.json
 
@@ -69,6 +76,13 @@ $env:QA_ANSWER_MODE = "off"
   --query "Người phụ nữ mặc áo đỏ đang cầm vật gì?" `
   --output data/reports/qa_query.json
 ```
+
+Lệnh KIS trên là smoke command của chính production entrypoint:
+`search_online -> get_online_pipeline -> OnlinePipeline.run`. Full coarse-to-dense
+chỉ được xác nhận khi output có
+`routing_trace.coarse_to_dense.executed=true` và `mode="coarse_to_dense"`.
+`mode="selected_only_fallback"` nghĩa là request vẫn chạy selected-keyframe path
+nhưng dense rescue/CSES chưa chạy; đừng lấy kết quả đó làm bằng chứng full path.
 
 `QA_ANSWER_MODE=off` vẫn chạy QA evidence nhưng không load answer model;
 `optional` giữ evidence và trả error/abstention status nếu generation lỗi;
@@ -129,7 +143,11 @@ qa = search_online(
 
 KIS response có `query_plan` và ranked `candidates`; `keyframe_id`/`frame_id` là
 technical retrieval identity, còn `frame_index` là canonical original-frame
-lineage khi metadata có sẵn. QA response giữ evidence riêng trong `evidence` và
+lineage khi metadata có sẵn. Mỗi dense-path candidate giữ `score_breakdown`,
+`modality_scores`, `cses_selection` và các identity/metadata field hiện hữu;
+`routing_trace.latency` tách thời gian planning, expansion, selected visual, text,
+fusion, dense global/rescue, CSES, deterministic rerank và context attachment.
+QA response giữ evidence riêng trong `evidence` và
 luôn có structured `answer` status; ở mode `off`, status cho biết answerer bị tắt,
 không có câu trả lời được bịa từ ngoài evidence.
 
@@ -171,11 +189,63 @@ hay FAISS row. Serializer yêu cầu lineage khớp và dedupe theo toàn sequen
 
 ## KIS/KIST và QA config
 
-KIS/KIST dùng canonical task `kis` và các section `hybrid`, `weights`,
-`text_index`, `query_expansion` trong `configs/retrieval.yaml`. Runtime artifact
-paths lấy từ `RETRIEVAL_INDEX_PATH`, `RETRIEVAL_FRAME_MAP_PATH`,
-`RETRIEVAL_MANIFEST_PATH` và `RETRIEVAL_TEXT_INDEX_PATH`; giới hạn public hiện là
-`hybrid.max_top_k: 200`.
+KIS/KIST dùng canonical task `kis`; AVS dùng cùng implementation với profile
+`avs`. Public call graph duy nhất là:
+
+```text
+search_online
+  -> get_online_pipeline        # cache theo committed corpus generation
+  -> OnlinePipeline.run
+  -> query plan/optional expansion
+  -> selected visual + caption/OCR/object retrieval
+  -> intra-variant fusion + inter-modality weighted RRF
+  -> coarse clip aggregation
+  -> full dense-candidate FAISS global search + missed-clip rescue
+  -> per-clip CSES
+  -> deterministic evidence rerank + exact candidate dedup
+  -> existing Candidate/public response schema
+```
+
+`configs/retrieval.yaml` sections `hybrid`, `weights`, `text_index`,
+`query_expansion` và `online` điều khiển route này. Defaults quan trọng của
+`online` là `coarse_top_n: 50`, `dense_global_top_k: 300`,
+`dense_rescue_clips: 10`, `max_total_clips: 60`,
+`dense_frames_per_clip: 12`, `rrf_k: 60`, `cses_enabled: true` và
+`deterministic_rerank_enabled: true`. Rerank cuối là phép cộng có trọng số của
+coarse RRF, dense visual, caption, OCR, objects, CSES gain, temporal consistency
+và modality alignment. Hai cờ `learned_rerank_enabled` và `vlm_rerank_enabled`
+mặc định `false`; canonical implementation hiện không load cross-encoder/VLM
+retrieval reranker, kể cả trong request bình thường. Query-expansion Qwen là một
+feature riêng của planner, không phải reranker này.
+
+Mọi field `online` có env override prefix `RETRIEVAL_ONLINE_`; các switch chính
+là `RETRIEVAL_ONLINE_COARSE_TO_DENSE_ENABLED`,
+`RETRIEVAL_ONLINE_DENSE_ENABLED`,
+`RETRIEVAL_ONLINE_DENSE_MISSING_BEHAVIOR`,
+`RETRIEVAL_ONLINE_LEARNED_RERANK_ENABLED`,
+`RETRIEVAL_ONLINE_VLM_RERANK_ENABLED` và `RETRIEVAL_ONLINE_DEBUG_ENABLED`.
+CLI `--debug` override debug cho riêng request và mở detailed fusion trace.
+
+Selected/coarse artifact paths vẫn lấy từ `RETRIEVAL_INDEX_PATH`,
+`RETRIEVAL_FRAME_MAP_PATH`, `RETRIEVAL_MANIFEST_PATH` và
+`RETRIEVAL_TEXT_INDEX_PATH`. Full dense-candidate bundle dùng riêng:
+
+| Biến | Artifact |
+|---|---|
+| `RETRIEVAL_DENSE_INDEX_PATH` | Corpus-wide dense-candidate FAISS `IndexFlatIP` |
+| `RETRIEVAL_DENSE_METADATA_PATH` | Enriched dense-candidate JSONL, cùng row order với FAISS |
+| `RETRIEVAL_DENSE_FRAME_MAP_PATH` | Dense FAISS row-to-frame map |
+| `RETRIEVAL_DENSE_MANIFEST_PATH` | Dense encoder/normalization/source/checksum contract |
+| `RETRIEVAL_DENSE_REPORT_PATH` | Dense build/validation report |
+
+Dense loader chạy lazy ở request KIS/AVS đầu tiên và cache theo corpus generation.
+Với `online.dense_missing_behavior: fallback_sparse` (mặc định), **bundle bị
+thiếu** (kể cả committed corpus cũ chưa khai báo dense roles) quay về
+selected-only route và trace ghi `selected_only_fallback`;
+`error` nâng thiếu artifact thành lỗi. Artifact đã có nhưng sai checksum, count,
+dimension, row order, source lineage, khai báo bundle dở dang hoặc lệch encoder
+contract với selected index luôn fail closed ở cả hai mode. Giới hạn public vẫn
+là `hybrid.max_top_k: 200`.
 
 QA dùng cùng canonical corpus nhưng có feature flags riêng:
 
@@ -301,11 +371,19 @@ chỉ override bằng đúng revision đó. Reranker `main` chỉ dành cho opti
 Dense manifest trong required mode cũng phải chứa hub model id và resolved commit
 hash bất biến; `main`, URL hoặc local model path đều bị từ chối.
 
-Production `get_trake_pipeline()` hiện không inject `LocalFrameScorer`. Dù
-`refinement_enabled` mặc định bật, refiner giữ coarse canonical frame và báo
-`local_refinement_scorer_unavailable`. Decoder/scorer protocols và boundary-aware
-selection có test bằng fake dependencies, nhưng không có pose/contact model hoặc
-VLM verifier đã được wire/kiểm chứng trên full corpus.
+Khi `refinement_enabled` bật, production `get_trake_pipeline()` inject
+`Siglip2LocalFrameScorer` và reuse encoder/model đã nằm trong canonical visual
+search engine. OpenCV chỉ decode bounded raw-frame windows dưới
+`RETRIEVAL_TRAKE_VIDEO_ROOT`; scorer encode event text và RGB frames trong cùng
+SigLIP2 vector space rồi đưa cosine similarity chuẩn hóa `[0,1]` cho
+boundary-aware selection. Nhánh này không load thêm checkpoint, không search
+full dense-candidate FAISS và không ảnh hưởng QA route. Nếu video/decode/scoring
+không khả dụng, refiner giữ coarse canonical frame và ghi warning/fallback trace.
+
+Sự thật cần giữ tỉnh táo: shared-SigLIP2 scorer là semantic similarity rẻ, không
+phải pose/contact detector hay VLM verifier. Unit/integration contract có thể xác
+nhận wiring và fallback, nhưng semantic-boundary accuracy vẫn cần full-corpus
+run cùng ground truth/adjudication trước khi đưa claim chất lượng.
 
 ## Test
 

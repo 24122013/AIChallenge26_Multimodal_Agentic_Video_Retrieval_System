@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from backend.app.services.agent.query_expansion import QueryExpansionProvider
 from backend.app.services.retrieval.hybrid_search import HybridSearchEngine
+from backend.app.services.retrieval.advanced_search import (
+    AdvancedSearchConfig,
+    DenseCandidateIndex,
+    advanced_text_search,
+)
 from backend.app.services.retrieval.online_context import OnlineContextIndex
 from backend.app.services.retrieval.planned_hybrid import planned_hybrid_search
 from backend.app.services.retrieval.qa_evidence import QaEvidenceSearchEngine
@@ -29,6 +35,31 @@ class TrakeSearchPipeline(Protocol):
     """Narrow dependency contract for the separately owned TRAKE pipeline."""
 
     def search(self, query: str, top_k: int = 100) -> Mapping[str, Any]: ...
+
+
+DenseIndexLoader = Callable[[], DenseCandidateIndex]
+
+
+class _TimedExpansionProvider:
+    """Measure only provider work while preserving the existing provider API."""
+
+    def __init__(self, provider: QueryExpansionProvider) -> None:
+        self.provider = provider
+        self.provider_name = provider.provider_name
+        self.model_name = provider.model_name
+        self.model_revision = provider.model_revision
+        self.elapsed_ms = 0.0
+
+    def expand(self, query, protected):
+        started = time.perf_counter()
+        try:
+            return self.provider.expand(query, protected)
+        finally:
+            self.elapsed_ms = round(self.elapsed_ms + _elapsed_ms(started), 3)
+
+    def close(self) -> None:
+        # The production provider is shared and owned by retrieval_manager.
+        return None
 
 
 @dataclass(frozen=True)
@@ -70,6 +101,8 @@ class Candidate:
     ocr_text: str = ""
     objects: tuple[str, ...] = ()
     modality_scores: dict[str, float] = field(default_factory=dict)
+    score_breakdown: dict[str, float] = field(default_factory=dict)
+    cses_selection: dict[str, Any] | None = None
     temporal: dict[str, Any] = field(default_factory=dict)
     context_sources: tuple[str, ...] = ()
 
@@ -165,6 +198,22 @@ class Candidate:
             ocr_text=str(value.get("ocr_text") or ""),
             objects=tuple(str(item) for item in (value.get("objects") or ()) if item),
             modality_scores=modality_scores,
+            score_breakdown=_float_mapping(
+                value.get("score_breakdown") or value.get("breakdown")
+            ),
+            cses_selection=(
+                dict(value["cses_selection"])
+                if isinstance(value.get("cses_selection"), Mapping)
+                else (
+                    dict(value["cses"])
+                    if isinstance(value.get("cses"), Mapping)
+                    else (
+                        dict(value["selection"])
+                        if isinstance(value.get("selection"), Mapping)
+                        else None
+                    )
+                )
+            ),
             temporal=temporal,
             context_sources=context_sources,
         )
@@ -199,6 +248,12 @@ class Candidate:
             "ocr_text": self.ocr_text,
             "objects": list(self.objects),
             "modality_scores": dict(self.modality_scores),
+            "score_breakdown": dict(self.score_breakdown),
+            "cses_selection": (
+                dict(self.cses_selection)
+                if self.cses_selection is not None
+                else None
+            ),
             "temporal": dict(self.temporal),
             "context_sources": list(self.context_sources),
         }
@@ -217,6 +272,8 @@ class OnlinePipeline:
         qa_evidence_engine: QaEvidenceSearchEngine | None = None,
         trake_pipeline: TrakeSearchPipeline | None = None,
         context_index: OnlineContextIndex | None = None,
+        dense_index: DenseCandidateIndex | None = None,
+        dense_index_loader: DenseIndexLoader | None = None,
         config: OnlinePipelineConfig | None = None,
     ) -> None:
         self.hybrid_engine = hybrid_engine
@@ -226,6 +283,11 @@ class OnlinePipeline:
         self.qa_evidence_engine = qa_evidence_engine
         self.trake_pipeline = trake_pipeline
         self.context_index = context_index
+        self._dense_index = dense_index
+        self._dense_index_loader = dense_index_loader
+        self._dense_index_resolved = dense_index is not None
+        self._dense_index_error = ""
+        self._dense_index_lock = threading.RLock()
         self.config = config or OnlinePipelineConfig()
         if int(self.config.max_top_k) <= 0:
             raise ValueError("online max_top_k must be positive")
@@ -238,6 +300,7 @@ class OnlinePipeline:
         *,
         expanded_queries: Sequence[str] = (),
         include_context: bool | None = None,
+        debug: bool | None = None,
     ) -> dict[str, Any]:
         """Plan once, route by task, then normalize all result candidates."""
 
@@ -268,23 +331,32 @@ class OnlinePipeline:
             )
 
         plan: QueryPlan | None = None
+        stage_latency: dict[str, float] = {}
+        debug_enabled = (
+            self.runtime_config.online.debug_enabled
+            if debug is None
+            else bool(debug)
+        )
         resolved_task = requested_task
         if requested_task in {"auto", "kis", "avs"}:
-            plan = self._plan(original_query, requested_task)
+            plan, planning_ms, expansion_ms = self._plan(
+                original_query,
+                requested_task,
+            )
+            stage_latency["query_planning_ms"] = planning_ms
+            stage_latency["query_expansion_ms"] = expansion_ms
             resolved_task = plan.profile if requested_task == "auto" else requested_task
             if requested_task == "auto" and top_k is None and resolved_task == "qa":
                 requested_top_k = 5
 
         if resolved_task in {"kis", "avs"}:
             assert plan is not None
-            raw = planned_hybrid_search(
-                self.hybrid_engine,
-                plan,
+            raw = self._run_kis_avs(
+                original_query,
+                plan=plan,
                 top_k=requested_top_k,
-                max_expansion_contribution=(
-                    self.runtime_config.query_expansion.max_expansion_contribution
-                ),
-            ).to_dict()
+                debug=debug_enabled,
+            )
         elif resolved_task == "qa":
             if self.qa_pipeline is None:
                 raise RuntimeError("QA pipeline is unavailable in this online runtime")
@@ -318,6 +390,7 @@ class OnlinePipeline:
                 "Online context was requested but canonical neighbor/segment "
                 "artifacts are not loaded"
             )
+        context_started = time.perf_counter()
         raw_candidates = raw.get("results") or ()
         candidates = [
             Candidate.from_mapping(
@@ -329,6 +402,7 @@ class OnlinePipeline:
             for item in raw_candidates
             if isinstance(item, Mapping)
         ]
+        stage_latency["context_attachment_ms"] = _elapsed_ms(context_started)
 
         response: dict[str, Any] = {
             "schema_version": ONLINE_SCHEMA_VERSION,
@@ -348,11 +422,24 @@ class OnlinePipeline:
                     else None
                 ),
             },
-            "latency_ms": round((time.perf_counter() - started_at) * 1000.0, 3),
+            "latency_ms": _elapsed_ms(started_at),
         }
         trace = raw.get("routing_trace") or raw.get("trace")
         if isinstance(trace, Mapping):
-            response["routing_trace"] = dict(trace)
+            routing_trace = dict(trace)
+        else:
+            routing_trace = {}
+        raw_latency = routing_trace.get("latency")
+        if not isinstance(raw_latency, Mapping):
+            raw_latency = routing_trace.get("stage_latency_ms")
+        if isinstance(raw_latency, Mapping):
+            combined_latency = _float_mapping(raw_latency)
+            combined_latency.update(stage_latency)
+            stage_latency = combined_latency
+        stage_latency["total_ms"] = response["latency_ms"]
+        routing_trace["latency"] = stage_latency
+        routing_trace["debug_enabled"] = debug_enabled
+        response["routing_trace"] = routing_trace
         for field_name in (
             "answer",
             "answer_report",
@@ -366,17 +453,143 @@ class OnlinePipeline:
                 response[field_name] = raw[field_name]
         return response
 
-    def _plan(self, query: str, task: str) -> QueryPlan:
-        return build_query_plan(
+    def _plan(self, query: str, task: str) -> tuple[QueryPlan, float, float]:
+        started = time.perf_counter()
+        provider = (
+            self.query_expansion_provider
+            if self.runtime_config.query_expansion.enabled
+            else None
+        )
+        timed_provider = _TimedExpansionProvider(provider) if provider is not None else None
+        plan = build_query_plan(
             query,
             profile=task,
-            expansion_provider=(
-                self.query_expansion_provider
-                if self.runtime_config.query_expansion.enabled
-                else None
-            ),
+            expansion_provider=timed_provider,
             expansion_config=self.runtime_config.query_expansion,
         )
+        total_ms = _elapsed_ms(started)
+        expansion_ms = timed_provider.elapsed_ms if timed_provider is not None else 0.0
+        return plan, round(max(0.0, total_ms - expansion_ms), 3), expansion_ms
+
+    def _run_kis_avs(
+        self,
+        query: str,
+        *,
+        plan: QueryPlan,
+        top_k: int,
+        debug: bool,
+    ) -> dict[str, Any]:
+        online = self.runtime_config.online
+        dense_index: DenseCandidateIndex | None = None
+        fallback_reason = ""
+        if online.coarse_to_dense_enabled and online.dense_enabled:
+            try:
+                dense_index = self._resolve_dense_index()
+            except FileNotFoundError as exc:
+                if online.dense_missing_behavior == "error":
+                    raise
+                fallback_reason = f"{type(exc).__name__}: {exc}"
+
+        if dense_index is None:
+            if not fallback_reason:
+                if not online.coarse_to_dense_enabled:
+                    fallback_reason = "coarse_to_dense_disabled"
+                elif not online.dense_enabled:
+                    fallback_reason = "dense_disabled"
+                else:
+                    fallback_reason = self._dense_index_error or "dense_index_unavailable"
+            sparse = planned_hybrid_search(
+                self.hybrid_engine,
+                plan,
+                top_k=top_k,
+                max_expansion_contribution=(
+                    self.runtime_config.query_expansion.max_expansion_contribution
+                ),
+            ).to_dict()
+            trace = dict(sparse.get("trace") or {})
+            trace["coarse_to_dense"] = {
+                "enabled": bool(online.coarse_to_dense_enabled),
+                "dense_enabled": bool(online.dense_enabled),
+                "executed": False,
+                "mode": "selected_only_fallback",
+                "missing_behavior": online.dense_missing_behavior,
+                "fallback_reason": fallback_reason,
+            }
+            trace["heavy_rerankers"] = {
+                "learned_enabled": bool(online.learned_rerank_enabled),
+                "vlm_enabled": bool(online.vlm_rerank_enabled),
+                "loaded_by_online_pipeline": False,
+            }
+            sparse["trace"] = trace
+            return sparse
+
+        encoder = getattr(self.hybrid_engine.visual_engine, "encoder", None)
+        if encoder is None or not callable(getattr(encoder, "encode", None)):
+            raise RuntimeError("Canonical visual query encoder is unavailable")
+        response = advanced_text_search(
+            query,
+            hybrid_engine=self.hybrid_engine,
+            text_encoder=encoder,
+            dense_index=dense_index,
+            profile=plan.profile,
+            plan=plan,
+            config=AdvancedSearchConfig(
+                coarse_top_n=online.coarse_top_n,
+                dense_global_top_k=online.dense_global_top_k,
+                dense_rescue_clips=online.dense_rescue_clips,
+                max_total_clips=online.max_total_clips,
+                dense_frames_per_clip=online.dense_frames_per_clip,
+                rrf_k=online.rrf_k,
+                modality_hint_boost=online.modality_hint_boost,
+                similarity_threshold=online.similarity_threshold,
+                temporal_window_seconds=online.temporal_window_seconds,
+                max_event_gap_seconds=online.max_event_gap_seconds,
+                rrf_enabled=online.rrf_enabled,
+                dense_rescue_enabled=online.dense_enabled,
+                cses_enabled=online.cses_enabled,
+                deterministic_rerank_enabled=online.deterministic_rerank_enabled,
+                query_expansion=self.runtime_config.query_expansion,
+                rerank_weights=online.rerank_weights,
+            ),
+        )
+        raw = response.to_dict(top_k=top_k)
+        trace = dict(raw.get("trace") or {})
+        trace["coarse_to_dense"] = {
+            "enabled": True,
+            "dense_enabled": True,
+            "executed": True,
+            "mode": "coarse_to_dense",
+            "missing_behavior": online.dense_missing_behavior,
+            "fallback_reason": "",
+        }
+        trace["heavy_rerankers"] = {
+            "learned_enabled": bool(online.learned_rerank_enabled),
+            "vlm_enabled": bool(online.vlm_rerank_enabled),
+            "loaded_by_online_pipeline": False,
+        }
+        if not debug:
+            trace.pop("intra_modality_fusion", None)
+            trace.pop("inter_modality_fusion", None)
+        raw["trace"] = trace
+        return raw
+
+    def _resolve_dense_index(self) -> DenseCandidateIndex | None:
+        with self._dense_index_lock:
+            if self._dense_index_resolved:
+                return self._dense_index
+            if self._dense_index_loader is None:
+                self._dense_index_error = "dense_index_loader_unavailable"
+                raise FileNotFoundError(self._dense_index_error)
+            try:
+                self._dense_index = self._dense_index_loader()
+            except FileNotFoundError as exc:
+                self._dense_index_error = f"{type(exc).__name__}: {exc}"
+                raise
+            self._dense_index_resolved = True
+            self._dense_index_error = ""
+            if self._dense_index is None:
+                raise RuntimeError("Dense index loader returned no index")
+            return self._dense_index
 
     def _top_k(self, value: int | None, *, task: str) -> int:
         if task == "qa":
@@ -527,6 +740,10 @@ def _optional_int(value: object) -> int | None:
         return None
 
 
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000.0, 3)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run one query through the canonical online pipeline."
@@ -552,6 +769,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Require canonical neighbor and segment context for this query.",
     )
     parser.add_argument(
+        "--debug",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Expose detailed fusion and per-stage latency trace.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -573,6 +797,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         top_k=args.top_k,
         expanded_queries=args.expanded_query,
         include_context=args.with_context,
+        debug=args.debug,
     )
     serialized = json.dumps(response, ensure_ascii=False, indent=2) + "\n"
     if args.output is not None:

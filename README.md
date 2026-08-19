@@ -20,17 +20,21 @@ OFFLINE
 video
   -> dense candidates + shot anchors/endpoints
   -> SigLIP2 + Qwen caption + PP-OCRv5 + YOLOE features
-  -> protected-event/MMR/dedup/gap-aware keyframe selection
-  -> canonical keyframes
-  -> SigLIP2 FAISS + neighbor/segment metadata
-  -> BM25 text index + optional BGE-M3 dense text index
+  -> (A) full dense-candidate pool -> corpus-wide SigLIP2 FAISS + metadata/map/manifest/report
+  -> (B) protected-event/MMR/dedup/gap-aware selection -> canonical selected keyframes
+         -> selected-keyframe SigLIP2 FAISS + neighbor/segment metadata
+         -> BM25 text index + optional BGE-M3 dense text index
 
-ONLINE (một entrypoint: search_online -> OnlinePipeline)
+ONLINE (canonical: search_online -> get_online_pipeline -> OnlinePipeline.run)
 query + task (KIS/AVS/temporal/TRAKE/QA/auto)
-  -> KIS/AVS/temporal/QA: typed query plan -> shared retrieval/evidence flow
+  -> KIS/AVS: typed query plan + optional expansion
+              -> selected visual/caption/OCR/object retrieval -> weighted RRF
+              -> coarse clips -> corpus-wide dense FAISS global rescue
+              -> per-clip CSES -> deterministic evidence rerank -> exact dedup
+  -> temporal/QA: existing evidence-oriented routes
   -> TRAKE: conservative event parser -> event-wise hybrid retrieval
             -> video coverage gating -> K-best original-frame alignment
-            -> optional bounded local refinement -> diverse sequence ranking
+            -> bounded local decode + shared-SigLIP2 scoring -> diverse sequence ranking
   -> QA only: evidence bundle -> optional Qwen grounded answer, or abstain
 ```
 
@@ -49,8 +53,9 @@ query + task (KIS/AVS/temporal/TRAKE/QA/auto)
 - Keyframe kỹ thuật là frame sparse được offline pipeline chọn để lập chỉ mục.
   Semantic keyframe của TRAKE là frame thỏa criterion của event (ví dụ lần đầu
   chạm, rời hoàn toàn hoặc đạt đỉnh) và có thể nằm cạnh keyframe kỹ thuật. Local
-  refinement chỉ dò một cửa sổ bounded quanh coarse frame; không tạo dense index
-  toàn corpus.
+  refinement chỉ decode một cửa sổ bounded quanh coarse frame. Nó không đọc full
+  dense-candidate FAISS của KIS/AVS và không biến mọi raw video frame thành một
+  corpus index thứ ba.
 
 Chi tiết truy vết theo file/function và risk register nằm tại
 [`docs/PIPELINE_AUDIT.md`](docs/PIPELINE_AUDIT.md).
@@ -60,7 +65,7 @@ Chi tiết truy vết theo file/function và risk register nằm tại
 | Thành phần | Model/checkpoint | Phương pháp | File triển khai | Thiết bị | Artifact |
 |---|---|---|---|---|---|
 | Shot detection | `TransNetV2` | Shot boundaries + dense sampling | `indexing/extract_keyframes.py`, `keyframe_candidates.py` | CPU/CUDA (`auto`) | keyframe JSONL/report |
-| Visual embedding | `google/siglip2-so400m-patch16-384` | normalized embedding, FAISS IP | `build_siglip2_index.py`, `search_visual.py` | CPU/CUDA | `.npy`, FAISS, map/manifest |
+| Visual embedding | `google/siglip2-so400m-patch16-384` | normalized embedding, FAISS IP; selected-keyframe coarse index và full dense-candidate rescue index là hai bundle riêng | `build_siglip2_index.py`, `dense_candidate_index.py`, `search_visual.py` | CPU/CUDA | `.npy`, FAISS, metadata/map/manifest/report |
 | Caption | `florence-community/Florence-2-base-ft` (~0.23B) @ `0b03b6f15a4a211370fb204aee4e7dd48887ea37` | `<MORE_DETAILED_CAPTION>` frame caption | `ingestion/caption_pipeline.py` | CPU/CUDA | caption JSONL/report |
 | OCR | `PP-OCRv5_server_det` + `latin_PP-OCRv5_mobile_rec` | Vietnamese/English OCR | `ingestion/ocr_pipeline.py` | CPU/CUDA | OCR JSONL/report |
 | Object evidence | `yoloe-26l-seg.pt` | Open-vocabulary soft evidence | `ingestion/object_pipeline.py` | CPU/CUDA | object JSONL/report |
@@ -70,7 +75,7 @@ Chi tiết truy vết theo file/function và risk register nằm tại
 | Text reranker | `BAAI/bge-reranker-v2-m3` | Cross-encoder blend | `bge_reranker.py` | CPU/CUDA | scores/trace |
 | Grounded QA | `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a` | Evidence-only JSON + citation validation | `qa_answerer.py` | CPU/CUDA; lazy-load | answer/cache/report |
 | Query expansion | `Qwen/Qwen3.5-9B` @ `c202236` | bounded paraphrase/decomposition | `agent/query_expansion.py`, `query_plan.py` | CPU/CUDA | expansion plan/trace |
-| TRAKE | Không có checkpoint/scorer production đi kèm | deterministic parse, per-event retrieval, coverage gating, K-best alignment, sequence NMS; injectable local scorer | `backend/app/services/trake/` | CPU; decoder/scorer tùy injection | sequence hypotheses + lineage/trace |
+| TRAKE | Reuse canonical SigLIP2 checkpoint | deterministic parse, per-event retrieval, coverage gating, K-best alignment, bounded local decode + text/image cosine scoring, sequence NMS | `backend/app/services/trake/` | CPU/CUDA cho SigLIP2; OpenCV decode | sequence hypotheses + lineage/trace |
 
 Không có model ASR trong runtime hoặc dependency manifest. Các revision `main`
 của BGE nên được thay bằng commit hash trước một benchmark chính thức.
@@ -135,7 +140,7 @@ python -c "import torch, paddle, transformers, faiss; print({'torch': torch.__ve
 ## Cấu hình runtime
 
 [`configs/retrieval.yaml`](configs/retrieval.yaml) giữ hybrid weights, query
-expansion và section `trake`. [`.env.example`](.env.example) liệt kê các biến
+expansion, coarse-to-dense `online` và section `trake`. [`.env.example`](.env.example) liệt kê các biến
 artifact/QA quan trọng. Sao chép file này thành `.env` để cấu hình local; các
 retrieval CLI entrypoint tự load `.env`. Biến đã đặt bằng shell hoặc process manager
 được ưu tiên hơn giá trị trong file.
@@ -146,8 +151,13 @@ retrieval CLI entrypoint tự load `.env`. Biến đã đặt bằng shell hoặ
 | `RETRIEVAL_INDEX_PATH` | Khi search visual | SigLIP2 path dưới `data/indexes` | Backend | FAISS coarse index |
 | `RETRIEVAL_FRAME_MAP_PATH` | Khi search visual | Path dưới `data/metadata` | Backend | Map row sang video/frame/timestamp |
 | `RETRIEVAL_MANIFEST_PATH` | Khi search visual | Path dưới `data/metadata` | Backend | Encoder dimension/normalization/lineage |
+| `RETRIEVAL_DENSE_INDEX_PATH` | Khi KIS/AVS chạy dense | `data/indexes/siglip2_so400m_patch16_384_dense_flat_ip.faiss` | KIS/AVS | Full dense-candidate FAISS; không phải selected-keyframe index |
+| `RETRIEVAL_DENSE_METADATA_PATH`, `RETRIEVAL_DENSE_FRAME_MAP_PATH`, `RETRIEVAL_DENSE_MANIFEST_PATH`, `RETRIEVAL_DENSE_REPORT_PATH` | Khi KIS/AVS chạy dense | Các path `*_dense_*` trong `.env.example` | KIS/AVS | Bundle metadata/map/manifest/report phải cùng corpus generation |
 | `RETRIEVAL_TEXT_INDEX_PATH` | Khi bật text | `data/indexes/retrieval_text_index.json` | Backend | Caption/OCR/object sparse index |
 | `RETRIEVAL_DEVICE` | Không | `auto` | Backend | `auto`, `cpu` hoặc `cuda` |
+| `online.coarse_to_dense_enabled`, `online.dense_enabled` | Không | `true`, `true` | KIS/AVS | Bật canonical coarse-to-dense route và nhánh global dense rescue |
+| `online.dense_missing_behavior` | Không | `fallback_sparse` | KIS/AVS | `fallback_sparse` trả selected-only với trace rõ; `error` fail closed |
+| `online.learned_rerank_enabled`, `online.vlm_rerank_enabled` | Không | `false`, `false` | KIS/AVS | Chỉ là feature flags; canonical online path không load heavy learned/VLM reranker |
 | `ONLINE_NEIGHBOR_CONTEXT_ENABLED` | Không | `false` | Online pipeline | Đọc trực tiếp `neighbors_all.jsonl` sau rerank |
 | `ONLINE_SEGMENT_CONTEXT_ENABLED` | Không | `false` | Online/temporal | Gắn canonical segment trước temporal matching |
 | `ONLINE_NEIGHBOR_PATH` | Khi bật neighbor | `data/metadata/neighbors_all.jsonl` | Online pipeline | Canonical neighbor artifact |
@@ -164,16 +174,43 @@ retrieval CLI entrypoint tự load `.env`. Biến đã đặt bằng shell hoặ
 $env:RETRIEVAL_INDEX_PATH = "data/indexes/siglip2_so400m_patch16_384_flat_ip.faiss"
 $env:RETRIEVAL_FRAME_MAP_PATH = "data/metadata/siglip2_so400m_patch16_384_frame_map.json"
 $env:RETRIEVAL_MANIFEST_PATH = "data/metadata/siglip2_so400m_patch16_384_faiss_manifest.json"
+$env:RETRIEVAL_DENSE_INDEX_PATH = "data/indexes/siglip2_so400m_patch16_384_dense_flat_ip.faiss"
+$env:RETRIEVAL_DENSE_METADATA_PATH = "data/metadata/siglip2_so400m_patch16_384_dense_faiss_metadata.jsonl"
+$env:RETRIEVAL_DENSE_FRAME_MAP_PATH = "data/metadata/siglip2_so400m_patch16_384_dense_frame_map.json"
+$env:RETRIEVAL_DENSE_MANIFEST_PATH = "data/metadata/siglip2_so400m_patch16_384_dense_faiss_manifest.json"
+$env:RETRIEVAL_DENSE_REPORT_PATH = "data/metadata/siglip2_so400m_patch16_384_dense_index_report.json"
 $env:RETRIEVAL_TEXT_INDEX_PATH = "data/indexes/retrieval_text_index.json"
 $env:RETRIEVAL_CORPUS_MANIFEST_PATH = "data/metadata/offline_corpus_manifest.json"
 $env:RETRIEVAL_DEVICE = "cuda"
 ```
 
+Dense bundle được resolve lazy và cache theo `bundle_generation`; mỗi request
+KIS/AVS không rebuild hay reload FAISS. `fallback_sparse` chỉ xử lý trường hợp
+bundle dense chưa có và ghi `routing_trace.coarse_to_dense.mode` là
+`selected_only_fallback`. Bundle có mặt nhưng sai checksum, row order, dimension
+hoặc encoder contract vẫn fail closed; fallback không được dùng để che artifact hỏng.
+
+Smoke qua đúng production entrypoint (PowerShell):
+
+```powershell
+$env:RETRIEVAL_QUERY_EXPANSION_ENABLED = "false" # optional low-latency smoke
+.\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline `
+  --task kis --top-k 20 --debug `
+  --query "a person opens a refrigerator and takes a bottle" `
+  --output data/reports/kis_online_smoke.json
+```
+
+Để xác nhận **full** path đã chạy, kiểm tra
+`routing_trace.coarse_to_dense.executed=true`, `mode="coarse_to_dense"`,
+`dense_rescue_clip_count` và `routing_trace.latency`. Nếu mode là
+`selected_only_fallback`, command chỉ chứng minh route selected-keyframe còn chạy;
+chưa chứng minh dense rescue/CSES trên corpus hiện tại.
+
 | Task | Nguồn cấu hình chính | Model nặng mặc định |
 |---|---|---|
-| KIS/KIST (`kis`) | `hybrid`, `weights`, `text_index`, `query_expansion` trong retrieval YAML và các `RETRIEVAL_*` artifact paths | SigLIP2; query expansion chỉ chạy khi enabled và provider khả dụng |
+| KIS/KIST (`kis`) | `hybrid`, `weights`, `text_index`, `query_expansion`, `online` trong retrieval YAML và các `RETRIEVAL_*` artifact paths | SigLIP2; learned/VLM rerank mặc định tắt; query expansion chỉ chạy khi enabled và provider khả dụng |
 | QA (`qa`) | Cùng retrieval artifacts cộng các biến `QA_*` | BGE dense/reranker mặc định tắt; Qwen answerer mặc định `off` |
-| TRAKE (`trake`) | Section `trake` và các override `RETRIEVAL_TRAKE_*` | BGE dense/reranker mặc định tắt; local semantic scorer chưa được inject |
+| TRAKE (`trake`) | Section `trake` và các override `RETRIEVAL_TRAKE_*` | BGE dense/reranker mặc định tắt; local refinement reuse canonical SigLIP2 khi enabled |
 
 Các lựa chọn QA đáng chú ý:
 
@@ -315,12 +352,14 @@ bounds; mỗi field có override `RETRIEVAL_TRAKE_*` tương ứng trong
 `retrieval_config.py`. Không dùng `hybrid.max_gap_seconds=180` làm hard cutoff
 cho TRAKE: alignment chỉ áp soft gap penalty trên original frame indexes.
 
-`refinement_enabled: true` chỉ bật orchestration/interface. Cached production
-pipeline hiện **không inject semantic local scorer**, nên refiner giữ coarse
-canonical `frame_index` và ghi warning `local_refinement_scorer_unavailable`.
-Decoder/scorer có thể được inject cho test hoặc deployment riêng; repository
+`refinement_enabled: true` làm cached production pipeline inject
+`Siglip2LocalFrameScorer`, reuse encoder của canonical visual engine và score
+bounded decoded windows trong cùng SigLIP2 text/image vector space. Không có model
+thứ hai hoặc corpus index được load cho bước này. Khi video/decode/scoring lỗi,
+refiner vẫn giữ coarse canonical `frame_index` và ghi fallback warning. Repository
 không tuyên bố có pose/contact model, VLM verifier hay geometric boundary
-verification đang hoạt động.
+verification đang hoạt động; cosine similarity vẫn cần adjudicated full-corpus
+evaluation trước khi claim semantic-boundary accuracy.
 
 Model được lazy-load và cache dưới `data/model_cache/`. Lần đầu cần mạng nếu
 checkpoint chưa có. Caption/QA 4-bit hoặc 8-bit cần CUDA và bitsandbytes tương
@@ -332,8 +371,9 @@ Entrypoint dưới đây chạy toàn bộ video `*.mp4` trong `data/raw/video/`
 tự deterministic. Mỗi video phải hoàn tất dense candidates → materialize toàn
 bộ ảnh → SigLIP2/OCR/object/caption cho toàn pool → multimodal selection →
 canonical publish/validation trước khi video kế tiếp bắt đầu. Chỉ sau khi mọi
-video requested thành công, pipeline mới build FAISS, BM25, BGE-M3, neighbor
-mapping và segment/event metadata rồi commit tất cả thành một corpus generation.
+video requested thành công, pipeline mới build selected-keyframe FAISS, full
+dense-candidate FAISS, BM25, BGE-M3, neighbor mapping và segment/event metadata
+rồi commit tất cả thành một corpus generation.
 
 ```powershell
 python -m backend.app.pipelines.offline_pipeline `
@@ -375,15 +415,19 @@ Có thể đổi bằng `--neighbor-window-seconds`, `--segment-strategy` và
 `--segment-fixed-duration-seconds`.
 
 Dense workspace được cô lập tại `data/candidates/`, `data/dense_keyframes/` và
-`data/candidate_features/`, nên không thể lọt vào glob retrieval canonical.
+`data/candidate_features/`. Nó không bị glob nhầm vào selected-keyframe
+FAISS/BM25; corpus builder đọc explicit full-pool records/embeddings để tạo dense
+candidate bundle riêng.
 OCR được chạy trong một child process chỉ nạp Paddle để tránh xung đột DLL cuDNN
 giữa wheel Torch và Paddle trên Windows; parent pipeline vẫn dùng Torch/CUDA cho
 SigLIP2, object detection và caption như bình thường.
 Selected artifacts nằm tại `data/keyframes/`, `data/embeddings/` và
-`data/metadata/`; per-video/corpus reports nằm dưới `data/reports/offline/`.
+`data/metadata/`; dense candidate FAISS nằm dưới `data/indexes/`, còn dense
+metadata/map/manifest/report dùng các tên `siglip2_so400m_patch16_384_dense_*`.
+Per-video/corpus reports nằm dưới `data/reports/offline/`.
 `data/metadata/neighbors_all.jsonl` và `segments_all.jsonl` cũng được build từ
-đúng tập selected keyframe vừa hoàn tất, không scan artifact stale. FAISS, BM25,
-BGE-M3, neighbor và segment đều được build/validate trong staging; manifest
+đúng tập selected keyframe vừa hoàn tất, không scan artifact stale. Cả hai visual
+FAISS bundle, BM25, BGE-M3, neighbor và segment đều được build/validate trong staging; manifest
 corpus được publish cuối cùng. Nếu crash giữa lúc promote, runtime fail-closed
 thay vì trộn artifact thuộc hai generation khác nhau.
 
@@ -561,13 +605,13 @@ dưới đây lược bớt một số nested retrieval fields để tập trung
         {"event_index": 1, "result": {"video_id": "L10_V010", "frame_id": "KF_B", "frame_index": 203}}
       ],
       "lineage": [
-        {"event_index": 0, "video_id": "L10_V010", "original_frame_index": 101, "internal_frame_id": "KF_A", "source": "canonical_metadata"},
-        {"event_index": 1, "video_id": "L10_V010", "original_frame_index": 203, "internal_frame_id": "KF_B", "source": "canonical_metadata"}
+        {"event_index": 0, "video_id": "L10_V010", "original_frame_index": 101, "internal_frame_id": "KF_A", "source": "local_refinement"},
+        {"event_index": 1, "video_id": "L10_V010", "original_frame_index": 203, "internal_frame_id": "KF_B", "source": "local_refinement"}
       ],
-      "warnings": ["local_refinement_scorer_unavailable"]
+      "warnings": []
     }
   ],
-  "trace": {"refinement": {"scorer_available": false}},
+  "trace": {"refinement": {"scorer_available": true}},
   "latency_ms": 12.3
 }
 ```
@@ -815,9 +859,10 @@ với checkpoint thật, FFmpeg, Paddle và video dataset thật.
 - TRAKE trả ít hoặc không có hypothesis: xem `trace.event_retrieval`,
   `trace.video_gating` và warnings về missing original-frame lineage/full coverage;
   không sửa bằng cách suy frame từ timestamp hoặc filename.
-- `local_refinement_scorer_unavailable`: behavior production mặc định hiện tại;
-  coarse canonical frame vẫn hợp lệ và được giữ. Muốn refinement thật phải inject
-  một `LocalFrameScorer` đã kiểm chứng và bảo đảm video ở canonical video root.
+- `local_refinement_video_unavailable` hoặc `local_refinement_failed_coarse_fallback`:
+  production đã inject shared-SigLIP2 scorer, nhưng vẫn giữ coarse canonical frame
+  nếu video không resolve được dưới canonical video root, decode lỗi hoặc local
+  scoring/refinement không hoàn tất.
 
 ## Giới hạn hiện tại
 
@@ -828,10 +873,11 @@ với checkpoint thật, FFmpeg, Paddle và video dataset thật.
   lấy immutable commit từ manifest.
 - Không có ASR nên câu hỏi chỉ xuất hiện trong lời nói có thể giảm recall; đây là
   trade-off tài nguyên có chủ đích, không phải lỗi audio.
-- TRAKE parser/retrieval/alignment/ranking và fallback chạy được, nhưng local
-  semantic-boundary accuracy chưa được chứng minh trên full corpus. Scorer
-  production chưa được wire; heuristic `first_*`/`peak` chỉ được dùng khi caller
-  inject score sequence, không phải pose/contact/VLM verification.
+- TRAKE parser/retrieval/alignment/ranking và shared-SigLIP2 local scorer đã được
+  wire, nhưng semantic-boundary accuracy chưa được chứng minh trên full corpus.
+  Boundary heuristic `first_*`/`peak` dùng chuỗi cosine similarity; đây không phải
+  pose/contact model hay VLM verification, nên đừng nâng claim thành event-boundary
+  recognition đã được adjudicate.
 - Header TRAKE vẫn provisional vì chưa có official `sample_submission.csv` trong
   repository; đổi constant serializer khi format chính thức được cung cấp.
 - Backend hiện dùng được ở mức library/CLI nhưng **chưa production/E2E-certified**

@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from yaml.nodes import MappingNode, Node, ScalarNode
 
 from backend.app.services.retrieval.hybrid_search import HybridSearchConfig
+from backend.app.services.retrieval.advanced_rerank import AdvancedRerankWeights
 from backend.app.services.retrieval.rerank import RerankConfig, RerankWeights
 from backend.app.services.agent.query_expansion import QueryExpansionConfig
 
@@ -63,6 +64,35 @@ _CONFIG_SCHEMA = {
         "max_new_tokens": "positive integer",
         "dtype": "non-empty string",
         "quantization": "non-empty string",
+    },
+    "online": {
+        "coarse_to_dense_enabled": "boolean",
+        "dense_enabled": "boolean",
+        "dense_missing_behavior": "dense missing behavior string",
+        "coarse_top_n": "positive integer",
+        "dense_global_top_k": "positive integer",
+        "dense_rescue_clips": "non-negative integer",
+        "max_total_clips": "positive integer",
+        "dense_frames_per_clip": "positive integer",
+        "rrf_k": "positive integer",
+        "modality_hint_boost": "positive number",
+        "similarity_threshold": "unit interval number",
+        "temporal_window_seconds": "non-negative number",
+        "max_event_gap_seconds": "positive number",
+        "rrf_enabled": "boolean",
+        "cses_enabled": "boolean",
+        "deterministic_rerank_enabled": "boolean",
+        "learned_rerank_enabled": "boolean",
+        "vlm_rerank_enabled": "boolean",
+        "debug_enabled": "boolean",
+        "rerank_coarse_rrf_weight": "non-negative number",
+        "rerank_dense_visual_weight": "non-negative number",
+        "rerank_caption_weight": "non-negative number",
+        "rerank_ocr_weight": "non-negative number",
+        "rerank_objects_weight": "non-negative number",
+        "rerank_cses_gain_weight": "non-negative number",
+        "rerank_temporal_consistency_weight": "non-negative number",
+        "rerank_modality_alignment_weight": "non-negative number",
     },
     "trake": {
         "bge_dense_enabled": "boolean",
@@ -128,6 +158,110 @@ class TextIndexConfig:
     path: Path = Path("data/indexes/retrieval_text_index.json")
     default_top_k: int = 20
     max_top_k: int = 200
+
+
+@dataclass(frozen=True)
+class OnlineRetrievalConfig:
+    """Validated controls for the canonical KIS/AVS coarse-to-dense route."""
+
+    coarse_to_dense_enabled: bool = True
+    dense_enabled: bool = True
+    dense_missing_behavior: str = "fallback_sparse"
+    coarse_top_n: int = 50
+    dense_global_top_k: int = 300
+    dense_rescue_clips: int = 10
+    max_total_clips: int = 60
+    dense_frames_per_clip: int = 12
+    rrf_k: int = 60
+    modality_hint_boost: float = 1.5
+    similarity_threshold: float = 0.92
+    temporal_window_seconds: float = 2.0
+    max_event_gap_seconds: float = 180.0
+    rrf_enabled: bool = True
+    cses_enabled: bool = True
+    deterministic_rerank_enabled: bool = True
+    learned_rerank_enabled: bool = False
+    vlm_rerank_enabled: bool = False
+    debug_enabled: bool = False
+    rerank_weights: AdvancedRerankWeights = AdvancedRerankWeights()
+
+    def __post_init__(self) -> None:
+        for name in (
+            "coarse_top_n",
+            "dense_global_top_k",
+            "max_total_clips",
+            "dense_frames_per_clip",
+            "rrf_k",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"online.{name} must be a positive integer")
+        if (
+            isinstance(self.dense_rescue_clips, bool)
+            or not isinstance(self.dense_rescue_clips, int)
+            or self.dense_rescue_clips < 0
+        ):
+            raise ValueError("online.dense_rescue_clips must be a non-negative integer")
+        if self.max_total_clips < self.coarse_top_n:
+            raise ValueError("online.max_total_clips must be >= online.coarse_top_n")
+        for name in ("modality_hint_boost", "max_event_gap_seconds"):
+            raw_value = getattr(self, name)
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise ValueError(f"online.{name} must be a positive finite number")
+            value = float(raw_value)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"online.{name} must be a positive finite number")
+        if isinstance(self.temporal_window_seconds, bool) or not isinstance(
+            self.temporal_window_seconds,
+            (int, float),
+        ):
+            raise ValueError(
+                "online.temporal_window_seconds must be a non-negative finite number"
+            )
+        if (
+            not math.isfinite(float(self.temporal_window_seconds))
+            or float(self.temporal_window_seconds) < 0
+        ):
+            raise ValueError(
+                "online.temporal_window_seconds must be a non-negative finite number"
+            )
+        if isinstance(self.similarity_threshold, bool) or not isinstance(
+            self.similarity_threshold,
+            (int, float),
+        ):
+            raise ValueError("online.similarity_threshold must be between 0 and 1")
+        if (
+            not math.isfinite(float(self.similarity_threshold))
+            or not 0 <= float(self.similarity_threshold) <= 1
+        ):
+            raise ValueError("online.similarity_threshold must be between 0 and 1")
+        behavior = str(self.dense_missing_behavior).casefold().strip()
+        if behavior not in {"error", "fallback_sparse"}:
+            raise ValueError(
+                "online.dense_missing_behavior must be error or fallback_sparse"
+            )
+        object.__setattr__(self, "dense_missing_behavior", behavior)
+        for name in (
+            "coarse_to_dense_enabled",
+            "dense_enabled",
+            "rrf_enabled",
+            "cses_enabled",
+            "deterministic_rerank_enabled",
+            "learned_rerank_enabled",
+            "vlm_rerank_enabled",
+            "debug_enabled",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"online.{name} must be a boolean")
+        if not isinstance(self.rerank_weights, AdvancedRerankWeights):
+            raise TypeError("online.rerank_weights must be AdvancedRerankWeights")
+        values = tuple(float(value) for value in self.rerank_weights.__dict__.values())
+        if any(not math.isfinite(value) or value < 0 for value in values):
+            raise ValueError("online deterministic rerank weights must be non-negative")
+        if sum(values) <= 0:
+            raise ValueError(
+                "online deterministic rerank weights must include a positive value"
+            )
 
 
 @dataclass(frozen=True)
@@ -277,6 +411,7 @@ class RetrievalRuntimeConfig:
     rerank: RerankConfig = RerankConfig()
     text_index: TextIndexConfig = TextIndexConfig()
     query_expansion: QueryExpansionConfig = QueryExpansionConfig()
+    online: OnlineRetrievalConfig = OnlineRetrievalConfig()
     trake: TrakeConfig = TrakeConfig()
 
 
@@ -294,6 +429,7 @@ def load_retrieval_runtime_config(
     dedupe_raw = _section(raw, "dedupe")
     text_raw = _section(raw, "text_index")
     expansion_raw = _section(raw, "query_expansion")
+    online_raw = _section(raw, "online")
     trake_raw = _section(raw, "trake")
 
     hybrid = HybridSearchConfig(
@@ -437,6 +573,145 @@ def load_retrieval_runtime_config(
             os.getenv("RETRIEVAL_QUERY_EXPANSION_QUANTIZATION")
             or expansion_raw.get("quantization")
             or QueryExpansionConfig.quantization
+        ),
+    )
+    online = OnlineRetrievalConfig(
+        coarse_to_dense_enabled=_bool_env(
+            "RETRIEVAL_ONLINE_COARSE_TO_DENSE_ENABLED",
+            online_raw.get("coarse_to_dense_enabled"),
+            OnlineRetrievalConfig.coarse_to_dense_enabled,
+        ),
+        dense_enabled=_bool_env(
+            "RETRIEVAL_ONLINE_DENSE_ENABLED",
+            online_raw.get("dense_enabled"),
+            OnlineRetrievalConfig.dense_enabled,
+        ),
+        dense_missing_behavior=_string_env(
+            "RETRIEVAL_ONLINE_DENSE_MISSING_BEHAVIOR",
+            online_raw.get("dense_missing_behavior"),
+            OnlineRetrievalConfig.dense_missing_behavior,
+        ),
+        coarse_top_n=_int_env(
+            "RETRIEVAL_ONLINE_COARSE_TOP_N",
+            online_raw.get("coarse_top_n"),
+            OnlineRetrievalConfig.coarse_top_n,
+        ),
+        dense_global_top_k=_int_env(
+            "RETRIEVAL_ONLINE_DENSE_GLOBAL_TOP_K",
+            online_raw.get("dense_global_top_k"),
+            OnlineRetrievalConfig.dense_global_top_k,
+        ),
+        dense_rescue_clips=_non_negative_int_env(
+            "RETRIEVAL_ONLINE_DENSE_RESCUE_CLIPS",
+            online_raw.get("dense_rescue_clips"),
+            OnlineRetrievalConfig.dense_rescue_clips,
+        ),
+        max_total_clips=_int_env(
+            "RETRIEVAL_ONLINE_MAX_TOTAL_CLIPS",
+            online_raw.get("max_total_clips"),
+            OnlineRetrievalConfig.max_total_clips,
+        ),
+        dense_frames_per_clip=_int_env(
+            "RETRIEVAL_ONLINE_DENSE_FRAMES_PER_CLIP",
+            online_raw.get("dense_frames_per_clip"),
+            OnlineRetrievalConfig.dense_frames_per_clip,
+        ),
+        rrf_k=_int_env(
+            "RETRIEVAL_ONLINE_RRF_K",
+            online_raw.get("rrf_k"),
+            OnlineRetrievalConfig.rrf_k,
+        ),
+        modality_hint_boost=_float_env(
+            "RETRIEVAL_ONLINE_MODALITY_HINT_BOOST",
+            online_raw.get("modality_hint_boost"),
+            OnlineRetrievalConfig.modality_hint_boost,
+        ),
+        similarity_threshold=_float_env(
+            "RETRIEVAL_ONLINE_SIMILARITY_THRESHOLD",
+            online_raw.get("similarity_threshold"),
+            OnlineRetrievalConfig.similarity_threshold,
+        ),
+        temporal_window_seconds=_float_env(
+            "RETRIEVAL_ONLINE_TEMPORAL_WINDOW_SECONDS",
+            online_raw.get("temporal_window_seconds"),
+            OnlineRetrievalConfig.temporal_window_seconds,
+        ),
+        max_event_gap_seconds=_float_env(
+            "RETRIEVAL_ONLINE_MAX_EVENT_GAP_SECONDS",
+            online_raw.get("max_event_gap_seconds"),
+            OnlineRetrievalConfig.max_event_gap_seconds,
+        ),
+        rrf_enabled=_bool_env(
+            "RETRIEVAL_ONLINE_RRF_ENABLED",
+            online_raw.get("rrf_enabled"),
+            OnlineRetrievalConfig.rrf_enabled,
+        ),
+        cses_enabled=_bool_env(
+            "RETRIEVAL_ONLINE_CSES_ENABLED",
+            online_raw.get("cses_enabled"),
+            OnlineRetrievalConfig.cses_enabled,
+        ),
+        deterministic_rerank_enabled=_bool_env(
+            "RETRIEVAL_ONLINE_DETERMINISTIC_RERANK_ENABLED",
+            online_raw.get("deterministic_rerank_enabled"),
+            OnlineRetrievalConfig.deterministic_rerank_enabled,
+        ),
+        learned_rerank_enabled=_bool_env(
+            "RETRIEVAL_ONLINE_LEARNED_RERANK_ENABLED",
+            online_raw.get("learned_rerank_enabled"),
+            OnlineRetrievalConfig.learned_rerank_enabled,
+        ),
+        vlm_rerank_enabled=_bool_env(
+            "RETRIEVAL_ONLINE_VLM_RERANK_ENABLED",
+            online_raw.get("vlm_rerank_enabled"),
+            OnlineRetrievalConfig.vlm_rerank_enabled,
+        ),
+        debug_enabled=_bool_env(
+            "RETRIEVAL_ONLINE_DEBUG_ENABLED",
+            online_raw.get("debug_enabled"),
+            OnlineRetrievalConfig.debug_enabled,
+        ),
+        rerank_weights=AdvancedRerankWeights(
+            coarse_rrf=_float_env(
+                "RETRIEVAL_ONLINE_RERANK_COARSE_RRF_WEIGHT",
+                online_raw.get("rerank_coarse_rrf_weight"),
+                AdvancedRerankWeights.coarse_rrf,
+            ),
+            dense_visual=_float_env(
+                "RETRIEVAL_ONLINE_RERANK_DENSE_VISUAL_WEIGHT",
+                online_raw.get("rerank_dense_visual_weight"),
+                AdvancedRerankWeights.dense_visual,
+            ),
+            caption=_float_env(
+                "RETRIEVAL_ONLINE_RERANK_CAPTION_WEIGHT",
+                online_raw.get("rerank_caption_weight"),
+                AdvancedRerankWeights.caption,
+            ),
+            ocr=_float_env(
+                "RETRIEVAL_ONLINE_RERANK_OCR_WEIGHT",
+                online_raw.get("rerank_ocr_weight"),
+                AdvancedRerankWeights.ocr,
+            ),
+            objects=_float_env(
+                "RETRIEVAL_ONLINE_RERANK_OBJECTS_WEIGHT",
+                online_raw.get("rerank_objects_weight"),
+                AdvancedRerankWeights.objects,
+            ),
+            cses_gain=_float_env(
+                "RETRIEVAL_ONLINE_RERANK_CSES_GAIN_WEIGHT",
+                online_raw.get("rerank_cses_gain_weight"),
+                AdvancedRerankWeights.cses_gain,
+            ),
+            temporal_consistency=_float_env(
+                "RETRIEVAL_ONLINE_RERANK_TEMPORAL_CONSISTENCY_WEIGHT",
+                online_raw.get("rerank_temporal_consistency_weight"),
+                AdvancedRerankWeights.temporal_consistency,
+            ),
+            modality_alignment=_float_env(
+                "RETRIEVAL_ONLINE_RERANK_MODALITY_ALIGNMENT_WEIGHT",
+                online_raw.get("rerank_modality_alignment_weight"),
+                AdvancedRerankWeights.modality_alignment,
+            ),
         ),
     )
     trake = TrakeConfig(
@@ -603,6 +878,7 @@ def load_retrieval_runtime_config(
         ),
         text_index=text_index,
         query_expansion=query_expansion,
+        online=online,
         trake=trake,
     )
 
@@ -780,12 +1056,19 @@ def _matches_expected_type(value: Any, expected: str) -> bool:
         return is_number and value > 0
     if expected == "non-negative number":
         return is_number and value >= 0
+    if expected == "unit interval number":
+        return is_number and 0 <= value <= 1
     if expected == "boolean":
         return isinstance(value, bool)
     if expected == "non-empty string":
         return isinstance(value, str) and bool(value.strip())
     if expected == "rrf string":
         return isinstance(value, str) and value.casefold().strip() == "rrf"
+    if expected == "dense missing behavior string":
+        return isinstance(value, str) and value.casefold().strip() in {
+            "error",
+            "fallback_sparse",
+        }
     if expected == "positive integer list":
         return (
             isinstance(value, list)
