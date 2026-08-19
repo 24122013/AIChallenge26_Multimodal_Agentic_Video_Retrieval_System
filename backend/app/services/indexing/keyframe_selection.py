@@ -32,6 +32,33 @@ PHASE_COVERAGE = "coverage_fill"
 PHASE_MMR = "mmr"
 PHASE_TEMPORAL_REPAIR = "temporal_repair"
 DEFAULT_MAX_GAP_SECONDS = 2.0
+SELECTION_COMPUTE_DEVICES = {"auto", "cpu", "cuda"}
+CUDA_DEDUP_BLOCK_SIZE = 1024
+
+
+def _resolve_compute_device(requested: str) -> str:
+    """Resolve the optional similarity backend without silently ignoring CUDA."""
+
+    if requested not in SELECTION_COMPUTE_DEVICES:
+        raise ValueError("compute_device must be one of: auto, cpu, cuda")
+    if requested == "cpu":
+        return "cpu"
+    try:
+        import torch
+    except ImportError as exc:
+        if requested == "cuda":
+            raise RuntimeError(
+                "CUDA multimodal selection requires PyTorch, but torch is not installed"
+            ) from exc
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if requested == "cuda":
+        raise RuntimeError(
+            "CUDA multimodal selection was requested, but "
+            "torch.cuda.is_available() is false"
+        )
+    return "cpu"
 
 
 def _finite_real(value: object, name: str) -> float:
@@ -430,6 +457,7 @@ def select_keyframes(
     *,
     video_duration: float,
     config: SelectionConfig,
+    compute_device: str = "cpu",
 ) -> SelectionResult:
     """Select keyframes while preserving detected events and temporal coverage.
 
@@ -440,6 +468,7 @@ def select_keyframes(
     mathematically infeasible.
     """
 
+    compute_device = _resolve_compute_device(compute_device)
     video_duration = _finite_real(video_duration, "video_duration")
     if video_duration < 0:
         raise ValueError("video_duration must be >= 0")
@@ -503,8 +532,19 @@ def select_keyframes(
     max_gap_before = _max_gap(state.selected.values(), video_duration)
     dedup_removed: tuple[dict[str, object], ...] = ()
     if config.enable_event_aware_dedup:
-        soft_stop_reason = _fill_mmr(state, ordered, config)
-        dedup_removed = _deduplicate_selected(state, ordered, events, config)
+        soft_stop_reason = _fill_mmr(
+            state,
+            ordered,
+            config,
+            compute_device=compute_device,
+        )
+        dedup_removed = _deduplicate_selected(
+            state,
+            ordered,
+            events,
+            config,
+            compute_device=compute_device,
+        )
         coverage_exhausted = not _repair_temporal_coverage(
             state,
             ordered,
@@ -574,7 +614,12 @@ def select_keyframes(
 
     hard_constraints_satisfied = not unsatisfied and not violations
     if hard_constraints_satisfied and not config.enable_event_aware_dedup:
-        soft_stop_reason = _fill_mmr(state, ordered, config)
+        soft_stop_reason = _fill_mmr(
+            state,
+            ordered,
+            config,
+            compute_device=compute_device,
+        )
 
     unsatisfied = _unsatisfied_event_ids(state.selected, events)
     violations = _violating_gaps(
@@ -881,6 +926,8 @@ def _deduplicate_selected(
     candidates: Sequence[SelectionCandidate],
     events: Sequence[ProtectedEvent],
     config: SelectionConfig,
+    *,
+    compute_device: str = "cpu",
 ) -> tuple[dict[str, object], ...]:
     """Remove visual duplicates without losing the last event representative."""
     selected = tuple(state.selected.values())
@@ -900,32 +947,66 @@ def _deduplicate_selected(
         if left_root != right_root:
             parent[max(left_root, right_root)] = min(left_root, right_root)
 
-    normalized: dict[int, np.ndarray] = {}
+    duplicate_group_representative: dict[str, int] = {}
     for index, candidate in enumerate(selected):
-        if candidate.semantic_embedding:
+        group = candidate.duplicate_group
+        if not group:
+            continue
+        representative = duplicate_group_representative.setdefault(group, index)
+        union(representative, index)
+
+    embedded = [
+        (index, candidate)
+        for index, candidate in enumerate(selected)
+        if candidate.semantic_embedding
+    ]
+    if compute_device == "cuda" and embedded:
+        import torch
+
+        original_indices = [index for index, _candidate in embedded]
+        matrix = torch.as_tensor(
+            [candidate.semantic_embedding for _index, candidate in embedded],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        matrix = torch.nn.functional.normalize(matrix, p=2, dim=1)
+        timestamps = torch.as_tensor(
+            [candidate.timestamp for _index, candidate in embedded],
+            dtype=torch.float64,
+            device="cuda",
+        )
+        total = len(embedded)
+        for start in range(0, total, CUDA_DEDUP_BLOCK_SIZE):
+            stop = min(start + CUDA_DEDUP_BLOCK_SIZE, total)
+            similarities = matrix[start:stop] @ matrix.T
+            temporal = torch.abs(timestamps[start:stop, None] - timestamps[None, :])
+            matches = (
+                (similarities >= config.dedup_similarity_threshold)
+                & (temporal <= config.dedup_temporal_window_seconds)
+            )
+            row_ids = torch.arange(start, stop, device="cuda")[:, None]
+            col_ids = torch.arange(total, device="cuda")[None, :]
+            pairs = torch.nonzero(matches & (col_ids > row_ids), as_tuple=False)
+            for local_left, right in pairs.cpu().tolist():
+                left = start + int(local_left)
+                union(original_indices[left], original_indices[int(right)])
+    elif embedded:
+        normalized: dict[int, np.ndarray] = {}
+        for index, candidate in embedded:
             vector = np.asarray(candidate.semantic_embedding, dtype=np.float64)
             normalized[index] = vector / np.linalg.norm(vector)
-    for left in range(len(selected)):
-        for right in range(left + 1, len(selected)):
-            first = selected[left]
-            second = selected[right]
-            same_group = bool(
-                first.duplicate_group
-                and first.duplicate_group == second.duplicate_group
-            )
-            semantic_duplicate = False
-            if (
-                left in normalized
-                and right in normalized
-                and abs(first.timestamp - second.timestamp)
-                <= config.dedup_temporal_window_seconds
-            ):
-                semantic_duplicate = (
-                    float(np.dot(normalized[left], normalized[right]))
+        normalized_indices = tuple(normalized)
+        for offset, left in enumerate(normalized_indices):
+            for right in normalized_indices[offset + 1 :]:
+                first = selected[left]
+                second = selected[right]
+                if (
+                    abs(first.timestamp - second.timestamp)
+                    <= config.dedup_temporal_window_seconds
+                    and float(np.dot(normalized[left], normalized[right]))
                     >= config.dedup_similarity_threshold
-                )
-            if same_group or semantic_duplicate:
-                union(left, right)
+                ):
+                    union(left, right)
 
     components: dict[int, list[SelectionCandidate]] = {}
     for index, candidate in enumerate(selected):
@@ -1150,7 +1231,12 @@ def _fill_mmr(
     state: _SelectionState,
     candidates: Sequence[SelectionCandidate],
     config: SelectionConfig,
+    *,
+    compute_device: str = "cpu",
 ) -> str:
+    if compute_device == "cuda":
+        return _fill_mmr_cuda(state, candidates, config)
+
     target = config.target_keyframes
     if target is None:
         return "target_not_configured"
@@ -1240,6 +1326,136 @@ def _fill_mmr(
                 np.maximum(max_similarity, similarities, out=max_similarity)
             else:
                 max_similarity[:] = similarities
+                has_selected_embedding = True
+
+    if len(state.selected) >= target:
+        return "target_reached"
+    if _cap_reached(state, config):
+        return "hard_cap_reached"
+    return "candidate_pool_exhausted"
+
+
+def _fill_mmr_cuda(
+    state: _SelectionState,
+    candidates: Sequence[SelectionCandidate],
+    config: SelectionConfig,
+) -> str:
+    """Run the similarity-heavy MMR loop on CUDA while preserving tie order."""
+
+    import torch
+
+    target = config.target_keyframes
+    if target is None:
+        return "target_not_configured"
+    if len(state.selected) >= target:
+        return "target_reached"
+
+    candidate_index_by_id = {
+        candidate.candidate_id: index for index, candidate in enumerate(candidates)
+    }
+    embedded_candidates = [
+        candidate for candidate in candidates if candidate.semantic_embedding
+    ]
+    embedding_row_by_id = {
+        candidate.candidate_id: row
+        for row, candidate in enumerate(embedded_candidates)
+    }
+    embedded_candidate_indices = torch.as_tensor(
+        [candidate_index_by_id[candidate.candidate_id] for candidate in embedded_candidates],
+        dtype=torch.long,
+        device="cuda",
+    )
+    embedding_matrix = None
+    max_similarity = None
+    has_selected_embedding = False
+    if embedded_candidates:
+        embedding_matrix = torch.as_tensor(
+            [candidate.semantic_embedding for candidate in embedded_candidates],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        embedding_matrix = torch.nn.functional.normalize(embedding_matrix, p=2, dim=1)
+        max_similarity = torch.full(
+            (len(embedded_candidates),),
+            -torch.inf,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        for selected in state.selected.values():
+            row = embedding_row_by_id.get(selected.candidate_id)
+            if row is None:
+                continue
+            similarities = torch.clamp(embedding_matrix @ embedding_matrix[row], -1.0, 1.0)
+            if has_selected_embedding:
+                torch.maximum(max_similarity, similarities, out=max_similarity)
+            else:
+                max_similarity.copy_(similarities)
+                has_selected_embedding = True
+
+    selected_mask = torch.zeros(len(candidates), dtype=torch.bool, device="cuda")
+    for candidate_id in state.selected:
+        selected_mask[candidate_index_by_id[candidate_id]] = True
+    importance = torch.as_tensor(
+        [candidate.importance_score for candidate in candidates],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    duplicate_indices: dict[str, list[int]] = {}
+    for index, candidate in enumerate(candidates):
+        if candidate.duplicate_group:
+            duplicate_indices.setdefault(candidate.duplicate_group, []).append(index)
+    selected_duplicate_groups = {
+        candidate.duplicate_group
+        for candidate in state.selected.values()
+        if candidate.duplicate_group
+    }
+    duplicate_novelty_mask = torch.zeros(
+        len(candidates), dtype=torch.bool, device="cuda"
+    )
+    for group in selected_duplicate_groups:
+        duplicate_novelty_mask[duplicate_indices.get(group, ())] = True
+
+    weight_sum = config.importance_weight + config.novelty_weight
+    while len(state.selected) < target and not _cap_reached(state, config):
+        if bool(torch.all(selected_mask).item()):
+            return "candidate_pool_exhausted"
+        novelty = torch.zeros(len(candidates), dtype=torch.float32, device="cuda")
+        if embedded_candidates:
+            if has_selected_embedding:
+                assert max_similarity is not None
+                embedded_novelty = torch.clamp((1.0 - max_similarity) / 2.0, 0.0, 1.0)
+            else:
+                embedded_novelty = torch.ones(
+                    len(embedded_candidates), dtype=torch.float32, device="cuda"
+                )
+            novelty[embedded_candidate_indices] = embedded_novelty
+        novelty.masked_fill_(duplicate_novelty_mask, 0.0)
+        scores = (
+            config.importance_weight * importance
+            + config.novelty_weight * novelty
+        ) / weight_sum
+        scores.masked_fill_(selected_mask, -torch.inf)
+        chosen_index = int(torch.argmax(scores).item())
+        score = float(scores[chosen_index].item())
+        if not math.isfinite(score):
+            return "candidate_pool_exhausted"
+        chosen = candidates[chosen_index]
+        state.add(chosen, phase=PHASE_MMR, reason="diversity_mmr", score=score)
+        selected_mask[chosen_index] = True
+        if chosen.duplicate_group:
+            selected_duplicate_groups.add(chosen.duplicate_group)
+            duplicate_novelty_mask[
+                duplicate_indices.get(chosen.duplicate_group, ())
+            ] = True
+        row = embedding_row_by_id.get(chosen.candidate_id)
+        if row is not None:
+            assert embedding_matrix is not None
+            assert max_similarity is not None
+            similarities = torch.clamp(embedding_matrix @ embedding_matrix[row], -1.0, 1.0)
+            if has_selected_embedding:
+                torch.maximum(max_similarity, similarities, out=max_similarity)
+            else:
+                max_similarity.copy_(similarities)
                 has_selected_embedding = True
 
     if len(state.selected) >= target:

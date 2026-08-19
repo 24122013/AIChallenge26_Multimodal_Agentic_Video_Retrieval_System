@@ -158,6 +158,7 @@ def run_multimodal_keyframe_pipeline(
     selection_config: SelectionConfig,
     adapter_config: FeatureAdapterConfig | None = None,
     allow_partial_features: bool = False,
+    selection_device: str = "cpu",
 ) -> MultimodalKeyframePipelineResult:
     """Select and materialize one video's final Phase 3 in-memory artifacts.
 
@@ -173,6 +174,8 @@ def run_multimodal_keyframe_pipeline(
         raise TypeError("adapter_config must be a FeatureAdapterConfig or None")
     if not isinstance(allow_partial_features, bool):
         raise TypeError("allow_partial_features must be a boolean")
+    if selection_device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("selection_device must be one of: auto, cpu, cuda")
 
     duration = _finite_non_negative(video_duration, "video_duration")
     identities = _normalize_candidate_records(candidates)
@@ -229,6 +232,7 @@ def run_multimodal_keyframe_pipeline(
         adapter_result.protected_events,
         video_duration=duration,
         config=selection_config,
+        compute_device=selection_device,
     )
     audit_events = adapter_result.protected_events
     if selection_config.protect_video_endpoints:

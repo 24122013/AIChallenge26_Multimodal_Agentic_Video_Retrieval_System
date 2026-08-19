@@ -609,7 +609,59 @@ class KeyframeSelectionTest(unittest.TestCase):
         self.assertEqual(len(first_ids), len(set(first_ids)))
         self.assertEqual(sorted(item.selection_rank for item in first.selected), [1, 2, 3])
 
+    def test_cuda_similarity_backend_matches_cpu_selection(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed")
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+        values = (
+            candidate("a", 1.0, importance=0.95, embedding=(1.0, 0.0, 0.0)),
+            candidate("b", 2.0, importance=0.80, embedding=(0.99, 0.01, 0.0)),
+            candidate("c", 3.0, importance=0.75, embedding=(0.0, 1.0, 0.0)),
+            candidate("d", 4.0, importance=0.70, embedding=(0.0, 0.0, 1.0)),
+            candidate("e", 5.0, importance=0.65, embedding=(0.7, 0.7, 0.0)),
+        )
+        config = SelectionConfig(
+            max_gap_seconds=10.0,
+            target_keyframes=4,
+            protect_each_shot=False,
+            enable_event_aware_dedup=True,
+            dedup_similarity_threshold=0.98,
+            dedup_temporal_window_seconds=5.0,
+        )
+
+        cpu = select_keyframes(
+            values,
+            (),
+            video_duration=6.0,
+            config=config,
+            compute_device="cpu",
+        )
+        cuda = select_keyframes(
+            values,
+            (),
+            video_duration=6.0,
+            config=config,
+            compute_device="cuda",
+        )
+
+        self.assertEqual(
+            [item.candidate.candidate_id for item in cuda.selected],
+            [item.candidate.candidate_id for item in cpu.selected],
+        )
+        self.assertEqual(cuda.dedup_removed, cpu.dedup_removed)
+
     def test_invalid_candidates_events_and_embeddings_fail_fast(self) -> None:
+        with self.assertRaisesRegex(ValueError, "compute_device"):
+            select_keyframes(
+                (),
+                (),
+                video_duration=0.0,
+                config=SelectionConfig(max_gap_seconds=3.0),
+                compute_device="tpu",
+            )
         with self.assertRaisesRegex(ValueError, "candidate_id values must be unique"):
             select_keyframes(
                 (candidate("same", 1.0), candidate("same", 2.0)),

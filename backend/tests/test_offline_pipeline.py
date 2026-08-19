@@ -339,6 +339,7 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 "run_multimodal_keyframe_pipeline",
                 return_value=selected,
             ) as selector,
+            patch.object(pipeline, "_write_selection_checkpoint") as checkpoint_writer,
         ):
             result, contract = pipeline._run_multimodal_selection(
                 shots,
@@ -366,6 +367,78 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 expected_ids,
             )
         self.assertFalse(kwargs["allow_partial_features"])
+        self.assertEqual(kwargs["selection_device"], "cpu")
+        checkpoint_writer.assert_called_once_with(
+            selected,
+            {"contract_sha256": "selection-contract"},
+            pipeline.PerVideoPaths.from_config(video_id, self.config),
+        )
+
+    def test_selection_checkpoint_roundtrip_skips_reselection_and_detects_corruption(
+        self,
+    ) -> None:
+        video_id = "video_selection_checkpoint"
+        materialized = self._materialized_stage(video_id, 3)
+        features = self._feature_bundle(video_id, 3)
+        paths = pipeline.PerVideoPaths.from_config(video_id, self.config)
+        contract = pipeline._stage_contract(
+            pipeline.STAGE_SELECTION,
+            fixture=True,
+            selection_compute_device="cpu",
+        )
+        selected_id = materialized.records[0]["candidate_id"]
+        report = {
+            "video_id": video_id,
+            "candidate_count": len(materialized.records),
+            "selected_count": 1,
+            "guarantees": {"constraints_satisfied": True},
+            "candidate_ledger": list(materialized.records),
+            "event_ledger": [],
+        }
+        result = SimpleNamespace(
+            video_id=video_id,
+            final_records=(materialized.records[0],),
+            final_embeddings=np.ascontiguousarray(features.embeddings[:1]),
+            final_embedding_records=(features.embedding_records[0],),
+            final_caption_records=(features.caption_records[0],),
+            final_ocr_records=(features.ocr_records[0],),
+            final_object_records=(features.object_records[0],),
+            candidate_ledger=materialized.records,
+            event_ledger=(),
+            to_report=lambda: report,
+        )
+
+        pipeline._write_selection_checkpoint(result, contract, paths)
+        loaded = pipeline._load_selection_checkpoint(contract, materialized, paths)
+
+        self.assertEqual(loaded.video_id, video_id)
+        self.assertEqual(
+            [record["candidate_id"] for record in loaded.final_records],
+            [selected_id],
+        )
+        np.testing.assert_array_equal(loaded.final_embeddings, result.final_embeddings)
+        with (
+            patch.object(pipeline, "_selection_contract", return_value=contract),
+            patch.object(
+                pipeline,
+                "run_multimodal_keyframe_pipeline",
+                side_effect=AssertionError("valid checkpoint must skip selection"),
+            ) as selector,
+        ):
+            resumed, resumed_contract = pipeline._run_multimodal_selection(
+                self._shot_stage(video_id, 3),
+                materialized,
+                features,
+                self.config,
+                paths,
+            )
+        selector.assert_not_called()
+        self.assertEqual(resumed.final_records, loaded.final_records)
+        self.assertEqual(resumed_contract, contract)
+
+        paths.selection_checkpoint_embeddings.write_bytes(b"corrupt")
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            pipeline._load_selection_checkpoint(contract, materialized, paths)
 
     def test_selector_rejects_a_missing_dense_feature_before_selection(self) -> None:
         video_id = "video_misaligned"
@@ -661,6 +734,8 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             "0b03b6f15a4a211370fb204aee4e7dd48887ea37",
         )
         self.assertEqual(quick.caption_task_prompt, "<MORE_DETAILED_CAPTION>")
+        self.assertEqual(quick.device, "cuda")
+        self.assertEqual(quick.shot_device, "cuda")
 
         video = self._video("video_A")
         artifact = self._video_artifacts(video)

@@ -154,14 +154,14 @@ class OfflinePipelineConfig:
     """Runtime and artifact policy for the canonical offline pipeline."""
 
     output_dir: Path = Path("data")
-    device: str = "auto"
+    device: str = "cuda"
     resume: bool = True
     force: bool = False
     allow_partial_corpus: bool = False
     build_corpus: bool = True
 
     shot_threshold: float = 0.5
-    shot_device: str = "auto"
+    shot_device: str = "cuda"
     dense_interval_sec: float = DEFAULT_INTERVAL_SEC
     boundary_guard_sec: float = DEFAULT_BOUNDARY_GUARD_SEC
     tiny_shot_max_sec: float = DEFAULT_TINY_SHOT_MAX_SEC
@@ -353,6 +353,8 @@ class PerVideoPaths:
     candidate_ledger: Path
     event_ledger: Path
     selection_report: Path
+    selection_checkpoint: Path
+    selection_checkpoint_embeddings: Path
     validation_report: Path
     completion_report: Path
     state_manifest: Path
@@ -400,6 +402,10 @@ class PerVideoPaths:
             candidate_ledger=report_dir / "candidate_ledger.jsonl",
             event_ledger=report_dir / "protected_events.jsonl",
             selection_report=report_dir / "selection_report.json",
+            selection_checkpoint=report_dir / "selection_checkpoint.json",
+            selection_checkpoint_embeddings=(
+                report_dir / "selection_checkpoint_embeddings.npy"
+            ),
             validation_report=report_dir / "validation.json",
             completion_report=metadata / f"keyframes_{video_id}_extract_report.json",
             state_manifest=report_dir / "state.json",
@@ -435,6 +441,25 @@ class DenseFeatureArtifacts:
     ocr_records: tuple[dict[str, Any], ...]
     object_records: tuple[dict[str, Any], ...]
     contract_sha256: str
+
+
+@dataclass(frozen=True)
+class SelectionStageArtifacts:
+    """Minimal reloadable selection result used by canonical persistence."""
+
+    video_id: str
+    final_records: tuple[dict[str, Any], ...]
+    final_embeddings: np.ndarray
+    final_embedding_records: tuple[dict[str, Any], ...]
+    final_ocr_records: tuple[dict[str, Any], ...]
+    final_object_records: tuple[dict[str, Any], ...]
+    final_caption_records: tuple[dict[str, Any], ...]
+    candidate_ledger: tuple[dict[str, Any], ...]
+    event_ledger: tuple[dict[str, Any], ...]
+    report: Mapping[str, Any]
+
+    def to_report(self) -> dict[str, Any]:
+        return dict(self.report)
 
 
 @dataclass(frozen=True)
@@ -2117,6 +2142,134 @@ def _selection_contract(
         dense_ocr_sha256=_sha256_file(paths.dense_ocr),
         dense_objects_sha256=_sha256_file(paths.dense_objects),
         selection_config=selection_config,
+        selection_compute_device=config.device,
+    )
+
+
+def _selection_records(
+    checkpoint: Mapping[str, Any],
+    field_name: str,
+) -> tuple[dict[str, Any], ...]:
+    value = checkpoint.get(field_name)
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError(f"selection checkpoint has invalid {field_name}")
+    return tuple(dict(item) for item in value)
+
+
+def _write_selection_checkpoint(
+    result: MultimodalKeyframePipelineResult | SelectionStageArtifacts,
+    contract: Mapping[str, Any],
+    paths: PerVideoPaths,
+) -> None:
+    """Atomically commit selection output before canonical publication starts."""
+
+    _atomic_save_npy(paths.selection_checkpoint_embeddings, result.final_embeddings)
+    report = result.to_report()
+    checkpoint = _with_contract(
+        {
+            "status": "passed",
+            "video_id": result.video_id,
+            "selection_report": report,
+            "final_records": list(result.final_records),
+            "final_embedding_records": list(result.final_embedding_records),
+            "final_caption_records": list(result.final_caption_records),
+            "final_ocr_records": list(result.final_ocr_records),
+            "final_object_records": list(result.final_object_records),
+            "embeddings_sha256": _sha256_file(paths.selection_checkpoint_embeddings),
+            "embedding_shape": list(result.final_embeddings.shape),
+        },
+        contract,
+    )
+    _atomic_write_json(paths.selection_checkpoint, checkpoint)
+
+
+def _load_selection_checkpoint(
+    contract: Mapping[str, Any],
+    materialized: MaterializedStageResult,
+    paths: PerVideoPaths,
+) -> SelectionStageArtifacts:
+    checkpoint = _read_json(paths.selection_checkpoint)
+    if checkpoint.get("status") != "passed":
+        raise ValueError("selection checkpoint is not passed")
+    if not _contract_matches(checkpoint, contract):
+        raise ValueError("selection checkpoint contract changed")
+    if checkpoint.get("video_id") != paths.video_id:
+        raise ValueError("selection checkpoint video_id changed")
+    if not paths.selection_checkpoint_embeddings.is_file():
+        raise FileNotFoundError("selection checkpoint embeddings are missing")
+    if checkpoint.get("embeddings_sha256") != _sha256_file(
+        paths.selection_checkpoint_embeddings
+    ):
+        raise ValueError("selection checkpoint embedding checksum changed")
+
+    report = checkpoint.get("selection_report")
+    if not isinstance(report, dict):
+        raise ValueError("selection checkpoint report is invalid")
+    guarantees = report.get("guarantees")
+    if not isinstance(guarantees, dict) or guarantees.get("constraints_satisfied") is not True:
+        raise ValueError("selection checkpoint hard guarantees are not satisfied")
+    expected_ids = _candidate_ids(materialized.records)
+    if int(report.get("candidate_count", -1)) != len(expected_ids):
+        raise ValueError("selection checkpoint candidate count changed")
+
+    final_records = _selection_records(checkpoint, "final_records")
+    final_embedding_records = _selection_records(
+        checkpoint, "final_embedding_records"
+    )
+    final_caption_records = _selection_records(checkpoint, "final_caption_records")
+    final_ocr_records = _selection_records(checkpoint, "final_ocr_records")
+    final_object_records = _selection_records(checkpoint, "final_object_records")
+    if not final_records:
+        raise ValueError("selection checkpoint has no final keyframes")
+    selected_ids = _candidate_ids(final_records)
+    if len(set(selected_ids)) != len(selected_ids) or not set(selected_ids).issubset(
+        expected_ids
+    ):
+        raise ValueError("selection checkpoint selected IDs are invalid")
+    if int(report.get("selected_count", -1)) != len(selected_ids):
+        raise ValueError("selection checkpoint selected count changed")
+    for label, records in (
+        ("embedding", final_embedding_records),
+        ("caption", final_caption_records),
+        ("OCR", final_ocr_records),
+        ("object", final_object_records),
+    ):
+        record_ids = _candidate_ids(records)
+        if len(record_ids) != len(selected_ids) or set(record_ids) != set(selected_ids):
+            raise ValueError(f"selection checkpoint {label} records are misaligned")
+
+    embeddings = np.load(paths.selection_checkpoint_embeddings, allow_pickle=False)
+    if list(embeddings.shape) != checkpoint.get("embedding_shape"):
+        raise ValueError("selection checkpoint embedding shape changed")
+    validate_embedding_artifacts(embeddings, list(final_embedding_records))
+    if _candidate_ids(final_embedding_records) != selected_ids:
+        raise ValueError("selection checkpoint embedding order changed")
+
+    candidate_ledger_value = report.get("candidate_ledger")
+    event_ledger_value = report.get("event_ledger")
+    if not isinstance(candidate_ledger_value, list) or any(
+        not isinstance(item, dict) for item in candidate_ledger_value
+    ):
+        raise ValueError("selection checkpoint candidate ledger is invalid")
+    if not isinstance(event_ledger_value, list) or any(
+        not isinstance(item, dict) for item in event_ledger_value
+    ):
+        raise ValueError("selection checkpoint event ledger is invalid")
+    candidate_ledger = tuple(dict(item) for item in candidate_ledger_value)
+    if _candidate_ids(candidate_ledger) != expected_ids:
+        raise ValueError("selection checkpoint candidate ledger is incomplete")
+
+    return SelectionStageArtifacts(
+        video_id=paths.video_id,
+        final_records=final_records,
+        final_embeddings=embeddings,
+        final_embedding_records=final_embedding_records,
+        final_ocr_records=final_ocr_records,
+        final_object_records=final_object_records,
+        final_caption_records=final_caption_records,
+        candidate_ledger=candidate_ledger,
+        event_ledger=tuple(dict(item) for item in event_ledger_value),
+        report=report,
     )
 
 
@@ -2126,8 +2279,29 @@ def _run_multimodal_selection(
     features: DenseFeatureArtifacts,
     config: OfflinePipelineConfig,
     paths: PerVideoPaths,
-) -> tuple[MultimodalKeyframePipelineResult, dict[str, object]]:
+) -> tuple[
+    MultimodalKeyframePipelineResult | SelectionStageArtifacts,
+    dict[str, object],
+]:
     contract = _selection_contract(paths, materialized, features, config)
+    if config.resume and not config.force:
+        try:
+            checkpoint = _load_selection_checkpoint(contract, materialized, paths)
+        except CHECKPOINT_INVALID_ERRORS as exc:
+            _stage_log(
+                paths.video_id,
+                STAGE_SELECTION,
+                "RUN",
+                f"checkpoint invalid: {exc}",
+            )
+        else:
+            _stage_log(
+                paths.video_id,
+                STAGE_SELECTION,
+                "SKIP",
+                f"checkpoint selected={len(checkpoint.final_records)}",
+            )
+            return checkpoint, contract
     _stage_log(
         paths.video_id,
         STAGE_SELECTION,
@@ -2166,6 +2340,7 @@ def _run_multimodal_selection(
         video_duration=shot_stage.info.duration,
         selection_config=config.selection_config(),
         allow_partial_features=False,
+        selection_device=config.device,
     )
     if not result.final_records:
         raise RuntimeError("multimodal selection returned no final keyframes")
@@ -2173,6 +2348,7 @@ def _run_multimodal_selection(
         raise RuntimeError("multimodal selection failed its independent guarantee audit")
     if len(result.candidate_ledger) != len(materialized.records):
         raise RuntimeError("selector candidate ledger does not cover the full dense pool")
+    _write_selection_checkpoint(result, contract, paths)
     return result, contract
 
 
@@ -2235,7 +2411,7 @@ def _rebase_selected_feature_record(
 
 def _persist_selected_artifacts(
     video_path: Path,
-    result: MultimodalKeyframePipelineResult,
+    result: MultimodalKeyframePipelineResult | SelectionStageArtifacts,
     selection_contract: Mapping[str, Any],
     paths: PerVideoPaths,
     *,
@@ -4701,7 +4877,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the canonical event-aware dedup pass.",
     )
 
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="cuda",
+        help=(
+            "Compute device for multimodal inference and selection. Defaults to "
+            "CUDA and fails fast when CUDA is unavailable; use cpu/auto only as "
+            "an explicit override."
+        ),
+    )
     parser.add_argument(
         "--batch-size",
         "--siglip-batch-size",

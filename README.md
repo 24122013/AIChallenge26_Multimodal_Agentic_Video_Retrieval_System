@@ -38,7 +38,7 @@ Nếu máy đã có môi trường và model cache, E2E tối thiểu là:
   --video-dir data\raw\video `
   --video-glob *.mp4 `
   --output-dir data `
-  --device auto `
+  --device cuda `
   --build-corpus `
   --resume `
   --verbose
@@ -231,7 +231,7 @@ Thay `L01_V001.mp4` bằng file thật:
 .\.venv\Scripts\python.exe -B -m backend.app.pipelines.offline_pipeline `
   --video-path data\raw\video\L01_V001.mp4 `
   --output-dir data `
-  --device auto `
+  --device cuda `
   --skip-corpus `
   --resume `
   --verbose
@@ -267,13 +267,20 @@ $videoId = "L01_V001"
 | 2. Dense candidate generation | Sample theo thời gian, thêm shot anchor/boundary guard | `candidate_plan.jsonl`, `candidate_report.json` | `(Get-Content "data\reports\offline\$videoId\candidate_plan.jsonl" \| Measure-Object -Line).Lines` |
 | 3. Materialization | Decode toàn bộ candidate thành JPEG và giữ identity/order | `data/candidates/<video_id>.jsonl`, `data/dense_keyframes/<video_id>/` | `(Get-Content "data\candidates\$videoId.jsonl" \| Measure-Object -Line).Lines` |
 | 4. Dense features | Chạy SigLIP2, Florence-2 caption, PP-OCRv5 và YOLOE trên full candidate pool | `data/candidate_features/<video_id>/` | `Get-ChildItem "data\candidate_features\$videoId"` |
-| 5. Multimodal selection | Protected-event, gap repair, dedup và MMR để chọn keyframe | `selection_report.json`, `candidate_ledger.jsonl` | `Get-Content "data\reports\offline\$videoId\selection_report.json" -Raw \| ConvertFrom-Json \| Select-Object status, selected_count` |
+| 5. Multimodal selection | Protected-event, gap repair, dedup và MMR; similarity/MMR/dedup chạy CUDA theo `--device` | `selection_checkpoint.json`, `selection_checkpoint_embeddings.npy`, `selection_report.json`, `candidate_ledger.jsonl` | `Get-Content "data\reports\offline\$videoId\selection_checkpoint.json" -Raw \| ConvertFrom-Json \| Select-Object status, video_id` |
 | 6. Canonical persistence | Ghi selected JPEG, metadata, caption/OCR/object và embedding | `data/keyframes/<video_id>/`, `data/metadata/keyframes_<video_id>.jsonl` | `(Get-Content "data\metadata\keyframes_$videoId.jsonl" \| Measure-Object -Line).Lines` |
 | 7. Validation/commit | Kiểm identity, count, checksum và chỉ ghi commit marker cuối cùng khi pass | `data/metadata/keyframes_<video_id>_extract_report.json` | `Get-Content "data\metadata\keyframes_${videoId}_extract_report.json" -Raw \| ConvertFrom-Json \| Select-Object status, dense_candidate_count, selected_count` |
 
 File có mặt không tự động đồng nghĩa stage hợp lệ. Khi chạy lại với `--resume`,
 pipeline validate contract/checksum rồi mới log `[SKIP]`; checkpoint sai sẽ bị
 chạy lại.
+
+Offline pipeline mặc định dùng `cuda` và fail-fast nếu PyTorch không thấy CUDA;
+nó không còn âm thầm rơi xuống CPU. Multimodal selection checkpoint được commit
+ngay sau khi chọn xong, trước canonical persistence, nên lỗi ở bước copy/publish
+sau đó sẽ resume từ kết quả selection đã kiểm checksum. Phần similarity của MMR
+và event-aware dedup chạy trên GPU; các rule/constraint tuần tự vẫn là Python
+control flow trên CPU.
 
 ### 6.3. Build full dataset và publish corpus
 
@@ -284,7 +291,7 @@ Sau khi smoke một video ổn, chạy toàn bộ thư mục:
   --video-dir data\raw\video `
   --video-glob *.mp4 `
   --output-dir data `
-  --device auto `
+  --device cuda `
   --build-corpus `
   --resume `
   --verbose
