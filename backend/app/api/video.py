@@ -47,7 +47,7 @@ try:  # pragma: no cover - depends on optional API runtime.
             raise HTTPException(status_code=404, detail="Frame neighbors not found")
         return metadata[frame_id]
 
-    # GET /api/video/stream/{video_name} — HTTP Range streaming
+    # GET /api/video/stream/{video_name} - HTTP Range streaming
     @video_router.get("/stream/{video_name}")
     def stream_video(video_name: str, range: Optional[str] = Header(None)):
         """Streams local video files using HTTP Range Requests (Status 206)."""
@@ -62,8 +62,8 @@ try:  # pragma: no cover - depends on optional API runtime.
                 'Accept-Ranges': 'bytes'
             }
             return StreamingResponse(
-                generate_full_video(), 
-                status_code=200, 
+                generate_full_video(file_path=file_path), 
+                status_code=200,
                 media_type='video/mp4', 
                 headers=headers
             )
