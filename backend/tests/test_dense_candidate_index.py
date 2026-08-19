@@ -11,7 +11,12 @@ from backend.app.pipelines import offline_pipeline as pipeline
 from backend.app.services.indexing import build_faiss_index as faiss_builder
 from backend.app.services.retrieval import dense_candidate_index as dense_module
 from backend.app.services.retrieval.dense_candidate_index import (
+    DENSE_ARCHITECTURE_VERSION,
     DENSE_ARTIFACT_ROLE,
+    DENSE_LAYER,
+    DENSE_MANIFEST_SCHEMA_VERSION,
+    DENSE_MODALITIES,
+    DENSE_RECORD_ARTIFACT_ROLE,
     DenseCandidateIndexConfig,
     FaissDenseCandidateIndex,
 )
@@ -65,9 +70,6 @@ class DenseCandidateIndexIntegrationTests(unittest.TestCase):
         self.video_paths.dense_embeddings.parent.mkdir(parents=True, exist_ok=True)
         np.save(self.video_paths.dense_embeddings, vectors)
         embeddings: list[dict] = []
-        captions: list[dict] = []
-        ocr: list[dict] = []
-        objects: list[dict] = []
         ledger: list[dict] = []
         for row in range(3):
             candidate_id = f"{self.video_id}:C{row:04d}"
@@ -100,38 +102,20 @@ class DenseCandidateIndexIntegrationTests(unittest.TestCase):
                     "output_dtype": "float32",
                 }
             )
-            captions.append(
-                {**common, "status": "success", "caption": f"caption evidence {row}"}
-            )
-            ocr.append(
-                {**common, "status": "success", "ocr_text": "SALE" if row == 1 else ""}
-            )
-            objects.append(
-                {
-                    **common,
-                    "status": "success",
-                    "objects": [{"class_name": "bottle", "confidence": 0.9}],
-                }
-            )
             ledger.append(
                 {
                     **common,
                     "selected": row == 0,
-                    "importance_score": 0.9,
-                    "semantic_novelty": 0.2,
-                    "component_scores": {"caption": 0.8},
-                    "available_modalities": ["caption", "ocr", "objects"],
-                    "feature_protected_event_ids": ["EVENT_OCR"] if row == 1 else [],
+                    "feature_protected_event_ids": [],
+                    "available_modalities": ["siglip2"],
                     "selection_rank": 1 if row == 0 else None,
-                    "selection_phase": "protected" if row == 0 else None,
+                    "selection_phase": "visual_temporal" if row == 0 else None,
                     "selection_reasons": ["unit_test"] if row == 0 else [],
                 }
             )
         self._write_jsonl(self.video_paths.dense_embedding_metadata, embeddings)
-        self._write_jsonl(self.video_paths.dense_captions, captions)
-        self._write_jsonl(self.video_paths.dense_ocr, ocr)
-        self._write_jsonl(self.video_paths.dense_objects, objects)
         self._write_jsonl(self.video_paths.candidate_ledger, ledger)
+        self._write_jsonl(self.video_paths.selected_metadata, [ledger[0]])
 
     def _build(self) -> FaissDenseCandidateIndex:
         report = pipeline._build_dense_corpus_index(
@@ -172,15 +156,23 @@ class DenseCandidateIndexIntegrationTests(unittest.TestCase):
                 (self.video_id, f"{self.video_id}:F0002"): 2,
             },
         )
-        self.assertEqual(dense.records[1]["caption"], "caption evidence 1")
-        self.assertEqual(dense.records[1]["ocr_text"], "SALE")
-        self.assertEqual(dense.records[1]["objects"], ["bottle"])
-        self.assertEqual(dense.records[1]["protected_event_ids"], ["EVENT_OCR"])
+        self.assertEqual(dense.layer, DENSE_LAYER)
+        self.assertEqual(dense.modalities, DENSE_MODALITIES)
+        self.assertEqual(
+            dense.records[1]["artifact_role"],
+            DENSE_RECORD_ARTIFACT_ROLE,
+        )
+        self.assertEqual(dense.records[1]["layer"], DENSE_LAYER)
+        for field_name in ("caption", "ocr_text", "objects"):
+            self.assertNotIn(field_name, dense.records[1])
         self.assertEqual(dense.search(np.asarray([0.0, 2.0]), top_k=2)[0][0], 1)
 
         manifest = json.loads(self.corpus_paths.dense_manifest.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["schema_version"], DENSE_MANIFEST_SCHEMA_VERSION)
+        self.assertEqual(manifest["architecture_version"], DENSE_ARCHITECTURE_VERSION)
         self.assertEqual(manifest["artifact_role"], DENSE_ARTIFACT_ROLE)
-        self.assertFalse(manifest["enrichment"]["inference_performed"])
+        self.assertEqual(manifest["layer"], DENSE_LAYER)
+        self.assertEqual(manifest["modalities"], list(DENSE_MODALITIES))
 
     def test_loader_rejects_metadata_tamper(self) -> None:
         self._build()
@@ -197,6 +189,7 @@ class DenseCandidateIndexIntegrationTests(unittest.TestCase):
                     report_path=self.corpus_paths.dense_report,
                 )
             )
+
     def test_loader_rejects_manifest_count_drift(self) -> None:
         self._build()
         manifest = json.loads(self.corpus_paths.dense_manifest.read_text(encoding="utf-8"))
@@ -217,22 +210,63 @@ class DenseCandidateIndexIntegrationTests(unittest.TestCase):
                 )
             )
 
+    def test_loader_rejects_incompatible_architecture_version(self) -> None:
+        self._build()
+        manifest = json.loads(self.corpus_paths.dense_manifest.read_text(encoding="utf-8"))
+        manifest["architecture_version"] = "legacy_dense_multimodal_v1"
+        self.corpus_paths.dense_manifest.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "architecture version"):
+            FaissDenseCandidateIndex(
+                DenseCandidateIndexConfig(
+                    index_path=self.corpus_paths.dense_index,
+                    metadata_path=self.corpus_paths.dense_metadata,
+                    frame_map_path=self.corpus_paths.dense_frame_map,
+                    manifest_path=self.corpus_paths.dense_manifest,
+                    report_path=self.corpus_paths.dense_report,
+                )
+            )
+
+    def test_loader_rejects_stale_dense_manifest_schema(self) -> None:
+        self._build()
+        manifest = json.loads(self.corpus_paths.dense_manifest.read_text(encoding="utf-8"))
+        manifest["schema_version"] = "1.2"
+        self.corpus_paths.dense_manifest.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "Unsupported.*schema"):
+            FaissDenseCandidateIndex(
+                DenseCandidateIndexConfig(
+                    index_path=self.corpus_paths.dense_index,
+                    metadata_path=self.corpus_paths.dense_metadata,
+                    frame_map_path=self.corpus_paths.dense_frame_map,
+                    manifest_path=self.corpus_paths.dense_manifest,
+                    report_path=self.corpus_paths.dense_report,
+                )
+            )
+
 
 class DenseCandidateIdentityValidationTests(unittest.TestCase):
     @staticmethod
     def _record(candidate_id: str, frame_id: str) -> dict:
         return {
             "faiss_index": 0,
+            "artifact_role": DENSE_RECORD_ARTIFACT_ROLE,
+            "layer": DENSE_LAYER,
             "candidate_id": candidate_id,
             "frame_id": frame_id,
             "video_id": "V1",
             "segment_id": "S1",
+            "timestamp": 1.0,
+            "frame_index": 25,
+            "keyframe_path": "dense_keyframes/V1/F0.jpg",
             "vector_dim": 2,
             "normalized": True,
-            "caption": "caption",
-            "ocr_text": "",
-            "objects": [],
-            "protected_event_ids": [],
         }
 
     def test_dense_contract_rejects_empty_and_duplicate_frame_identity(self) -> None:
@@ -247,6 +281,69 @@ class DenseCandidateIdentityValidationTests(unittest.TestCase):
         second["faiss_index"] = 1
         with self.assertRaisesRegex(ValueError, "Duplicate dense frame identity"):
             dense_module._validate_records([first, second], vector_dim=2)
+
+    def test_dense_contract_requires_visual_layer_identity_and_location(self) -> None:
+        required = {
+            "artifact_role": "artifact_role",
+            "layer": "layer",
+            "candidate_id": "candidate_id",
+            "video_id": "video_id",
+            "frame_id": "frame_id",
+            "segment_id": "clip id",
+            "timestamp": "timestamp",
+            "frame_index": "frame_index",
+            "keyframe_path": "keyframe_path",
+        }
+        for field_name, message in required.items():
+            with self.subTest(field_name=field_name):
+                record = self._record("C0", "F0")
+                record.pop(field_name)
+                with self.assertRaisesRegex(ValueError, message):
+                    dense_module._validate_records([record], vector_dim=2)
+
+        for field_name, invalid_value in (
+            ("timestamp", float("nan")),
+            ("timestamp", -0.1),
+            ("frame_index", True),
+            ("frame_index", -1),
+        ):
+            with self.subTest(field_name=field_name, value=invalid_value):
+                record = self._record("C0", "F0")
+                record[field_name] = invalid_value
+                with self.assertRaisesRegex(ValueError, field_name):
+                    dense_module._validate_records([record], vector_dim=2)
+
+    def test_dense_contract_rejects_selected_semantic_keys_even_when_empty(self) -> None:
+        for field_name, value in (
+            ("caption", ""),
+            ("ocr_text", ""),
+            ("objects", []),
+        ):
+            with self.subTest(field_name=field_name):
+                record = self._record("C0", "F0")
+                record[field_name] = value
+                with self.assertRaisesRegex(ValueError, field_name):
+                    dense_module._validate_records([record], vector_dim=2)
+
+    def test_dense_manifest_requires_exact_visual_only_layer_contract(self) -> None:
+        dense_module._validate_layer_contract(
+            {"layer": DENSE_LAYER, "modalities": list(DENSE_MODALITIES)}
+        )
+        for manifest, message in (
+            ({"modalities": list(DENSE_MODALITIES)}, "layer"),
+            ({"layer": DENSE_LAYER}, "modalities"),
+            (
+                {"layer": "selected_multimodal", "modalities": list(DENSE_MODALITIES)},
+                "layer",
+            ),
+            (
+                {"layer": DENSE_LAYER, "modalities": ["siglip2", "caption"]},
+                "visual-only modalities",
+            ),
+        ):
+            with self.subTest(manifest=manifest):
+                with self.assertRaisesRegex(ValueError, message):
+                    dense_module._validate_layer_contract(manifest)
 
 
 if __name__ == "__main__":

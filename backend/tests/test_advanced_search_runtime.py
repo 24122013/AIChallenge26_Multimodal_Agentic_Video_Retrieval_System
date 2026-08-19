@@ -26,6 +26,8 @@ class _DenseIndex:
     def __init__(self) -> None:
         self.records = [
             {
+                "artifact_role": "dense_candidate",
+                "layer": "dense_visual",
                 "candidate_id": "A0",
                 "frame_id": "FRAME_A0",
                 "video_id": "V1",
@@ -34,12 +36,10 @@ class _DenseIndex:
                 "timestamp": 1.0,
                 "frame_index": 25,
                 "keyframe_path": "data/dense/V1/FRAME_A0.jpg",
-                "caption": "a person closes a door",
-                "ocr_text": "",
-                "objects": ["person", "door"],
-                "protected_event_ids": ["SHOT_A"],
             },
             {
+                "artifact_role": "dense_candidate",
+                "layer": "dense_visual",
                 "candidate_id": "B0",
                 "frame_id": "FRAME_B0",
                 "video_id": "V2",
@@ -48,10 +48,6 @@ class _DenseIndex:
                 "timestamp": 2.0,
                 "frame_index": 50,
                 "keyframe_path": "data/dense/V2/FRAME_B0.jpg",
-                "caption": "a person opens a refrigerator and takes a bottle",
-                "ocr_text": "MILK",
-                "objects": ["person", "refrigerator", "bottle"],
-                "protected_event_ids": ["OCR_MILK"],
             },
         ]
         self.vectors = np.asarray(
@@ -212,6 +208,107 @@ class AdvancedSearchRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "within"):
             ContextRerankConfig(max_bonus=1.01)
 
+    def test_visual_only_rows_renormalize_without_fake_semantic_zeros(self) -> None:
+        records = [
+            {
+                "candidate_id": candidate_id,
+                "frame_id": frame_id,
+                "video_id": "V1",
+                "segment_id": segment_id,
+                "timestamp": timestamp,
+            }
+            for candidate_id, frame_id, segment_id, timestamp in (
+                ("A", "F_A", "S_A", 1.0),
+                ("B", "F_B", "S_B", 2.0),
+            )
+        ]
+        weights = AdvancedRerankWeights(
+            coarse_rrf=0.20,
+            dense_visual=0.30,
+            caption=0.25,
+            ocr=0.10,
+            objects=0.05,
+            cses_gain=0.05,
+            temporal_consistency=0.03,
+            modality_alignment=0.02,
+            neighbor_support=0.0,
+            segment_support=0.0,
+        )
+
+        ranked = rerank_dense_candidates(
+            plan=build_query_plan("target action", profile="kis"),
+            selections=[self._selection(0, 0.8), self._selection(1, 0.8)],
+            records=records,
+            vectors=np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32),
+            query_vector=np.asarray([1.0, 0.0], dtype=np.float32),
+            coarse_scores={("V1", "S_A"): 1.0, ("V1", "S_B"): 1.0},
+            weights=weights,
+        )
+
+        self.assertEqual(ranked[0].score, ranked[1].score)
+        for item in ranked:
+            self.assertEqual(
+                item.context_trace["active_terms"],
+                (
+                    "coarse_rrf",
+                    "dense_visual",
+                    "cses_gain",
+                    "temporal_consistency",
+                ),
+            )
+            for name in ("caption", "ocr", "objects", "modality_alignment"):
+                self.assertNotIn(name, item.breakdown)
+                self.assertNotIn(name, item.contributions)
+                self.assertNotIn(name, item.to_result_mapping()["modality_scores"])
+            self.assertAlmostEqual(item.score, 1.0)
+
+    def test_semantic_evidence_is_activated_per_record(self) -> None:
+        records = [
+            {
+                "candidate_id": "VISUAL_ONLY",
+                "frame_id": "F0",
+                "video_id": "V1",
+                "segment_id": "S0",
+                "timestamp": 1.0,
+            },
+            {
+                "candidate_id": "WITH_CAPTION",
+                "frame_id": "F1",
+                "video_id": "V1",
+                "segment_id": "S1",
+                "timestamp": 2.0,
+                "caption": "unrelated words",
+            },
+        ]
+        weights = AdvancedRerankWeights(
+            coarse_rrf=0.20,
+            dense_visual=0.30,
+            caption=0.50,
+            ocr=0.0,
+            objects=0.0,
+            cses_gain=0.0,
+            temporal_consistency=0.0,
+            modality_alignment=0.0,
+            neighbor_support=0.0,
+            segment_support=0.0,
+        )
+
+        ranked = rerank_dense_candidates(
+            plan=build_query_plan("target action", profile="kis"),
+            selections=[self._selection(0, 0.8), self._selection(1, 0.8)],
+            records=records,
+            vectors=np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32),
+            query_vector=np.asarray([1.0, 0.0], dtype=np.float32),
+            coarse_scores={("V1", "S0"): 1.0, ("V1", "S1"): 1.0},
+            weights=weights,
+        )
+
+        by_id = {str(item.record["candidate_id"]): item for item in ranked}
+        self.assertNotIn("caption", by_id["VISUAL_ONLY"].contributions)
+        self.assertIn("caption", by_id["WITH_CAPTION"].contributions)
+        self.assertAlmostEqual(by_id["VISUAL_ONLY"].score, 1.0)
+        self.assertAlmostEqual(by_id["WITH_CAPTION"].score, 0.5)
+
     def test_to_dict_rejects_non_positive_top_k(self) -> None:
         dense = _DenseIndex()
         response = advanced_vector_search(
@@ -283,9 +380,6 @@ class AdvancedSearchRuntimeTest(unittest.TestCase):
                 "video_id": "V1",
                 "segment_id": segment_id,
                 "timestamp": timestamp,
-                "caption": "",
-                "ocr_text": "",
-                "objects": [],
             }
             for candidate_id, frame_id, segment_id, timestamp in (
                 ("A", "A", "SA", 10.0),
@@ -384,9 +478,6 @@ class AdvancedSearchRuntimeTest(unittest.TestCase):
                 "video_id": "V1",
                 "segment_id": segment_id,
                 "timestamp": timestamp,
-                "caption": "",
-                "ocr_text": "",
-                "objects": [],
             }
             for frame_id, segment_id, timestamp, _cosine in values
         ]
@@ -444,9 +535,11 @@ class AdvancedSearchRuntimeTest(unittest.TestCase):
         by_id = {str(item.record["candidate_id"]): item for item in ranked}
         ordered = [str(item.record["candidate_id"]) for item in ranked]
         self.assertLess(ordered.index("A"), ordered.index("B"))
+        self.assertNotIn("segment_support", by_id["B"].breakdown)
+        self.assertFalse(by_id["B"].context_trace["segment_used_for_scoring"])
         self.assertGreater(
             by_id["A"].breakdown["segment_support"],
-            by_id["B"].breakdown["segment_support"],
+            by_id["B"].breakdown.get("segment_support", 0.0),
         )
         self.assertGreater(
             by_id["A"].breakdown["segment_support"],

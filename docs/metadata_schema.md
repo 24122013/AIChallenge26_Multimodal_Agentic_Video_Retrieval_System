@@ -1,4 +1,4 @@
-# Metadata Schema v1.2
+# Metadata Schemas
 
 `frame_map.json` là metadata chính cho retrieval. Phase 2 bổ sung encoder
 contract để embedding, FAISS index, frame map và query encoder có thể được kiểm
@@ -196,15 +196,102 @@ optional đối với legacy artifact nhưng bắt buộc với artifact SigLIP2
 Retrieval phải đọc `encoder` trước khi load text encoder. Không được encode
 query bằng OpenCLIP rồi search trong index SigLIP2.
 
-## Metadata ngoài Phase 2
+## Full-dense visual manifest and row schema v2.0
 
-Caption, OCR và objects giữ schema hiện tại và không được tạo trong Phase
-2. Các pipeline OpenCLIP/artifact cũ cũng không bị xóa hoặc overwrite.
+Manifest v1.2 ở trên tiếp tục mô tả selected-keyframe visual FAISS. Full-dense
+visual rescue/CSES là một bundle riêng và bắt buộc dùng schema `2.0`:
+
+```json
+{
+  "schema_version": "2.0",
+  "artifact_role": "dense_candidate_index",
+  "layer": "dense_visual",
+  "modalities": ["siglip2"],
+  "source_kind": "full_dense_candidates",
+  "index_type": "IndexFlatIP",
+  "metric": "ip",
+  "vector_count": 2401,
+  "metadata_record_count": 2401,
+  "clip_count": 120,
+  "encoder": {
+    "model_family": "siglip2",
+    "model_name": "google/siglip2-so400m-patch16-384",
+    "model_revision": "<resolved-or-requested-revision>",
+    "processor_name": "google/siglip2-so400m-patch16-384",
+    "vector_dim": 1152,
+    "input_resolution": 384,
+    "normalized": true,
+    "similarity": "cosine",
+    "output_dtype": "float32"
+  },
+  "bundle_generation": "<sha256-of-artifact-hashes>",
+  "artifacts": {
+    "index": {
+      "filename": "siglip2_so400m_patch16_384_dense_flat_ip.faiss",
+      "sha256": "<sha256>"
+    },
+    "metadata": {
+      "filename": "siglip2_so400m_patch16_384_dense_faiss_metadata.jsonl",
+      "sha256": "<sha256>"
+    },
+    "frame_map": {
+      "filename": "siglip2_so400m_patch16_384_dense_frame_map.json",
+      "sha256": "<sha256>"
+    },
+    "report": {
+      "filename": "siglip2_so400m_patch16_384_dense_index_report.json",
+      "sha256": "<sha256>"
+    }
+  }
+}
+```
+
+Mỗi row trong dense metadata là visual-only:
+
+```json
+{
+  "candidate_id": "CAND_L01_V001_000001",
+  "frame_id": "FRAME_L01_V001_000001",
+  "video_id": "L01_V001",
+  "shot_id": "SHOT_L01_V001_000001",
+  "segment_id": "SHOT_L01_V001_000001",
+  "timestamp": 1.25,
+  "frame_index": 37,
+  "keyframe_path": "data/dense_keyframes/L01_V001/FRAME_L01_V001_000001.jpg",
+  "embedding_index": 0,
+  "faiss_index": 0,
+  "artifact_role": "dense_candidate",
+  "layer": "dense_visual",
+  "model_family": "siglip2",
+  "model_name": "google/siglip2-so400m-patch16-384",
+  "model_revision": "<resolved-or-requested-revision>",
+  "vector_dim": 1152,
+  "normalized": true
+}
+```
+
+Dense rows không được có top-level `caption`, `ocr_text` hoặc `objects`. Không
+được thêm các field rỗng này để giả backward compatibility. Count invariant là:
+
+```text
+dense metadata rows == dense FAISS ntotal == materialized dense candidates
+```
+
+Manifest schema cũ, thiếu `layer`, sai `modalities`, hoặc dense row còn semantic
+fields phải fail closed và được regenerate. Chỉnh tay version không migrate được
+vector order, checksums hay corpus generation. Loader cũng đối chiếu từng artifact
+checksum, `bundle_generation`, row order, FAISS `ntotal`/dimension và `clip_count`.
+
+## Selected semantic metadata
+
+Caption, OCR và objects giữ schema ingestion hiện tại nhưng chỉ được tạo sau
+visual-temporal selection, cho canonical selected IDs. Các file này không sửa
+embedding, FAISS index hoặc frame map; corpus loader join chúng với
+`keyframes_<video_id>.jsonl` bằng stable `(video_id, frame_id)`.
 
 ## Multimodal ingestion metadata v1.0
 
-Caption, OCR và object detection là các JSONL độc lập. Chúng không sửa
-`keyframes_<video_id>.jsonl`, embedding, FAISS index hoặc frame map. Mọi record
+Caption, OCR và object detection là các JSONL độc lập. Mọi record selected
 keyframe giữ nguyên giá trị của các khóa nhận dạng:
 
 `frame_id`, `video_id`, `segment_id`, `shot_id`, `timestamp`, `shot_start`,

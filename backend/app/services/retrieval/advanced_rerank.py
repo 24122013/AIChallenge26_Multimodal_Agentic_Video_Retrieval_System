@@ -1,4 +1,4 @@
-"""Deterministic multimodal reranking for dense CSES candidates."""
+"""Deterministic evidence-aware reranking for dense CSES candidates."""
 from __future__ import annotations
 
 import math
@@ -232,23 +232,15 @@ def rerank_dense_candidates(
         and row_by_frame is not None
         and int(context_summary.get("segment_record_count") or 0) > 0
     )
-    active_weight_names = [
+    # Full-dense rows are visual-only in schema 2.0.  The semantic weights stay
+    # configurable for callers that enrich a row explicitly, but they must not
+    # dilute a visual-only row as if absent text were negative evidence.
+    base_weight_names = (
         "coarse_rrf",
         "dense_visual",
-        "caption",
-        "ocr",
-        "objects",
         "cses_gain",
         "temporal_consistency",
-        "modality_alignment",
-    ]
-    if neighbor_active:
-        active_weight_names.append("neighbor_support")
-    if segment_active:
-        active_weight_names.append("segment_support")
-    total_weight = sum(float(getattr(weights, name)) for name in active_weight_names)
-    if total_weight <= 0:
-        raise ValueError("Active advanced rerank weights must include a positive value")
+    )
 
     context_by_row: dict[int, Any] = {}
     if context_index is not None and (neighbor_active or segment_active):
@@ -291,16 +283,19 @@ def rerank_dense_candidates(
             str(record.get("video_id") or ""),
             str(record.get("segment_id") or record.get("shot_id") or ""),
         )
-        modality = {
-            "caption": _text_score(query_tokens, str(record.get("caption") or "")),
-            "ocr": _text_score(query_tokens, str(record.get("ocr_text") or "")),
-            "objects": _text_score(
-                query_tokens,
-                " ".join(str(value) for value in record.get("objects", []) or []),
-            ),
-        }
+        modality: dict[str, float] = {}
+        caption = str(record.get("caption") or "").strip()
+        ocr_text = str(record.get("ocr_text") or "").strip()
+        object_text = " ".join(
+            str(value) for value in record.get("objects", []) or []
+        ).strip()
+        if caption:
+            modality["caption"] = _text_score(query_tokens, caption)
+        if ocr_text:
+            modality["ocr"] = _text_score(query_tokens, ocr_text)
+        if object_text:
+            modality["objects"] = _text_score(query_tokens, object_text)
         hinted = [modality[name] for name in plan.modality_hints if name in modality]
-        hint_alignment = max(hinted, default=0.0)
         raw_coarse_score = float(raw_coarse.get(clip_key, 0.0))
         normalized_coarse = raw_coarse_score / coarse_scale
         if has_negative_coarse:
@@ -314,8 +309,11 @@ def rerank_dense_candidates(
             **modality,
             "cses_gain": float(selection.selection_gain) / max_cses,
             "temporal_consistency": temporal_scores.get(selection.row, 0.0),
-            "modality_alignment": hint_alignment,
         }
+        direct_names = [*base_weight_names, *modality]
+        if hinted:
+            breakdown["modality_alignment"] = max(hinted)
+            direct_names.append("modality_alignment")
         context = context_by_row.get(selection.row)
         center_timestamp = float(record.get("timestamp") or 0.0)
         neighbor_values: list[float] = []
@@ -379,19 +377,28 @@ def rerank_dense_candidates(
             max_ratio=context_config.segment_max_ratio,
             top_k=context_config.segment_top_k,
         )
-        breakdown["neighbor_support"] = neighbor_support if neighbor_active else 0.0
-        breakdown["segment_support"] = segment_support if segment_active else 0.0
+        context_names: list[str] = []
+        if neighbor_values:
+            breakdown["neighbor_support"] = neighbor_support
+            context_names.append("neighbor_support")
+        if segment_values:
+            breakdown["segment_support"] = segment_support
+            context_names.append("segment_support")
 
+        active_weight_names = [*direct_names, *context_names]
+        total_weight = sum(
+            float(getattr(weights, name)) for name in active_weight_names
+        )
+        if total_weight <= 0:
+            raise ValueError(
+                "Available advanced rerank evidence must include a positive weight"
+            )
         raw_contributions = {
             name: float(getattr(weights, name)) * float(breakdown[name]) / total_weight
             for name in active_weight_names
         }
-        direct_names = active_weight_names[:8]
         raw_direct_score = sum(raw_contributions[name] for name in direct_names)
-        raw_context_bonus = sum(
-            raw_contributions.get(name, 0.0)
-            for name in ("neighbor_support", "segment_support")
-        )
+        raw_context_bonus = sum(raw_contributions[name] for name in context_names)
         context_bonus = min(raw_context_bonus, float(context_config.max_bonus))
         context_scale = (
             context_bonus / raw_context_bonus if raw_context_bonus > 0 else 0.0
@@ -401,7 +408,7 @@ def rerank_dense_candidates(
             for name, value in raw_contributions.items()
             if name not in {"neighbor_support", "segment_support"}
         }
-        for name in ("neighbor_support", "segment_support"):
+        for name in context_names:
             if name in raw_contributions:
                 contributions[name] = raw_contributions[name] * context_scale
         score = raw_direct_score + context_bonus
@@ -415,17 +422,18 @@ def rerank_dense_candidates(
         )
         context_trace = {
             "neighbor_requested": bool(context_config.neighbor_enabled),
-            "neighbor_used_for_scoring": neighbor_active,
+            "neighbor_used_for_scoring": bool(neighbor_values),
             "neighbor_evidence_count": len(neighbor_values),
             "neighbor_missing_dense_count": missing_neighbor_refs,
             "segment_requested": bool(context_config.segment_enabled),
-            "segment_used_for_scoring": segment_active,
+            "segment_used_for_scoring": bool(segment_values),
             "segment_evidence_count": len(segment_values),
             "segment_missing_dense_count": missing_segment_refs,
             "context_bonus_before_cap": round(raw_context_bonus, 8),
             "context_bonus_after_cap": round(context_bonus, 8),
             "context_bonus_cap": float(context_config.max_bonus),
             "cap_applied": raw_context_bonus > context_bonus,
+            "active_terms": tuple(active_weight_names),
         }
         ranked.append(
             AdvancedRankedFrame(

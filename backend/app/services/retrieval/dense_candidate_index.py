@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -24,8 +26,35 @@ DENSE_METADATA_NAME = f"{DENSE_ARTIFACT_TAG}_faiss_metadata.jsonl"
 DENSE_FRAME_MAP_NAME = f"{DENSE_ARTIFACT_TAG}_frame_map.json"
 DENSE_MANIFEST_NAME = f"{DENSE_ARTIFACT_TAG}_faiss_manifest.json"
 DENSE_REPORT_NAME = f"{DENSE_ARTIFACT_TAG}_index_report.json"
-DENSE_MANIFEST_SCHEMA_VERSION = "1.2"
+DENSE_MANIFEST_SCHEMA_VERSION = "2.0"
+DENSE_ARCHITECTURE_VERSION = "selected_semantic_v2"
 DENSE_ARTIFACT_ROLE = "dense_candidate_index"
+DENSE_RECORD_ARTIFACT_ROLE = "dense_candidate"
+DENSE_LAYER = "dense_visual"
+DENSE_MODALITIES = ("siglip2",)
+
+# These fields belong to the selected semantic layer.  Rejecting them is
+# deliberate: accepting empty placeholders would make an old full-dense
+# multimodal bundle look compatible with the visual-only architecture.
+_FORBIDDEN_DENSE_SEMANTIC_FIELDS = frozenset(
+    {
+        "caption",
+        "caption_text",
+        "captions_aggregated",
+        "dense_caption",
+        "ocr",
+        "ocr_text",
+        "ocr_tokens",
+        "text_regions",
+        "dense_ocr",
+        "objects",
+        "object_classes",
+        "object_labels",
+        "detected_objects",
+        "dense_objects",
+        "modality_alignment",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -152,6 +181,38 @@ def _validate_encoder_contract(manifest: Mapping[str, Any]) -> int:
     return vector_dim
 
 
+def _validate_layer_contract(manifest: Mapping[str, Any]) -> None:
+    if manifest.get("layer") != DENSE_LAYER:
+        raise ValueError(f"Dense manifest must declare layer={DENSE_LAYER!r}")
+    modalities = manifest.get("modalities")
+    if not isinstance(modalities, list) or modalities != list(DENSE_MODALITIES):
+        raise ValueError(
+            "Dense manifest must declare visual-only modalities=['siglip2']"
+        )
+
+
+def _required_dense_text(record: Mapping[str, Any], field_name: str, row: int) -> str:
+    value = record.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Dense metadata row {row} has invalid {field_name}")
+    return value.strip()
+
+
+def _validate_dense_timestamp(record: Mapping[str, Any], row: int) -> None:
+    value = record.get("timestamp")
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"Dense metadata row {row} has invalid timestamp")
+    timestamp = float(value)
+    if not math.isfinite(timestamp) or timestamp < 0:
+        raise ValueError(f"Dense metadata row {row} has invalid timestamp")
+
+
+def _validate_dense_frame_index(record: Mapping[str, Any], row: int) -> None:
+    value = record.get("frame_index")
+    if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
+        raise ValueError(f"Dense metadata row {row} has invalid frame_index")
+
+
 def _validate_records(
     records: list[dict[str, Any]],
     *,
@@ -166,17 +227,42 @@ def _validate_records(
     mutable_clip_rows: dict[tuple[str, str], list[int]] = {}
     row_by_frame: dict[tuple[str, str], int] = {}
     for row, record in enumerate(records):
-        if record.get("faiss_index") != row:
+        faiss_index = record.get("faiss_index")
+        if (
+            isinstance(faiss_index, bool)
+            or not isinstance(faiss_index, Integral)
+            or int(faiss_index) != row
+        ):
             raise ValueError(f"Dense metadata faiss_index mismatch at row {row}")
-        candidate_id = str(record.get("candidate_id") or "")
-        video_id = str(record.get("video_id") or "")
-        frame_id = str(record.get("frame_id") or record.get("keyframe_id") or "")
-        clip_id = str(record.get("segment_id") or record.get("shot_id") or "")
-        if not candidate_id or not video_id or not frame_id or not clip_id:
+        if record.get("artifact_role") != DENSE_RECORD_ARTIFACT_ROLE:
+            raise ValueError(
+                f"Dense metadata row {row} must be artifact_role="
+                f"{DENSE_RECORD_ARTIFACT_ROLE!r}"
+            )
+        if record.get("layer") != DENSE_LAYER:
+            raise ValueError(
+                f"Dense metadata row {row} must declare layer={DENSE_LAYER!r}"
+            )
+        forbidden = sorted(_FORBIDDEN_DENSE_SEMANTIC_FIELDS.intersection(record))
+        if forbidden:
+            raise ValueError(
+                "Dense visual metadata must not contain selected semantic fields: "
+                + ", ".join(forbidden)
+            )
+
+        candidate_id = _required_dense_text(record, "candidate_id", row)
+        video_id = _required_dense_text(record, "video_id", row)
+        frame_id = _required_dense_text(record, "frame_id", row)
+        raw_clip_id = record.get("segment_id") or record.get("shot_id")
+        if not isinstance(raw_clip_id, str) or not raw_clip_id.strip():
             raise ValueError(
                 "Dense metadata row "
                 f"{row} requires candidate_id, video_id, frame_id, and clip id"
             )
+        clip_id = raw_clip_id.strip()
+        _validate_dense_timestamp(record, row)
+        _validate_dense_frame_index(record, row)
+        _required_dense_text(record, "keyframe_path", row)
         if candidate_id in candidate_ids:
             raise ValueError(f"Duplicate dense candidate_id: {candidate_id}")
         candidate_ids.add(candidate_id)
@@ -184,18 +270,6 @@ def _validate_records(
             raise ValueError(f"Dense metadata vector_dim mismatch at row {row}")
         if record.get("normalized") is not True:
             raise ValueError(f"Dense metadata row {row} is not normalized")
-        if not isinstance(record.get("caption"), str):
-            raise ValueError(f"Dense metadata row {row} has invalid caption evidence")
-        if not isinstance(record.get("ocr_text"), str):
-            raise ValueError(f"Dense metadata row {row} has invalid OCR evidence")
-        if not isinstance(record.get("objects"), list) or any(
-            not isinstance(value, str) for value in record["objects"]
-        ):
-            raise ValueError(f"Dense metadata row {row} has invalid object evidence")
-        if not isinstance(record.get("protected_event_ids"), list) or any(
-            not isinstance(value, str) for value in record["protected_event_ids"]
-        ):
-            raise ValueError(f"Dense metadata row {row} has invalid protected events")
         frame_key = (video_id, frame_id)
         if frame_key in row_by_frame:
             raise ValueError(f"Duplicate dense frame identity: {frame_key}")
@@ -249,8 +323,11 @@ def validate_dense_candidate_artifacts(
     manifest = _read_json_object(config.manifest_path)
     if manifest.get("schema_version") != DENSE_MANIFEST_SCHEMA_VERSION:
         raise ValueError("Unsupported dense-candidate manifest schema")
+    if manifest.get("architecture_version") != DENSE_ARCHITECTURE_VERSION:
+        raise ValueError("Unsupported dense-candidate architecture version")
     if manifest.get("artifact_role") != DENSE_ARTIFACT_ROLE:
         raise ValueError("Manifest is not a full dense-candidate index")
+    _validate_layer_contract(manifest)
     if manifest.get("index_type") != "IndexFlatIP" or manifest.get("metric") != "ip":
         raise ValueError("Dense candidate retrieval requires IndexFlatIP with IP metric")
     vector_dim = _validate_encoder_contract(manifest)
@@ -330,6 +407,10 @@ class FaissDenseCandidateIndex:
         self.rows_by_clip = self.artifacts.rows_by_clip
         self.row_by_frame = self.artifacts.row_by_frame
         self.encoder_contract = self.artifacts.manifest["encoder"]
+        self.layer = str(self.artifacts.manifest["layer"])
+        self.modalities = tuple(
+            str(value) for value in self.artifacts.manifest["modalities"]
+        )
 
     def search(self, query_vector: np.ndarray, top_k: int) -> list[tuple[int, float]]:
         requested = int(top_k)
@@ -360,9 +441,12 @@ __all__ = [
     "DENSE_ARTIFACT_TAG",
     "DENSE_FRAME_MAP_NAME",
     "DENSE_INDEX_NAME",
+    "DENSE_LAYER",
     "DENSE_MANIFEST_NAME",
     "DENSE_MANIFEST_SCHEMA_VERSION",
     "DENSE_METADATA_NAME",
+    "DENSE_MODALITIES",
+    "DENSE_RECORD_ARTIFACT_ROLE",
     "DENSE_REPORT_NAME",
     "DenseCandidateIndex",
     "DenseCandidateIndexConfig",

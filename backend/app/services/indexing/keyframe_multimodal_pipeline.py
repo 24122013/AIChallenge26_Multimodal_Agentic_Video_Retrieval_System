@@ -48,6 +48,7 @@ from .keyframe_selection import (
 
 
 KEYFRAME_STRATEGY_MULTIMODAL_COVERAGE = "multimodal_coverage"
+KEYFRAME_STRATEGY_VISUAL_TEMPORAL = "visual_temporal"
 _DENSE_REASONS = {
     REASON_DENSE_INTERVAL,
     REASON_SHOT_BOUNDARY_START,
@@ -158,6 +159,7 @@ def run_multimodal_keyframe_pipeline(
     selection_config: SelectionConfig,
     adapter_config: FeatureAdapterConfig | None = None,
     allow_partial_features: bool = False,
+    keyframe_strategy: str = KEYFRAME_STRATEGY_MULTIMODAL_COVERAGE,
 ) -> MultimodalKeyframePipelineResult:
     """Select and materialize one video's final Phase 3 in-memory artifacts.
 
@@ -173,6 +175,8 @@ def run_multimodal_keyframe_pipeline(
         raise TypeError("adapter_config must be a FeatureAdapterConfig or None")
     if not isinstance(allow_partial_features, bool):
         raise TypeError("allow_partial_features must be a boolean")
+    if not isinstance(keyframe_strategy, str) or not keyframe_strategy.strip():
+        raise TypeError("keyframe_strategy must be a non-empty string")
 
     duration = _finite_non_negative(video_duration, "video_duration")
     identities = _normalize_candidate_records(candidates)
@@ -280,6 +284,7 @@ def run_multimodal_keyframe_pipeline(
             item,
             scores_by_id[item.candidate.candidate_id],
             semantic_novelty=semantic_novelty_by_id[item.candidate.candidate_id],
+            keyframe_strategy=keyframe_strategy,
         )
         for item in selection_result.selected
     )
@@ -326,6 +331,38 @@ def run_multimodal_keyframe_pipeline(
         selection_result=selection_result,
         guarantee_report=guarantee_report,
         allow_partial_features=allow_partial_features,
+    )
+
+
+def run_visual_temporal_keyframe_pipeline(
+    candidates: Iterable[Mapping[str, Any]],
+    *,
+    embeddings: np.ndarray,
+    embedding_records: Iterable[Mapping[str, Any]],
+    video_duration: float,
+    selection_config: SelectionConfig,
+    adapter_config: FeatureAdapterConfig | None = None,
+) -> MultimodalKeyframePipelineResult:
+    """Select before semantic enrichment using only visual-temporal evidence.
+
+    The shared deterministic selector still enforces shot and temporal coverage,
+    uses SigLIP transition/novelty signals, and subsets the already-computed
+    dense embedding matrix.  Caption, OCR, and object records are deliberately
+    absent here so they cannot influence pre-selection behavior.
+    """
+
+    return run_multimodal_keyframe_pipeline(
+        candidates,
+        embeddings=embeddings,
+        embedding_records=embedding_records,
+        ocr_records=(),
+        object_records=(),
+        caption_records=(),
+        video_duration=video_duration,
+        selection_config=selection_config,
+        adapter_config=adapter_config,
+        allow_partial_features=True,
+        keyframe_strategy=KEYFRAME_STRATEGY_VISUAL_TEMPORAL,
     )
 
 
@@ -777,6 +814,7 @@ def _build_final_record(
     score: CandidateComponentScore,
     *,
     semantic_novelty: float,
+    keyframe_strategy: str,
 ) -> dict[str, Any]:
     record = dict(candidate_record)
     component_scores = dict(score.component_scores)
@@ -799,7 +837,7 @@ def _build_final_record(
         )
     )
     provenance = {
-        "strategy": KEYFRAME_STRATEGY_MULTIMODAL_COVERAGE,
+        "strategy": keyframe_strategy,
         "selection_rank": selected.selection_rank,
         "selection_phase": selected.selection_phase,
         "selection_reasons": list(selected.selection_reasons),
@@ -813,7 +851,7 @@ def _build_final_record(
     }
     record.update(
         {
-            "keyframe_strategy": KEYFRAME_STRATEGY_MULTIMODAL_COVERAGE,
+            "keyframe_strategy": keyframe_strategy,
             "selection_phase": selected.selection_phase,
             "selection_rank": selected.selection_rank,
             "selection_reasons": list(selected.selection_reasons),
@@ -970,7 +1008,9 @@ def _build_event_ledger(
 __all__ = [
     "HardGuaranteeReport",
     "KEYFRAME_STRATEGY_MULTIMODAL_COVERAGE",
+    "KEYFRAME_STRATEGY_VISUAL_TEMPORAL",
     "MultimodalKeyframePipelineError",
     "MultimodalKeyframePipelineResult",
     "run_multimodal_keyframe_pipeline",
+    "run_visual_temporal_keyframe_pipeline",
 ]

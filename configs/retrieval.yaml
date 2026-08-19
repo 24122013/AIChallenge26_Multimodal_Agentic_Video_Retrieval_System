@@ -67,6 +67,9 @@ online:
   context_max_bonus: 0.08
   rerank_coarse_rrf_weight: 0.14
   rerank_dense_visual_weight: 0.39
+  # Selected caption/OCR/object evidence already enters through coarse RRF.
+  # Schema-2.0 dense rows omit these fields, so the reranker excludes these
+  # conditional terms and renormalizes over the evidence present on each row.
   rerank_caption_weight: 0.11
   rerank_ocr_weight: 0.10
   rerank_objects_weight: 0.07

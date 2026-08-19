@@ -77,34 +77,60 @@ Raw Videos
 Shot detection + dense-candidate materialization
     │
     ▼
-Multimodal extraction (SigLIP2/caption/OCR/objects)
+SigLIP2 encoding over the complete dense pool
     │
-    ├── Full dense-candidate pool
-    │     └── FAISS + metadata + frame map + manifest + report
+    ├── Full dense visual layer
+    │     └── SigLIP2 FAISS + visual-only metadata + frame map + manifest
     │
-    └── Multimodal selection
-          └── Canonical selected keyframes
+    └── Visual-temporal selection
+          └── Canonical selected keyframes + subsetted SigLIP2 vectors
+                │
+                ▼
+          Caption + OCR + Object inference on selected IDs only
                 ├── Selected-keyframe visual FAISS
-                ├── BM25/optional BGE text index
-                └── Neighbor/segment metadata
+                ├── Selected Caption/OCR/Object BM25 + optional BGE
+                └── Selected neighbor/segment metadata
 ```
 
 Output:
 
-* Full dense-candidate bundle
-* Canonical selected keyframes
+* Full dense-candidate visual bundle
+* Canonical selected multimodal keyframes
 * Segments
 * Metadata
 * Embeddings
 * Search Index
 
 Offline selected keyframes là **technical keyframes**: sparse frames được chọn
-để lập coarse index và luôn giữ original zero-based `frame_index`. Offline cũng
-publish một **full dense-candidate index** từ toàn bộ materialized candidates
-trước selection; bundle này rộng hơn selected index nhưng vẫn không chứa mọi raw
-video frame. TRAKE tìm **semantic keyframes** thỏa criterion của từng event bằng
-cách decode local windows quanh technical frame và không phụ thuộc vào dense
-candidate FAISS.
+để lập coarse index và luôn giữ original zero-based `frame_index`. Selector chỉ
+dùng shot/boundary coverage, temporal max-gap, visual dedup, full-dense SigLIP2
+transition/novelty và deterministic diversity. Caption, OCR và object detection
+không phải selector input.
+
+Offline đồng thời publish một **full dense-candidate visual index** từ toàn bộ
+materialized candidates. Bundle này rộng hơn selected index nhưng vẫn không chứa
+mọi raw video frame. Dense row có identity/timestamp/path/shot-segment lineage và
+SigLIP2 mapping; nó không có `caption`, `ocr_text` hay `objects`. Selected SigLIP2
+vectors được lấy trực tiếp từ full-dense matrix, không encode lại. TRAKE tìm
+**semantic keyframes** thỏa criterion của từng event bằng cách decode local
+windows quanh technical frame và không phụ thuộc vào dense candidate FAISS.
+
+Với `N` dense candidates và `M` selected keyframes, invariant canonical là:
+
+```text
+dense_siglip_count == N
+selected_caption_count == M
+selected_ocr_count == M
+selected_object_count == M
+```
+
+`N == selected_caption_count` không còn là invariant. Empty OCR/object result có
+thể là inference thành công; record `status="error"` là trạng thái khác và không
+được giả làm empty evidence.
+
+Temporal density là configuration-driven. Profile deadline có thể dùng
+`max_gap_seconds=4.0` và soft density `0.25`, nhưng one-per-shot/boundary coverage
+vẫn là hard constraint; shot-heavy video có thể chọn nhiều hơn soft target.
 
 ---
 
@@ -144,22 +170,33 @@ semantics.
 The full dense-candidate loader is lazy and cached by committed corpus
 generation, so QA and TRAKE are not blocked merely because the dense KIS/AVS
 bundle is absent. KIS/AVS use `online.dense_missing_behavior` to choose explicit
-`selected_only_fallback` or an error on missing files. Integrity/lineage/encoder
-contract failures always fail closed. Canonical KIS/AVS has no heavy learned/VLM
-retrieval reranker; legacy settings for those branches are ignored with a warning.
-The final rerank is deterministic and exposes score breakdown, weighted
-contributions, context evidence/cap diagnostics and per-stage latency.
+`selected_only_fallback` or an error on missing files. A current dense manifest
+must declare schema `2.0`, `layer="dense_visual"` and
+`modalities=["siglip2"]`; dense rows containing Caption/OCR/Object are rejected
+as an incompatible old architecture. Integrity/lineage/encoder contract failures
+always fail closed. Canonical KIS/AVS has no heavy learned/VLM retrieval reranker;
+legacy settings for those branches are ignored with a warning. The final rerank
+is deterministic and exposes score breakdown, weighted contributions, context
+evidence/cap diagnostics and per-stage latency.
 
 Neighbor/segment scoring is an opt-in advanced path because loading the artifacts
 is disabled by default. When requested and available, it runs after CSES and
 before final dedup/Top-K. It resolves at most two neighbors on each side and a
 12-keyframe canonical segment window, aggregates the segment Top-3, and caps the
 combined context bonus at `0.08`. It reuses the normalized original-query vector,
-full-dense vectors and existing caption/OCR/object metadata: no second encode and
-no additional global FAISS/BM25 search. After Top-K, the same context index
-hydrates public `neighbors`/`segment_context`. Missing optional files produce an
-explicit fallback trace; present but corrupt or lineage-mismatched artifacts fail
-validation.
+full-dense visual vectors and selected neighbor/segment Caption/OCR/Object
+evidence where available: no second encode and no additional global FAISS/BM25
+search. It never expects semantic fields on an arbitrary dense row. After Top-K,
+the same context index hydrates public `neighbors`/`segment_context`. Missing
+optional files produce an explicit fallback trace; present but corrupt or
+lineage-mismatched artifacts fail validation.
+
+Offline checkpoints include architecture/schema and input lineage. Checkpoints
+from the former full-dense multimodal architecture cannot mark selected semantic
+inference complete. Compatible early artifacts may resume, but incompatible
+selection/enrichment/corpus artifacts are regenerated or fail fast with an
+actionable message. Corpus publication remains staged and atomic; the commit
+manifest is written last.
 
 ---
 
@@ -316,11 +353,14 @@ Query
 
 Mỗi search engine có thể phát triển độc lập, nhưng KIS/AVS production không gọi
 `advanced_search` như một orphan utility: nó được route trực tiếp từ
-`OnlinePipeline.run` qua canonical public manager entrypoint. Coarse RRF chỉ chọn
-clip pool; dense similarity và evidence features được tính riêng ở deterministic
-rerank, tránh cộng một raw score hai lần như thể chúng cùng thang đo. Context
-lookup cho mỗi candidate bị chặn bởi một cửa sổ nhỏ; nó không scan segment/corpus
-tùy ý và không gọi encoder/search engine lần nữa.
+`OnlinePipeline.run` qua canonical public manager entrypoint. Coarse RRF dùng
+selected visual/Caption/OCR/Object evidence để chọn clip pool. Dense stage sau đó
+dùng full-dense visual similarity, coarse selected evidence, CSES gain, temporal
+consistency và bounded neighbor/segment evidence. Nó không đọc semantic evidence
+trực tiếp từ arbitrary dense rows và không coi modality không tồn tại là zero
+evidence để giữ nguyên một weight stale. Context lookup cho mỗi candidate bị chặn
+bởi một cửa sổ nhỏ; nó không scan segment/corpus tùy ý và không gọi encoder/search
+engine lần nữa.
 
 TRAKE is orchestrated by `backend/app/services/trake/pipeline.py` and is cached
 with the same corpus generation as the hybrid engine. Every complete hypothesis
@@ -392,9 +432,10 @@ Planner có thể:
 
 Lưu:
 
-* captions
-* OCR
-* objects
+* selected-keyframe captions
+* selected-keyframe OCR
+* selected-keyframe objects
+* dense visual-only identity/timestamp/path lineage
 
 ---
 
@@ -404,7 +445,8 @@ Lưu:
 
 * CLIP embeddings
 * OpenCLIP embeddings
-* SigLIP2 embeddings with a versioned encoder manifest
+* selected-keyframe SigLIP2 embeddings
+* full-dense SigLIP2 embeddings with a versioned dense-visual manifest
 
 Có thể sử dụng:
 

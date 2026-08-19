@@ -23,12 +23,22 @@ Hệ thống hỗ trợ sáu task online:
 ```text
 video gốc
   -> shot detection
-  -> dense frame candidates
-  -> SigLIP2 + caption + OCR + objects cho toàn bộ candidate
-  -> chọn canonical keyframes
-  -> publish selected FAISS + dense FAISS + BM25 + context + BGE-M3
+  -> materialize toàn bộ dense frame candidates thành JPEG
+  -> SigLIP2 trên toàn bộ dense candidate
+  -> visual-temporal selection
+  -> Caption + OCR + Object chỉ trên selected keyframes
+  -> publish selected multimodal indexes + full-dense visual FAISS
   -> query qua OnlinePipeline
 ```
+
+Pipeline giữ hai layer tách biệt:
+
+- **Dense visual layer**: toàn bộ dense JPEG và SigLIP2 embeddings, phục vụ
+  global visual rescue, localization và CSES. Dense rows không mang
+  `caption`, `ocr_text` hoặc `objects`.
+- **Selected multimodal layer**: selected SigLIP2 vectors được subset từ dense
+  embeddings, cộng Caption/OCR/Object của đúng selected IDs, phục vụ visual và
+  text retrieval. SigLIP2 không được encode lần hai cho selected frames.
 
 Nếu máy đã có môi trường và model cache, E2E tối thiểu là:
 
@@ -266,14 +276,39 @@ $videoId = "L01_V001"
 | 1. Shot detection | Đọc FPS/frame count và tìm shot boundary bằng TransNetV2 | `data/reports/offline/<video_id>/shots.json` | `Get-Content "data\reports\offline\$videoId\shots.json" -Raw \| ConvertFrom-Json \| Select-Object status, shot_count, detector_name` |
 | 2. Dense candidate generation | Sample theo thời gian, thêm shot anchor/boundary guard | `candidate_plan.jsonl`, `candidate_report.json` | `(Get-Content "data\reports\offline\$videoId\candidate_plan.jsonl" \| Measure-Object -Line).Lines` |
 | 3. Materialization | Decode toàn bộ candidate thành JPEG và giữ identity/order | `data/candidates/<video_id>.jsonl`, `data/dense_keyframes/<video_id>/` | `(Get-Content "data\candidates\$videoId.jsonl" \| Measure-Object -Line).Lines` |
-| 4. Dense features | Chạy SigLIP2, Florence-2 caption, PP-OCRv5 và YOLOE trên full candidate pool | `data/candidate_features/<video_id>/` | `Get-ChildItem "data\candidate_features\$videoId"` |
-| 5. Multimodal selection | Protected-event, gap repair, dedup và MMR để chọn keyframe | `selection_report.json`, `candidate_ledger.jsonl` | `Get-Content "data\reports\offline\$videoId\selection_report.json" -Raw \| ConvertFrom-Json \| Select-Object status, selected_count` |
-| 6. Canonical persistence | Ghi selected JPEG, metadata, caption/OCR/object và embedding | `data/keyframes/<video_id>/`, `data/metadata/keyframes_<video_id>.jsonl` | `(Get-Content "data\metadata\keyframes_$videoId.jsonl" \| Measure-Object -Line).Lines` |
-| 7. Validation/commit | Kiểm identity, count, checksum và chỉ ghi commit marker cuối cùng khi pass | `data/metadata/keyframes_<video_id>_extract_report.json` | `Get-Content "data\metadata\keyframes_${videoId}_extract_report.json" -Raw \| ConvertFrom-Json \| Select-Object status, dense_candidate_count, selected_count` |
+| 4. Dense visual encoding | Chạy SigLIP2 trên toàn bộ dense pool; không chạy Caption/OCR/Object | `data/candidate_features/<video_id>/siglip2.npy`, `siglip2_metadata.jsonl`, `siglip2_benchmark.json` | `(Get-Content "data\candidate_features\$videoId\siglip2_metadata.jsonl" \| Measure-Object -Line).Lines` |
+| 5. Visual-temporal selection | Dùng shot coverage/boundaries, max-gap, pHash/SigLIP transition, semantic novelty và deterministic diversity; không cần dense semantic artifacts | `selection_report.json`, `candidate_ledger.jsonl` | `Get-Content "data\reports\offline\$videoId\selection_report.json" -Raw \| ConvertFrom-Json \| Select-Object status, selected_count` |
+| 6. Selected visual persistence | Copy selected JPEG, ghi canonical metadata và subset selected embeddings từ dense vectors | `data/keyframes/<video_id>/`, `data/metadata/keyframes_<video_id>.jsonl`, `data/embeddings/siglip2_*_<video_id>.npy` | `(Get-Content "data\metadata\keyframes_$videoId.jsonl" \| Measure-Object -Line).Lines` |
+| 7. Selected multimodal enrichment | Chạy Florence-2, PP-OCRv5 và YOLOE chỉ trên canonical selected keyframes | `data/metadata/captions_<video_id>.jsonl`, `ocr_<video_id>.jsonl`, `objects_<video_id>.jsonl` | `Get-ChildItem data\metadata\*_$videoId.jsonl` |
+| 8. Validation/commit | Kiểm identity, count, checksum và chỉ ghi commit marker cuối cùng khi pass | `data/metadata/keyframes_<video_id>_extract_report.json` | `Get-Content "data\metadata\keyframes_${videoId}_extract_report.json" -Raw \| ConvertFrom-Json \| Select-Object status, dense_candidate_count, selected_count` |
 
 File có mặt không tự động đồng nghĩa stage hợp lệ. Khi chạy lại với `--resume`,
 pipeline validate contract/checksum rồi mới log `[SKIP]`; checkpoint sai sẽ bị
 chạy lại.
+
+Count invariant của kiến trúc mới phải là:
+
+```powershell
+$denseCount = (Get-Content "data\candidates\$videoId.jsonl" | Measure-Object -Line).Lines
+$denseSiglip = (Get-Content "data\candidate_features\$videoId\siglip2_metadata.jsonl" | Measure-Object -Line).Lines
+$selectedCount = (Get-Content "data\metadata\keyframes_$videoId.jsonl" | Measure-Object -Line).Lines
+$captionCount = (Get-Content "data\metadata\captions_$videoId.jsonl" | Measure-Object -Line).Lines
+$ocrCount = (Get-Content "data\metadata\ocr_$videoId.jsonl" | Measure-Object -Line).Lines
+$objectCount = (Get-Content "data\metadata\objects_$videoId.jsonl" | Measure-Object -Line).Lines
+
+[pscustomobject]@{
+  DenseCandidates = $denseCount
+  DenseSiglip = $denseSiglip
+  SelectedKeyframes = $selectedCount
+  SelectedCaptions = $captionCount
+  SelectedOcr = $ocrCount
+  SelectedObjects = $objectCount
+}
+```
+
+Kết quả hợp lệ cần có `DenseCandidates == DenseSiglip` và ba selected modality
+counts đều bằng `SelectedKeyframes`. Không có invariant
+`dense_count == caption_count == ocr_count == object_count` nữa.
 
 ### 6.3. Build full dataset và publish corpus
 
@@ -294,7 +329,7 @@ Sau khi smoke một video ổn, chạy toàn bộ thư mục:
 
 1. Selected-keyframe SigLIP2 FAISS cho coarse retrieval.
 2. Full dense-candidate SigLIP2 FAISS cho global rescue/CSES.
-3. BM25 index cho caption/OCR/object text.
+3. BM25 index cho caption/OCR/object text của selected keyframes.
 4. `neighbors_all.jsonl` và `segments_all.jsonl` từ canonical selected frames.
 5. BGE-M3 dense text index, trừ khi truyền `--skip-bge`.
 6. `offline_corpus_manifest.json` chứa checksum và `bundle_generation` của cả
@@ -328,7 +363,31 @@ Nếu OOM, giảm batch trước khi đổi model/quantization:
 Caption backend canonical hiện chỉ hỗ trợ `--caption-quantization none`. Đừng
 truyền `4bit`/`8bit` chỉ vì CLI liệt kê choice; backend sẽ từ chối rõ ràng.
 
-### 6.5. Resume và rebuild
+### 6.5. Profile deadline với max-gap 4 giây
+
+Để giảm số frame phải chạy Caption/OCR/Object, có thể dùng profile explicit sau
+cho smoke trước:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.offline_pipeline `
+  --video-path data\raw\video\L01_V001.mp4 `
+  --output-dir data `
+  --device auto `
+  --max-gap-seconds 4.0 `
+  --skip-corpus `
+  --resume `
+  --verbose
+```
+
+`--max-gap-seconds 4.0` nới temporal coverage và, khi không truyền density/count
+explicit, tự suy ra soft density `0.25` tương ứng khoảng một selected frame mỗi
+bốn giây. `--target-density-per-second` vẫn override được khi cần. Shot/boundary
+coverage vẫn là hard constraint, nên video có rất nhiều shot ngắn có thể chọn
+nhiều hơn target.
+Đừng suy ra chắc chắn `selected_count << dense_count` chỉ từ config; phải nhìn
+count và runtime của video smoke thật.
+
+### 6.6. Resume, schema migration và rebuild
 
 ```powershell
 # Resume là mặc định; ghi rõ để command tự mô tả
@@ -343,7 +402,14 @@ truyền `4bit`/`8bit` chỉ vì CLI liệt kê choice; backend sẽ từ chối
 `--force` tốn tài nguyên lớn. Không cần xóa tay artifact trước; xóa lẻ dễ tạo
 bundle nửa cũ nửa mới và làm lineage khó audit.
 
-### 6.6. Xác nhận offline đã hoàn tất
+Artifact full-dense multimodal của kiến trúc cũ không tương thích với dense
+visual schema mới. Khi `--resume`, pipeline phải invalidate/regenerate stage
+không tương thích; tuyệt đối không lấp `caption=""`, `ocr_text=""` hoặc
+`objects=[]` vào dense rows để qua validator. Nếu online báo dense manifest cũ,
+chạy lại full command với `--build-corpus --resume`; chỉ dùng `--force` khi log
+cho thấy checkpoint vẫn không thể được migrate an toàn.
+
+### 6.7. Xác nhận offline đã hoàn tất
 
 ```powershell
 $requiredArtifacts = @(
@@ -372,7 +438,14 @@ $manifest | Select-Object status, bundle_generation, bge_enabled, video_ids
 
 $report = Get-Content data\reports\offline\corpus_report.json -Raw | ConvertFrom-Json
 $report | Select-Object status, video_count, dense_candidate_count, selected_keyframe_count
+
+$denseManifest = Get-Content data\metadata\siglip2_so400m_patch16_384_dense_faiss_manifest.json -Raw | ConvertFrom-Json
+$denseManifest | Select-Object schema_version, layer, modalities, source_kind, vector_count
 ```
+
+Dense bundle hiện hành phải có `schema_version="2.0"`, `layer="dense_visual"`
+và `modalities=["siglip2"]`. Manifest cũ hoặc dense metadata chứa top-level
+`caption`, `ocr_text` hay `objects` là incompatible và phải được regenerate.
 
 Nếu không dùng `--skip-bge`, kiểm tra thêm:
 
@@ -728,12 +801,13 @@ manifest, online trace và đánh giá có ground truth.
 |---|---|---|
 | Video gốc | `data/raw/video/` | Nguồn offline và TRAKE local refinement |
 | Dense candidates | `data/candidates/`, `data/dense_keyframes/` | Full candidate pool trước selection |
-| Candidate features | `data/candidate_features/` | SigLIP2/caption/OCR/object theo video |
+| Dense visual features | `data/candidate_features/` | Full-dense SigLIP2 theo video; không chứa Caption/OCR/Object |
 | Selected keyframes | `data/keyframes/`, `data/metadata/keyframes_*.jsonl` | Canonical sparse frames |
+| Selected semantic metadata | `data/metadata/captions_*.jsonl`, `ocr_*.jsonl`, `objects_*.jsonl` | Caption/OCR/Object chỉ cho selected IDs |
 | Selected visual index | `data/indexes/siglip2_so400m_patch16_384_flat_ip.faiss` | Coarse visual retrieval |
-| Dense visual index | `data/indexes/siglip2_so400m_patch16_384_dense_flat_ip.faiss` | Global rescue và CSES |
-| Sparse text index | `data/indexes/retrieval_text_index.json` | BM25 caption/OCR/objects |
-| BGE-M3 | `data/indexes/bge_m3/` | Optional dense text cho QA/TRAKE |
+| Dense visual index | `data/indexes/siglip2_so400m_patch16_384_dense_flat_ip.faiss` | Full-dense SigLIP2 global rescue/CSES, schema v2.0 |
+| Sparse text index | `data/indexes/retrieval_text_index.json` | BM25 trên selected Caption/OCR/Objects |
+| BGE-M3 | `data/indexes/bge_m3/` | Optional dense text từ selected metadata cho QA/TRAKE |
 | Context | `data/metadata/neighbors_all.jsonl`, `segments_all.jsonl` | Bounded neighbor/segment evidence |
 | Corpus commit | `data/metadata/offline_corpus_manifest.json` | Checksum và bundle generation |
 | Reports | `data/reports/` | Stage, corpus và query trace |
@@ -783,6 +857,11 @@ routing_trace.coarse_to_dense.fallback_reason
 
 `selected_only_fallback` thường do dense bundle thiếu. Bundle có mặt nhưng corrupt
 hoặc sai generation phải fail closed; không nên đổi config để nuốt lỗi checksum.
+
+Nếu lỗi nhắc `Unsupported dense-candidate manifest schema`, `layer` hoặc
+`modalities`, đó thường là artifact kiến trúc cũ chứ không phải thiếu file. Rebuild
+corpus bằng command mục 6.3; đừng sửa tay manifest vì checksum và row lineage sẽ
+không còn đáng tin.
 
 ### Qwen expansion không chạy
 

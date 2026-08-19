@@ -9,8 +9,10 @@ import numpy as np
 from backend.app.services.indexing.keyframe_feature_adapter import FeatureAdapterConfig
 from backend.app.services.indexing.keyframe_multimodal_pipeline import (
     KEYFRAME_STRATEGY_MULTIMODAL_COVERAGE,
+    KEYFRAME_STRATEGY_VISUAL_TEMPORAL,
     MultimodalKeyframePipelineError,
     run_multimodal_keyframe_pipeline,
+    run_visual_temporal_keyframe_pipeline,
 )
 from backend.app.services.indexing.keyframe_selection import (
     PHASE_MMR,
@@ -187,6 +189,30 @@ def run_pipeline(
         or SelectionConfig(max_gap_seconds=1.25, target_keyframes=None),
         adapter_config=adapter_config(),
         allow_partial_features=allow_partial_features,
+    )
+
+
+def run_visual_pipeline(
+    *,
+    candidates: list[dict[str, object]] | None = None,
+    embeddings: np.ndarray | None = None,
+    embedding_records: list[dict[str, object]] | None = None,
+):
+    default_embeddings, default_embedding_records = embedding_artifacts()
+    return run_visual_temporal_keyframe_pipeline(
+        candidates if candidates is not None else candidate_records(),
+        embeddings=embeddings if embeddings is not None else default_embeddings,
+        embedding_records=(
+            embedding_records
+            if embedding_records is not None
+            else default_embedding_records
+        ),
+        video_duration=4.0,
+        selection_config=SelectionConfig(
+            max_gap_seconds=1.25,
+            target_keyframes=None,
+        ),
+        adapter_config=adapter_config(),
     )
 
 
@@ -368,6 +394,76 @@ class MultimodalKeyframePipelineTest(unittest.TestCase):
         self.assertEqual(first.candidate_ledger, second.candidate_ledger)
         self.assertEqual(first.event_ledger, second.event_ledger)
         self.assertEqual(first.guarantee_report, second.guarantee_report)
+        np.testing.assert_array_equal(first.final_embeddings, second.final_embeddings)
+
+    def test_visual_temporal_uses_dense_siglip_without_semantic_modalities(self) -> None:
+        source_matrix, _ = embedding_artifacts()
+
+        result = run_visual_pipeline()
+
+        self.assertTrue(result.final_records)
+        self.assertTrue(result.guarantee_report.constraints_satisfied)
+        self.assertTrue(result.guarantee_report.temporal_coverage_satisfied)
+        self.assertTrue(result.guarantee_report.shot_coverage_satisfied)
+        self.assertLessEqual(
+            result.guarantee_report.observed_max_gap_seconds,
+            result.guarantee_report.configured_max_gap_seconds,
+        )
+        self.assertTrue(
+            all(
+                record["keyframe_strategy"] == KEYFRAME_STRATEGY_VISUAL_TEMPORAL
+                for record in result.final_records
+            )
+        )
+        self.assertEqual(result.final_caption_records, ())
+        self.assertEqual(result.final_ocr_records, ())
+        self.assertEqual(result.final_object_records, ())
+
+        selected_ids = [record["candidate_id"] for record in result.final_records]
+        source_row = {f"C{index}": index for index in range(len(source_matrix))}
+        expected = source_matrix[
+            [source_row[candidate_id] for candidate_id in selected_ids]
+        ]
+        np.testing.assert_array_equal(result.final_embeddings, expected)
+        self.assertEqual(
+            [record["candidate_id"] for record in result.final_embedding_records],
+            selected_ids,
+        )
+        self.assertEqual(
+            [record["embedding_index"] for record in result.final_embedding_records],
+            list(range(len(selected_ids))),
+        )
+
+    def test_visual_temporal_is_deterministic_when_dense_inputs_are_shuffled(
+        self,
+    ) -> None:
+        first = run_visual_pipeline()
+        matrix, metadata = embedding_artifacts()
+        order = list(range(len(metadata)))
+        random.Random(42).shuffle(order)
+        shuffled_matrix = np.ascontiguousarray(matrix[order])
+        shuffled_metadata: list[dict[str, object]] = []
+        for new_index, old_index in enumerate(order):
+            record = copy.deepcopy(metadata[old_index])
+            record["embedding_index"] = new_index
+            shuffled_metadata.append(record)
+
+        second = run_visual_pipeline(
+            candidates=list(reversed(candidate_records())),
+            embeddings=shuffled_matrix,
+            embedding_records=shuffled_metadata,
+        )
+
+        self.assertEqual(first.final_records, second.final_records)
+        self.assertEqual(first.final_embedding_records, second.final_embedding_records)
+        self.assertEqual(first.candidate_ledger, second.candidate_ledger)
+        self.assertEqual(first.event_ledger, second.event_ledger)
+        self.assertEqual(first.guarantee_report, second.guarantee_report)
+        self.assertTrue(second.guarantee_report.temporal_coverage_satisfied)
+        self.assertTrue(second.guarantee_report.shot_coverage_satisfied)
+        self.assertEqual(second.final_caption_records, ())
+        self.assertEqual(second.final_ocr_records, ())
+        self.assertEqual(second.final_object_records, ())
         np.testing.assert_array_equal(first.final_embeddings, second.final_embeddings)
 
 

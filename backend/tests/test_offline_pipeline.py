@@ -34,6 +34,11 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_public_exports_reference_live_symbols(self) -> None:
+        for name in pipeline.__all__:
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(pipeline, name))
+
     def _video(self, video_id: str) -> Path:
         path = self.root / "videos" / f"{video_id}.mp4"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,11 +115,11 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             contract_sha256="materialization-contract",
         )
 
-    def _feature_bundle(
+    def _dense_visual_bundle(
         self,
         video_id: str,
         count: int,
-    ) -> pipeline.DenseFeatureArtifacts:
+    ) -> pipeline.DenseVisualArtifacts:
         dense = self._dense_records(video_id, count)
         embedding_records = tuple(
             {
@@ -127,47 +132,55 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             }
             for index, record in enumerate(dense)
         )
+        embeddings = np.tile(
+            np.asarray([[1.0, 0.0]], dtype=np.float32),
+            (count, 1),
+        )
+        return pipeline.DenseVisualArtifacts(
+            embeddings=embeddings,
+            embedding_records=embedding_records,
+            contract_sha256="dense-siglip-contract",
+        )
+
+    def _selected_multimodal_bundle(
+        self,
+        records: tuple[dict, ...],
+    ) -> pipeline.SelectedMultimodalArtifacts:
         captions = tuple(
             {
                 "candidate_id": record["candidate_id"],
                 "frame_id": record["frame_id"],
-                "video_id": video_id,
+                "video_id": record["video_id"],
                 "status": "success",
                 "caption": f"caption {index}",
             }
-            for index, record in enumerate(dense)
+            for index, record in enumerate(records)
         )
         ocr = tuple(
             {
                 "candidate_id": record["candidate_id"],
                 "frame_id": record["frame_id"],
-                "video_id": video_id,
+                "video_id": record["video_id"],
                 "status": "success",
                 "ocr_text": "",
             }
-            for record in dense
+            for record in records
         )
         objects = tuple(
             {
                 "candidate_id": record["candidate_id"],
                 "frame_id": record["frame_id"],
-                "video_id": video_id,
+                "video_id": record["video_id"],
                 "status": "success",
                 "objects": [],
             }
-            for record in dense
+            for record in records
         )
-        embeddings = np.tile(
-            np.asarray([[1.0, 0.0]], dtype=np.float32),
-            (count, 1),
-        )
-        return pipeline.DenseFeatureArtifacts(
-            embeddings=embeddings,
-            embedding_records=embedding_records,
+        return pipeline.SelectedMultimodalArtifacts(
             caption_records=captions,
             ocr_records=ocr,
             object_records=objects,
-            contract_sha256="features-contract",
+            contract_sha256="selected-multimodal-contract",
         )
 
     def _video_artifacts(
@@ -202,8 +215,14 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         shots = self._shot_stage(video.stem, 3)
         candidates = self._candidate_stage(video.stem, 3)
         materialized = self._materialized_stage(video.stem, 3)
-        features = self._feature_bundle(video.stem, 3)
+        features = self._dense_visual_bundle(video.stem, 3)
         selection = SimpleNamespace()
+        selected_visual = pipeline.MaterializedStageResult(
+            records=(materialized.records[0],),
+            report={"selected_count": 1},
+            contract_sha256="selected-visual-contract",
+        )
+        modalities = self._selected_multimodal_bundle(selected_visual.records)
         artifacts = self._video_artifacts(video)
         events: list[str] = []
 
@@ -226,12 +245,12 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             ),
             patch.object(
                 pipeline,
-                "_extract_all_dense_features",
-                side_effect=self._recording_stage(events, "features", features),
+                "_extract_dense_visual_features",
+                side_effect=self._recording_stage(events, "dense_siglip", features),
             ),
             patch.object(
                 pipeline,
-                "_run_multimodal_selection",
+                "_run_visual_temporal_selection",
                 side_effect=self._recording_stage(
                     events,
                     "selection",
@@ -240,7 +259,25 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             ),
             patch.object(
                 pipeline,
-                "_persist_selected_artifacts",
+                "_persist_selected_visual_artifacts",
+                side_effect=self._recording_stage(
+                    events,
+                    "selected_visual",
+                    selected_visual,
+                ),
+            ),
+            patch.object(
+                pipeline,
+                "_extract_selected_multimodal_features",
+                side_effect=self._recording_stage(
+                    events,
+                    "selected_multimodal",
+                    modalities,
+                ),
+            ),
+            patch.object(
+                pipeline,
+                "_finalize_selected_artifacts",
                 side_effect=self._recording_stage(events, "persistence", None),
             ),
             patch.object(
@@ -259,73 +296,76 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 "shots",
                 "candidates",
                 "materialization",
-                "features",
+                "dense_siglip",
                 "selection",
+                "selected_visual",
+                "selected_multimodal",
                 "persistence",
                 "validation",
             ],
         )
 
-    def test_feature_extraction_receives_the_entire_dense_pool(self) -> None:
+    def test_dense_feature_extractor_runs_only_siglip_on_the_full_pool(self) -> None:
         video = self._video("video_dense")
         count = 100
-        shots = self._shot_stage(video.stem, count)
-        candidates = self._candidate_stage(video.stem, count)
         materialized = self._materialized_stage(video.stem, count)
-        features = self._feature_bundle(video.stem, count)
-        artifacts = self._video_artifacts(video, dense_count=count)
-        received_counts: list[int] = []
-
-        def extract(_video_path, dense_pool, _config, _paths):
-            received_counts.append(len(dense_pool.records))
-            self.assertIs(dense_pool, materialized)
-            self.assertEqual(
-                [record["candidate_id"] for record in dense_pool.records],
-                [candidate.candidate_id for candidate in candidates.candidates],
-            )
-            return features
+        expected = self._dense_visual_bundle(video.stem, count)
+        paths = pipeline.PerVideoPaths.from_config(video.stem, self.config)
 
         with (
-            patch.object(pipeline, "_try_load_complete_video", return_value=None),
-            patch.object(pipeline, "_load_or_run_shot_detection", return_value=shots),
             patch.object(
                 pipeline,
-                "_load_or_run_dense_candidate_generation",
-                return_value=candidates,
-            ),
-            patch.object(
-                pipeline,
-                "_load_or_run_dense_materialization",
-                return_value=materialized,
-            ),
-            patch.object(pipeline, "_extract_all_dense_features", side_effect=extract),
-            patch.object(
-                pipeline,
-                "_run_multimodal_selection",
-                return_value=(SimpleNamespace(), {"contract_sha256": "selection"}),
-            ),
-            patch.object(pipeline, "_persist_selected_artifacts"),
-            patch.object(
-                pipeline,
-                "_validate_and_commit_video",
-                return_value=artifacts,
-            ),
-            patch.object(pipeline, "_release_accelerator_memory"),
+                "_load_or_run_siglip_features",
+                return_value=(
+                    expected.embeddings,
+                    expected.embedding_records,
+                    expected.contract_sha256,
+                ),
+            ) as siglip,
+            patch.object(pipeline, "_load_or_run_caption_features") as caption,
+            patch.object(pipeline, "_load_or_run_ocr_features") as ocr,
+            patch.object(pipeline, "_load_or_run_object_features") as objects,
         ):
-            pipeline.process_video(video, self.config)
+            result = pipeline._extract_dense_visual_features(
+                video,
+                materialized,
+                self.config,
+                paths,
+            )
 
-        self.assertEqual(received_counts, [100])
+        self.assertEqual(result.embeddings.shape[0], count)
+        self.assertEqual(len(result.embedding_records), count)
+        self.assertFalse(hasattr(result, "caption_records"))
+        self.assertFalse(hasattr(result, "ocr_records"))
+        self.assertFalse(hasattr(result, "object_records"))
+        siglip.assert_called_once_with(video, materialized, self.config, paths)
+        caption.assert_not_called()
+        ocr.assert_not_called()
+        objects.assert_not_called()
 
-    def test_selector_receives_full_aligned_dense_multimodal_pool(self) -> None:
+    def test_visual_selector_receives_dense_siglip_without_semantic_artifacts(
+        self,
+    ) -> None:
         video_id = "video_selector"
         count = 100
         shots = self._shot_stage(video_id, count)
         materialized = self._materialized_stage(video_id, count)
-        features = self._feature_bundle(video_id, count)
+        features = self._dense_visual_bundle(video_id, count)
         selected = SimpleNamespace(
             final_records=(materialized.records[0],),
             guarantee_report=SimpleNamespace(constraints_satisfied=True),
             candidate_ledger=materialized.records,
+            adapter_report=SimpleNamespace(
+                modality_available_counts={
+                    "transition": count,
+                    "caption": 0,
+                    "ocr": 0,
+                    "objects": 0,
+                }
+            ),
+            final_caption_records=(),
+            final_ocr_records=(),
+            final_object_records=(),
         )
 
         with (
@@ -336,11 +376,11 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             ),
             patch.object(
                 pipeline,
-                "run_multimodal_keyframe_pipeline",
+                "run_visual_temporal_keyframe_pipeline",
                 return_value=selected,
             ) as selector,
         ):
-            result, contract = pipeline._run_multimodal_selection(
+            result, contract = pipeline._run_visual_temporal_selection(
                 shots,
                 materialized,
                 features,
@@ -355,28 +395,30 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         self.assertEqual(len(args[0]), 100)
         self.assertEqual(kwargs["embeddings"].shape[0], 100)
         expected_ids = [record["candidate_id"] for record in materialized.records]
-        for key in (
-            "embedding_records",
+        self.assertEqual(
+            [record["candidate_id"] for record in kwargs["embedding_records"]],
+            expected_ids,
+        )
+        self.assertTrue(
+            set(record["candidate_id"] for record in result.final_records).issubset(
+                expected_ids
+            )
+        )
+        for forbidden in (
+            "caption_records",
             "ocr_records",
             "object_records",
-            "caption_records",
+            "allow_partial_features",
         ):
-            self.assertEqual(
-                [record["candidate_id"] for record in kwargs[key]],
-                expected_ids,
-            )
-        self.assertFalse(kwargs["allow_partial_features"])
+            self.assertNotIn(forbidden, kwargs)
 
-    def test_selector_rejects_a_missing_dense_feature_before_selection(self) -> None:
+    def test_visual_selector_rejects_missing_dense_siglip_before_selection(self) -> None:
         video_id = "video_misaligned"
         materialized = self._materialized_stage(video_id, 4)
-        features = self._feature_bundle(video_id, 4)
-        misaligned = pipeline.DenseFeatureArtifacts(
+        features = self._dense_visual_bundle(video_id, 4)
+        misaligned = pipeline.DenseVisualArtifacts(
             embeddings=features.embeddings,
-            embedding_records=features.embedding_records,
-            caption_records=features.caption_records,
-            ocr_records=features.ocr_records[:-1],
-            object_records=features.object_records,
+            embedding_records=features.embedding_records[:-1],
             contract_sha256=features.contract_sha256,
         )
 
@@ -386,10 +428,13 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 "_selection_contract",
                 return_value={"contract_sha256": "selection-contract"},
             ),
-            patch.object(pipeline, "run_multimodal_keyframe_pipeline") as selector,
+            patch.object(
+                pipeline,
+                "run_visual_temporal_keyframe_pipeline",
+            ) as selector,
         ):
-            with self.assertRaisesRegex(ValueError, "alignment mismatch"):
-                pipeline._run_multimodal_selection(
+            with self.assertRaisesRegex(ValueError, "not aligned"):
+                pipeline._run_visual_temporal_selection(
                     self._shot_stage(video_id, 4),
                     materialized,
                     misaligned,
@@ -399,6 +444,72 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
 
         selector.assert_not_called()
 
+    def test_selected_multimodal_inference_receives_exact_selected_ids(self) -> None:
+        video = self._video("video_selected_modalities")
+        dense = self._dense_records(video.stem, 6)
+        selected_records = (dense[1], dense[4])
+        selected_visual = pipeline.MaterializedStageResult(
+            records=selected_records,
+            report={"selected_count": len(selected_records)},
+            contract_sha256="selected-visual-contract",
+        )
+        expected = self._selected_multimodal_bundle(selected_records)
+        paths = pipeline.PerVideoPaths.from_config(video.stem, self.config)
+        received: dict[str, tuple[str, ...]] = {}
+
+        def stage(name, records, contract):
+            def run(_video, selected, _config, _paths):
+                self.assertIs(selected, selected_visual)
+                received[name] = tuple(
+                    str(record["candidate_id"]) for record in selected.records
+                )
+                return records, contract
+
+            return run
+
+        with (
+            patch.object(
+                pipeline,
+                "_load_or_run_caption_features",
+                side_effect=stage("caption", expected.caption_records, "caption-contract"),
+            ),
+            patch.object(
+                pipeline,
+                "_load_or_run_ocr_features",
+                side_effect=stage("ocr", expected.ocr_records, "ocr-contract"),
+            ),
+            patch.object(
+                pipeline,
+                "_load_or_run_object_features",
+                side_effect=stage("objects", expected.object_records, "object-contract"),
+            ),
+        ):
+            result = pipeline._extract_selected_multimodal_features(
+                video,
+                selected_visual,
+                self.config,
+                paths,
+            )
+
+        selected_ids = tuple(record["candidate_id"] for record in selected_records)
+        non_selected_ids = {
+            record["candidate_id"] for record in dense
+        }.difference(selected_ids)
+        self.assertEqual(set(received), {"caption", "ocr", "objects"})
+        self.assertTrue(all(ids == selected_ids for ids in received.values()))
+        self.assertTrue(
+            all(non_selected_ids.isdisjoint(ids) for ids in received.values())
+        )
+        for records in (
+            result.caption_records,
+            result.ocr_records,
+            result.object_records,
+        ):
+            self.assertEqual(
+                tuple(record["candidate_id"] for record in records),
+                selected_ids,
+            )
+
     def test_caption_stage_rejects_success_row_with_empty_caption(self) -> None:
         video = self._video("video_empty_caption")
         dense_image = self.root / "dense-empty-caption.jpg"
@@ -407,15 +518,15 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             **self._dense_records(video.stem, 1)[0],
             "keyframe_path": dense_image.as_posix(),
         }
-        materialized = pipeline.MaterializedStageResult(
+        selected_visual = pipeline.MaterializedStageResult(
             records=(dense_record,),
-            report={"candidate_count": 1},
-            contract_sha256="materialization-contract",
+            report={"selected_count": 1, "selected_images_sha256": "images-contract"},
+            contract_sha256="selected-visual-contract",
         )
         paths = pipeline.PerVideoPaths.from_config(video.stem, self.config)
-        paths.dense_metadata.parent.mkdir(parents=True, exist_ok=True)
-        paths.dense_metadata.write_text(
-            json.dumps(materialized.records[0]) + "\n",
+        paths.selected_metadata.parent.mkdir(parents=True, exist_ok=True)
+        paths.selected_metadata.write_text(
+            json.dumps(selected_visual.records[0]) + "\n",
             encoding="utf-8",
         )
 
@@ -423,8 +534,8 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             Path(output_path).write_text(
                 json.dumps(
                     {
-                        "candidate_id": materialized.records[0]["candidate_id"],
-                        "frame_id": materialized.records[0]["frame_id"],
+                        "candidate_id": selected_visual.records[0]["candidate_id"],
+                        "frame_id": selected_visual.records[0]["frame_id"],
                         "video_id": video.stem,
                         "status": "success",
                         "caption": "   ",
@@ -447,12 +558,13 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "caption"):
                 pipeline._load_or_run_caption_features(
                     video,
-                    materialized,
+                    selected_visual,
                     self.config,
                     paths,
                 )
 
         caption_runner.assert_called_once()
+        self.assertEqual(caption_runner.call_args.args[0], paths.selected_metadata)
         self.assertEqual(
             caption_runner.call_args.kwargs["model_name"],
             "florence-community/Florence-2-base-ft",
@@ -678,6 +790,46 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         self.assertTrue(result.corpus_skipped)
         self.assertEqual(existing_index.read_text(encoding="utf-8"), "keep")
 
+    def test_implicit_target_density_tracks_max_gap_but_explicit_density_wins(
+        self,
+    ) -> None:
+        parser = pipeline.build_parser()
+        implicit = pipeline._config_from_args(
+            parser.parse_args(
+                [
+                    "--video-id",
+                    "video_A",
+                    "--max-gap-seconds",
+                    "4.0",
+                    "--output-dir",
+                    str(self.config.output_dir),
+                ]
+            )
+        )
+        explicit = pipeline._config_from_args(
+            parser.parse_args(
+                [
+                    "--video-id",
+                    "video_A",
+                    "--max-gap-seconds",
+                    "4.0",
+                    "--target-density-per-second",
+                    "0.4",
+                    "--output-dir",
+                    str(self.config.output_dir),
+                ]
+            )
+        )
+
+        self.assertAlmostEqual(
+            implicit.selection_config().target_density_per_second,
+            0.25,
+        )
+        self.assertAlmostEqual(
+            explicit.selection_config().target_density_per_second,
+            0.4,
+        )
+
     def test_empty_video_id_is_rejected_instead_of_expanding_to_full_dataset(
         self,
     ) -> None:
@@ -715,7 +867,13 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         shots = self._shot_stage(video_b.stem, 3)
         candidates = self._candidate_stage(video_b.stem, 3)
         materialized = self._materialized_stage(video_b.stem, 3)
-        features = self._feature_bundle(video_b.stem, 3)
+        features = self._dense_visual_bundle(video_b.stem, 3)
+        selected_visual = pipeline.MaterializedStageResult(
+            records=(materialized.records[0],),
+            report={"selected_count": 1},
+            contract_sha256="selected-visual-contract",
+        )
+        modalities = self._selected_multimodal_bundle(selected_visual.records)
         rerun_artifact = self._video_artifacts(video_b)
 
         def validate_checkpoint(
@@ -759,15 +917,25 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             ),
             patch.object(
                 pipeline,
-                "_extract_all_dense_features",
+                "_extract_dense_visual_features",
                 return_value=features,
             ),
             patch.object(
                 pipeline,
-                "_run_multimodal_selection",
+                "_run_visual_temporal_selection",
                 return_value=(SimpleNamespace(), {"contract_sha256": "selection"}),
             ),
-            patch.object(pipeline, "_persist_selected_artifacts"),
+            patch.object(
+                pipeline,
+                "_persist_selected_visual_artifacts",
+                return_value=selected_visual,
+            ),
+            patch.object(
+                pipeline,
+                "_extract_selected_multimodal_features",
+                return_value=modalities,
+            ),
+            patch.object(pipeline, "_finalize_selected_artifacts"),
             patch.object(
                 pipeline,
                 "_validate_and_commit_video",
@@ -858,38 +1026,19 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                     "candidate_id": candidate_id,
                     "frame_id": frame_id,
                     "video_id": video.stem,
+                    "shot_id": base["shot_id"],
+                    "segment_id": base["segment_id"],
+                    "frame_index": base["frame_index"],
+                    "timestamp": base["timestamp"],
+                    "keyframe_path": base["keyframe_path"],
                     "embedding_index": 0,
                     "vector_dim": 2,
                     "normalized": True,
                 },
             ),
-            final_caption_records=(
-                {
-                    "candidate_id": candidate_id,
-                    "frame_id": frame_id,
-                    "video_id": video.stem,
-                    "status": "success",
-                    "caption": "a red bicycle",
-                },
-            ),
-            final_ocr_records=(
-                {
-                    "candidate_id": candidate_id,
-                    "frame_id": frame_id,
-                    "video_id": video.stem,
-                    "status": "success",
-                    "ocr_text": "SALE",
-                },
-            ),
-            final_object_records=(
-                {
-                    "candidate_id": candidate_id,
-                    "frame_id": frame_id,
-                    "video_id": video.stem,
-                    "status": "success",
-                    "objects": ["bicycle"],
-                },
-            ),
+            final_caption_records=(),
+            final_ocr_records=(),
+            final_object_records=(),
             candidate_ledger=(base,),
             event_ledger=(),
             to_report=lambda: {
@@ -900,10 +1049,61 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         )
         contract = pipeline._stage_contract("test_selection", fixture=True)
 
-        pipeline._persist_selected_artifacts(
+        selected_visual = pipeline._persist_selected_visual_artifacts(
             video,
             result,
             contract,
+            paths,
+        )
+        modalities = pipeline.SelectedMultimodalArtifacts(
+            caption_records=(
+                {
+                    "candidate_id": candidate_id,
+                    "frame_id": frame_id,
+                    "video_id": video.stem,
+                    "status": "success",
+                    "caption": "a red bicycle",
+                },
+            ),
+            ocr_records=(
+                {
+                    "candidate_id": candidate_id,
+                    "frame_id": frame_id,
+                    "video_id": video.stem,
+                    "status": "success",
+                    "ocr_text": "SALE",
+                },
+            ),
+            object_records=(
+                {
+                    "candidate_id": candidate_id,
+                    "frame_id": frame_id,
+                    "video_id": video.stem,
+                    "status": "success",
+                    "objects": ["bicycle"],
+                },
+            ),
+            contract_sha256="selected-multimodal-contract",
+        )
+        for path, records in (
+            (paths.selected_captions, modalities.caption_records),
+            (paths.selected_ocr, modalities.ocr_records),
+            (paths.selected_objects, modalities.object_records),
+        ):
+            pipeline._atomic_write_jsonl(path, records)
+        for report_path in (
+            paths.selected_caption_report,
+            paths.selected_ocr_report,
+            paths.selected_object_report,
+        ):
+            pipeline._atomic_write_json(
+                report_path,
+                {"status": "passed", "runtime_sec": 0.0},
+            )
+        pipeline._finalize_selected_artifacts(
+            video,
+            selected_visual,
+            modalities,
             paths,
         )
         loaded = load_canonical_keyframe_records(
@@ -916,6 +1116,7 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         self.assertEqual(record["video_id"], video.stem)
         self.assertEqual(record["frame_id"], frame_id)
         self.assertEqual(record["artifact_role"], "selected_keyframe")
+        self.assertEqual(record["architecture_version"], pipeline.ARCHITECTURE_VERSION)
         self.assertEqual(record["caption"], "a red bicycle")
         self.assertEqual(record["ocr_text"], "SALE")
         self.assertEqual(record["objects"], ["bicycle"])
@@ -954,38 +1155,19 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                     "candidate_id": candidate_id,
                     "frame_id": frame_id,
                     "video_id": video.stem,
+                    "shot_id": base["shot_id"],
+                    "segment_id": base["segment_id"],
+                    "frame_index": base["frame_index"],
+                    "timestamp": base["timestamp"],
+                    "keyframe_path": base["keyframe_path"],
                     "embedding_index": 0,
                     "vector_dim": 2,
                     "normalized": True,
                 },
             ),
-            final_caption_records=(
-                {
-                    "candidate_id": candidate_id,
-                    "frame_id": frame_id,
-                    "video_id": video.stem,
-                    "status": "success",
-                    "caption": "a validation marker frame",
-                },
-            ),
-            final_ocr_records=(
-                {
-                    "candidate_id": candidate_id,
-                    "frame_id": frame_id,
-                    "video_id": video.stem,
-                    "status": "success",
-                    "ocr_text": "",
-                },
-            ),
-            final_object_records=(
-                {
-                    "candidate_id": candidate_id,
-                    "frame_id": frame_id,
-                    "video_id": video.stem,
-                    "status": "success",
-                    "objects": [],
-                },
-            ),
+            final_caption_records=(),
+            final_ocr_records=(),
+            final_object_records=(),
             candidate_ledger=(base,),
             event_ledger=(),
             to_report=lambda: {
@@ -994,20 +1176,116 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 "guarantees": {"constraints_satisfied": True},
             },
         )
-        pipeline._persist_selected_artifacts(
-            video,
-            result,
-            pipeline._stage_contract("test_selection", fixture=True),
-            paths,
+        pipeline._atomic_write_jsonl(paths.dense_metadata, [base])
+        materialization_contract = pipeline._stage_contract(
+            pipeline.STAGE_MATERIALIZATION,
+            fixture=True,
+        )
+        materialization_report = pipeline._with_contract(
+            {
+                "status": "satisfied",
+                "candidate_count": 1,
+                "keyframe_count": 1,
+                "dense_metadata_sha256": pipeline._sha256_file(paths.dense_metadata),
+                "dense_images_sha256": pipeline._images_sha256([base]),
+            },
+            materialization_contract,
+        )
+        pipeline._atomic_write_json(paths.materialization_report, materialization_report)
+        materialized = pipeline.MaterializedStageResult(
+            records=(base,),
+            report=materialization_report,
+            contract_sha256=str(materialization_contract["contract_sha256"]),
         )
         pipeline._atomic_save_npy(paths.dense_embeddings, result.final_embeddings)
         pipeline._atomic_write_jsonl(
             paths.dense_embedding_metadata,
             result.final_embedding_records,
         )
-        pipeline._atomic_write_jsonl(paths.dense_captions, result.final_caption_records)
-        pipeline._atomic_write_jsonl(paths.dense_ocr, result.final_ocr_records)
-        pipeline._atomic_write_jsonl(paths.dense_objects, result.final_object_records)
+        pipeline._atomic_write_jsonl(paths.dense_embedding_skipped, [])
+        siglip_contract = pipeline._siglip_contract(paths, materialized, self.config)
+        pipeline._atomic_write_json(
+            paths.dense_embedding_report,
+            pipeline._with_contract(
+                {
+                    "status": "passed",
+                    "runtime_sec": 0.0,
+                    "embedding_sha256": pipeline._sha256_file(paths.dense_embeddings),
+                    "embedding_metadata_sha256": pipeline._sha256_file(
+                        paths.dense_embedding_metadata
+                    ),
+                },
+                siglip_contract,
+            ),
+        )
+        features = pipeline.DenseVisualArtifacts(
+            embeddings=result.final_embeddings,
+            embedding_records=result.final_embedding_records,
+            contract_sha256=str(siglip_contract["contract_sha256"]),
+        )
+        selection_contract = pipeline._selection_contract(
+            paths,
+            materialized,
+            features,
+            self.config,
+        )
+        selected_visual = pipeline._persist_selected_visual_artifacts(
+            video,
+            result,
+            selection_contract,
+            paths,
+        )
+        modalities = pipeline.SelectedMultimodalArtifacts(
+            caption_records=(
+                {
+                    "candidate_id": candidate_id,
+                    "frame_id": frame_id,
+                    "video_id": video.stem,
+                    "status": "success",
+                    "caption": "a validation marker frame",
+                },
+            ),
+            ocr_records=(
+                {
+                    "candidate_id": candidate_id,
+                    "frame_id": frame_id,
+                    "video_id": video.stem,
+                    "status": "success",
+                    "ocr_text": "",
+                },
+            ),
+            object_records=(
+                {
+                    "candidate_id": candidate_id,
+                    "frame_id": frame_id,
+                    "video_id": video.stem,
+                    "status": "success",
+                    "objects": [],
+                },
+            ),
+            contract_sha256="selected-multimodal-contract",
+        )
+        for output_path, records in (
+            (paths.selected_captions, modalities.caption_records),
+            (paths.selected_ocr, modalities.ocr_records),
+            (paths.selected_objects, modalities.object_records),
+        ):
+            pipeline._atomic_write_jsonl(output_path, records)
+        for report_path in (
+            paths.selected_caption_report,
+            paths.selected_ocr_report,
+            paths.selected_object_report,
+        ):
+            pipeline._atomic_write_json(
+                report_path,
+                {"status": "passed", "runtime_sec": 0.0},
+            )
+        pipeline._finalize_selected_artifacts(
+            video,
+            selected_visual,
+            modalities,
+            paths,
+        )
         shot_contract = pipeline._shot_contract(video, self.config)
         pipeline._atomic_write_json(
             paths.shot_report,
@@ -1023,6 +1301,54 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             self.assertIsNotNone(
                 pipeline._try_load_complete_video(video, self.config, paths)
             )
+
+            dense_image_bytes = dense_image.read_bytes()
+            dense_image.unlink()
+            self.assertIsNone(
+                pipeline._try_load_complete_video(video, self.config, paths)
+            )
+            dense_image.write_bytes(dense_image_bytes)
+            self.assertIsNotNone(
+                pipeline._try_load_complete_video(video, self.config, paths)
+            )
+
+            completion = pipeline._read_json(paths.completion_report)
+            self.assertEqual(
+                completion["architecture_version"],
+                pipeline.ARCHITECTURE_VERSION,
+            )
+            stale_completion = {**completion, "architecture_version": "legacy_dense_v1"}
+            pipeline._atomic_write_json(paths.completion_report, stale_completion)
+            with self.assertRaisesRegex(ValueError, "incompatible architecture"):
+                pipeline._validate_selected_bundle(
+                    video_path=video,
+                    config=self.config,
+                    paths=paths,
+                    require_completion=True,
+                )
+            self.assertIsNone(
+                pipeline._try_load_complete_video(video, self.config, paths)
+            )
+            pipeline._atomic_write_json(paths.completion_report, completion)
+
+            dense_metadata_bytes = paths.dense_embedding_metadata.read_bytes()
+            wrong_dense_record = dict(result.final_embedding_records[0])
+            wrong_dense_record["candidate_id"] = f"{video.stem}:C9999"
+            pipeline._atomic_write_jsonl(
+                paths.dense_embedding_metadata,
+                (wrong_dense_record,),
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "aligned row per dense candidate|subset of the dense SigLIP2 pool",
+            ):
+                pipeline._validate_selected_bundle(
+                    video_path=video,
+                    config=self.config,
+                    paths=paths,
+                    require_completion=False,
+                )
+            paths.dense_embedding_metadata.write_bytes(dense_metadata_bytes)
 
             paths.validation_report.write_text("{corrupt", encoding="utf-8")
             self.assertIsNone(
@@ -1045,6 +1371,43 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Source video changed"):
                 pipeline._validate_and_commit_video(video, self.config, paths)
             self.assertFalse(paths.completion_report.exists())
+
+    def test_stale_selection_architecture_is_rejected_before_resume(self) -> None:
+        video = self._video("video_stale_selection")
+        paths = pipeline.PerVideoPaths.from_config(video.stem, self.config)
+        paths.selection_report.parent.mkdir(parents=True, exist_ok=True)
+        paths.selection_report.write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "architecture_version": "legacy_dense_v1",
+                    "selection_layer": "multimodal_dense",
+                    "semantic_modalities_used_for_selection": [
+                        "caption",
+                        "ocr",
+                        "objects",
+                    ],
+                    "guarantees": {"constraints_satisfied": True},
+                    "offline_contract": {
+                        "stage": "multimodal_selection",
+                        "architecture_version": "legacy_dense_v1",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "incompatible architecture"):
+            pipeline._validate_selected_bundle(
+                video_path=video,
+                config=self.config,
+                paths=paths,
+                require_completion=False,
+            )
+        self.assertIsNone(
+            pipeline._try_load_complete_video(video, self.config, paths)
+        )
 
     def test_canonical_loader_rejects_filename_row_video_mismatch_in_all_modes(
         self,
@@ -1250,6 +1613,8 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             "video_id": video_id,
             "frame_id": frame_id,
             "artifact_role": "selected_keyframe",
+            "layer": "selected_multimodal",
+            "architecture_version": pipeline.ARCHITECTURE_VERSION,
             "keyframe_path": f"keyframes/{video_id}/{frame_id}.jpg",
             "timestamp": 1.0,
             "timestamp_source": "video_fps",
@@ -1293,6 +1658,37 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 json.dumps(record, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
+        selected_vector = np.asarray([[1.0, 0.0]], dtype=np.float32)
+        selected_embedding = {
+            **selected,
+            "embedding_id": f"EMB_{frame_id}",
+            "embedding_index": 0,
+            "model_family": "siglip2",
+            "model_name": "google/siglip2-so400m-patch16-384",
+            "model_revision": "unit-test-revision",
+            "processor_name": "google/siglip2-so400m-patch16-384",
+            "vector_dim": 2,
+            "input_resolution": 384,
+            "normalized": True,
+            "similarity": "cosine",
+            "output_dtype": "float32",
+        }
+        paths.selected_embeddings.parent.mkdir(parents=True, exist_ok=True)
+        np.save(paths.selected_embeddings, selected_vector)
+        paths.selected_embedding_metadata.write_text(
+            json.dumps(selected_embedding, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        for report_path in (
+            paths.selected_caption_report,
+            paths.selected_ocr_report,
+            paths.selected_object_report,
+        ):
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps({"status": "passed", "runtime_sec": 0.0}) + "\n",
+                encoding="utf-8",
+            )
         dense_vectors = np.asarray(
             [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]],
             dtype=np.float32,
@@ -1300,9 +1696,6 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         paths.dense_embeddings.parent.mkdir(parents=True, exist_ok=True)
         np.save(paths.dense_embeddings, dense_vectors)
         dense_records = []
-        dense_captions = []
-        dense_ocr = []
-        dense_objects = []
         dense_ledger = []
         for index in range(3):
             candidate_id = f"{video_id}:C{index:04d}"
@@ -1333,42 +1726,22 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                     "output_dtype": "float32",
                 }
             )
-            dense_captions.append(
-                {**common, "status": "success", "caption": f"{caption} {index}"}
-            )
-            dense_ocr.append(
-                {**common, "status": "success", "ocr_text": f"ocr-{video_id}-{index}"}
-            )
-            dense_objects.append(
-                {
-                    **common,
-                    "status": "success",
-                    "objects": [
-                        {"class_name": f"object-{video_id}-{index}", "confidence": 0.9}
-                    ],
-                }
-            )
             dense_ledger.append(
                 {
                     **common,
                     "selected": index == 0,
                     "importance_score": 1.0 - index * 0.1,
                     "semantic_novelty": index * 0.1,
-                    "component_scores": {"caption": 0.8},
-                    "available_modalities": ["caption", "ocr", "objects"],
-                    "feature_protected_event_ids": (
-                        [f"EVENT_{video_id}_000001"] if index == 1 else []
-                    ),
+                    "component_scores": {"transition": 0.8},
+                    "available_modalities": ["transition"],
+                    "feature_protected_event_ids": [],
                     "selection_rank": 1 if index == 0 else None,
-                    "selection_phase": "protected" if index == 0 else None,
+                    "selection_phase": "coverage" if index == 0 else None,
                     "selection_reasons": ["unit_test"] if index == 0 else [],
                 }
             )
         for path, records in (
             (paths.dense_embedding_metadata, dense_records),
-            (paths.dense_captions, dense_captions),
-            (paths.dense_ocr, dense_ocr),
-            (paths.dense_objects, dense_objects),
             (paths.candidate_ledger, dense_ledger),
         ):
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1376,6 +1749,10 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
                 encoding="utf-8",
             )
+        paths.dense_embedding_report.write_text(
+            json.dumps({"status": "passed", "runtime_sec": 0.0}) + "\n",
+            encoding="utf-8",
+        )
         return selected
 
     def test_neighbor_and_segment_stages_use_selected_keyframes_and_modalities(
@@ -1517,7 +1894,14 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             artifact = self._video_artifacts(video)
             artifact.paths.completion_report.parent.mkdir(parents=True, exist_ok=True)
             artifact.paths.completion_report.write_text(
-                json.dumps({"status": "passed", "artifact_hashes": {}}) + "\n",
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "architecture_version": pipeline.ARCHITECTURE_VERSION,
+                        "artifact_hashes": {},
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
             artifacts.append(artifact)
@@ -1539,7 +1923,7 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
                 pipeline,
                 "_validate_selected_bundle",
                 side_effect=validate_video,
-            ),
+            ) as bundle_validator,
             patch.object(
                 pipeline,
                 "load_canonical_keyframe_records",
@@ -1650,6 +2034,7 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         self.assertEqual(report["video_ids"], ["video_A", "video_B"])
         self.assertEqual(report["video_count"], 2)
         self.assertEqual(report["selected_keyframe_count"], 2)
+        self.assertEqual(bundle_validator.call_count, 4)
         bge_builder.assert_not_called()
 
     def test_corpus_bundle_is_staged_committed_and_resumed_as_one_generation(
@@ -1685,7 +2070,14 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         )
         paths.completion_report.parent.mkdir(parents=True, exist_ok=True)
         paths.completion_report.write_text(
-            json.dumps({"status": "passed", "artifact_hashes": {}}) + "\n",
+            json.dumps(
+                {
+                    "status": "passed",
+                    "architecture_version": pipeline.ARCHITECTURE_VERSION,
+                    "artifact_hashes": {},
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
 
@@ -1810,7 +2202,14 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         artifact = self._video_artifacts(video)
         artifact.paths.completion_report.parent.mkdir(parents=True, exist_ok=True)
         artifact.paths.completion_report.write_text(
-            json.dumps({"status": "passed", "artifact_hashes": {}}) + "\n",
+            json.dumps(
+                {
+                    "status": "passed",
+                    "architecture_version": pipeline.ARCHITECTURE_VERSION,
+                    "artifact_hashes": {},
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         corpus_paths = pipeline.CorpusPaths.from_config(config)
@@ -1861,7 +2260,14 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         artifact = self._video_artifacts(video)
         artifact.paths.completion_report.parent.mkdir(parents=True, exist_ok=True)
         artifact.paths.completion_report.write_text(
-            json.dumps({"status": "passed", "artifact_hashes": {}}) + "\n",
+            json.dumps(
+                {
+                    "status": "passed",
+                    "architecture_version": pipeline.ARCHITECTURE_VERSION,
+                    "artifact_hashes": {},
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         corpus_paths = pipeline.CorpusPaths.from_config(self.config)

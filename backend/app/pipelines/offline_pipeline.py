@@ -1,11 +1,11 @@
 """Canonical sequential offline orchestration for multimodal video retrieval.
 
 The expensive unit of work is one video.  A video completes dense candidate
-generation, full-pool materialization, every configured feature extractor,
-multimodal selection, canonical publication, and validation before the next
-video starts.  Corpus indexes, selected-keyframe neighbor mappings, and
-segment/event metadata are built only from the explicit set of videos that
-completed that contract.
+generation and full-pool materialization, encodes SigLIP2 for that visual pool,
+selects a bounded visual-temporal subset, and only then runs caption/OCR/object
+inference for the selected keyframes.  Corpus indexes, selected-keyframe
+neighbor mappings, and segment/event metadata are built only from the explicit
+set of videos that completed that contract.
 
 This module intentionally orchestrates existing algorithms.  Shot detection,
 dense sampling, image decoding, feature inference, selection, and index
@@ -67,7 +67,7 @@ from backend.app.services.indexing.keyframe_candidates import (
 )
 from backend.app.services.indexing.keyframe_multimodal_pipeline import (
     MultimodalKeyframePipelineResult,
-    run_multimodal_keyframe_pipeline,
+    run_visual_temporal_keyframe_pipeline,
 )
 from backend.app.services.indexing.keyframe_selection import (
     DEFAULT_MAX_GAP_SECONDS,
@@ -108,13 +108,19 @@ from backend.app.services.retrieval.bge_dense import (
     validate_bge_m3_artifacts,
 )
 from backend.app.services.retrieval.dense_candidate_index import (
+    DENSE_ARCHITECTURE_VERSION,
     DENSE_ARTIFACT_ROLE,
     DENSE_FRAME_MAP_NAME,
     DENSE_INDEX_NAME,
+    DENSE_LAYER,
     DENSE_MANIFEST_NAME,
     DENSE_MANIFEST_SCHEMA_VERSION,
     DENSE_METADATA_NAME,
+    DENSE_MODALITIES,
+    DENSE_RECORD_ARTIFACT_ROLE,
     DENSE_REPORT_NAME,
+    DenseCandidateIndexConfig,
+    validate_dense_candidate_artifacts,
 )
 from backend.app.services.retrieval.text_index import (
     MODALITIES as TEXT_MODALITIES,
@@ -125,7 +131,8 @@ from backend.app.services.retrieval.text_index import (
 LOGGER = logging.getLogger("offline_pipeline")
 PIPELINE_SCHEMA_VERSION = "1.0"
 PIPELINE_NAME = "canonical_sequential_offline"
-CORPUS_BUNDLE_SCHEMA_VERSION = "1.0"
+ARCHITECTURE_VERSION = DENSE_ARCHITECTURE_VERSION
+CORPUS_BUNDLE_SCHEMA_VERSION = "2.0"
 SUPPORTED_VIDEO_SUFFIXES = (".mp4", ".mkv", ".avi", ".mov", ".webm")
 DEFAULT_TARGET_DENSITY_PER_SECOND = 1.0 / DEFAULT_MAX_GAP_SECONDS
 CHECKPOINT_INVALID_ERRORS = (
@@ -141,11 +148,12 @@ STAGE_SHOTS = "shot_detection"
 STAGE_CANDIDATES = "dense_candidate_generation"
 STAGE_MATERIALIZATION = "dense_candidate_materialization"
 STAGE_SIGLIP = "siglip2_features"
-STAGE_OCR = "ocr_features"
-STAGE_OBJECTS = "object_features"
-STAGE_CAPTIONS = "caption_features"
-STAGE_SELECTION = "multimodal_selection"
-STAGE_PERSISTENCE = "canonical_persistence"
+STAGE_OCR = "selected_ocr_features"
+STAGE_OBJECTS = "selected_object_features"
+STAGE_CAPTIONS = "selected_caption_features"
+STAGE_SELECTION = "visual_temporal_selection"
+STAGE_SELECTED_VISUAL = "selected_visual_persistence"
+STAGE_PERSISTENCE = "selected_multimodal_persistence"
 STAGE_VALIDATION = "per_video_validation"
 
 
@@ -173,7 +181,7 @@ class OfflinePipelineConfig:
     max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS
     gap_tolerance_seconds: float = 0.0
     target_keyframes: int | None = None
-    target_density_per_second: float | None = DEFAULT_TARGET_DENSITY_PER_SECOND
+    target_density_per_second: float | None = None
     hard_max_keyframes: int | None = None
     enable_event_aware_dedup: bool = True
     dedup_similarity_threshold: float = 0.92
@@ -308,10 +316,13 @@ class OfflinePipelineConfig:
             )
 
     def selection_config(self) -> SelectionConfig:
+        target_density = self.target_density_per_second
+        if self.target_keyframes is None and target_density is None:
+            target_density = 1.0 / self.max_gap_seconds
         return SelectionConfig(
             max_gap_seconds=self.max_gap_seconds,
             target_keyframes=self.target_keyframes,
-            target_density_per_second=self.target_density_per_second,
+            target_density_per_second=target_density,
             hard_max_keyframes=self.hard_max_keyframes,
             gap_tolerance_seconds=self.gap_tolerance_seconds,
             protect_each_shot=True,
@@ -350,6 +361,9 @@ class PerVideoPaths:
     selected_captions: Path
     selected_ocr: Path
     selected_objects: Path
+    selected_caption_report: Path
+    selected_ocr_report: Path
+    selected_object_report: Path
     candidate_ledger: Path
     event_ledger: Path
     selection_report: Path
@@ -397,6 +411,9 @@ class PerVideoPaths:
             selected_captions=metadata / f"captions_{video_id}.jsonl",
             selected_ocr=metadata / f"ocr_{video_id}.jsonl",
             selected_objects=metadata / f"objects_{video_id}.jsonl",
+            selected_caption_report=report_dir / "selected_captions_report.json",
+            selected_ocr_report=report_dir / "selected_ocr_report.json",
+            selected_object_report=report_dir / "selected_objects_report.json",
             candidate_ledger=report_dir / "candidate_ledger.jsonl",
             event_ledger=report_dir / "protected_events.jsonl",
             selection_report=report_dir / "selection_report.json",
@@ -428,9 +445,14 @@ class MaterializedStageResult:
 
 
 @dataclass(frozen=True)
-class DenseFeatureArtifacts:
+class DenseVisualArtifacts:
     embeddings: np.ndarray
     embedding_records: tuple[dict[str, Any], ...]
+    contract_sha256: str
+
+
+@dataclass(frozen=True)
+class SelectedMultimodalArtifacts:
     caption_records: tuple[dict[str, Any], ...]
     ocr_records: tuple[dict[str, Any], ...]
     object_records: tuple[dict[str, Any], ...]
@@ -874,6 +896,7 @@ def _write_state(
         {
             "pipeline": PIPELINE_NAME,
             "schema_version": PIPELINE_SCHEMA_VERSION,
+            "architecture_version": ARCHITECTURE_VERSION,
             "video_id": paths.video_id,
             "video_path": video_path.resolve().as_posix(),
             "stages": stages,
@@ -1540,14 +1563,21 @@ def _load_or_run_siglip_features(
 def _modality_contract(
     stage: str,
     paths: PerVideoPaths,
-    materialized: MaterializedStageResult,
+    selected_visual: MaterializedStageResult,
     **model_contract: object,
 ) -> dict[str, object]:
     return _stage_contract(
         stage,
-        materialization_contract_sha256=materialized.contract_sha256,
-        dense_metadata_sha256=_sha256_file(paths.dense_metadata),
-        dense_images_sha256=str(materialized.report.get("dense_images_sha256")),
+        architecture_version=ARCHITECTURE_VERSION,
+        artifact_layer="selected_multimodal",
+        selected_visual_contract_sha256=selected_visual.contract_sha256,
+        selected_metadata_sha256=_sha256_file(paths.selected_metadata),
+        selected_candidate_ids_sha256=_sha256_value(
+            _candidate_ids(selected_visual.records)
+        ),
+        selected_images_sha256=str(
+            selected_visual.report.get("selected_images_sha256")
+        ),
         **model_contract,
     )
 
@@ -1557,7 +1587,7 @@ def _validate_modality_stage(
     label: str,
     output_path: Path,
     report_path: Path,
-    materialized: MaterializedStageResult,
+    expected_records: Sequence[Mapping[str, Any]],
     video_id: str,
     contract: Mapping[str, Any],
     required_nonempty_field: str | None = None,
@@ -1569,7 +1599,7 @@ def _validate_modality_stage(
     _validate_modality_records(
         label=label,
         records=records,
-        expected_candidates=materialized.records,
+        expected_candidates=expected_records,
         video_id=video_id,
         required_nonempty_field=required_nonempty_field,
     )
@@ -1741,14 +1771,14 @@ def _run_ocr_file_isolated(
 
 def _load_or_run_ocr_features(
     video_path: Path,
-    materialized: MaterializedStageResult,
+    selected_visual: MaterializedStageResult,
     config: OfflinePipelineConfig,
     paths: PerVideoPaths,
 ) -> tuple[tuple[dict[str, Any], ...], str]:
     contract = _modality_contract(
         STAGE_OCR,
         paths,
-        materialized,
+        selected_visual,
         detection_model=config.ocr_detection_model,
         recognition_model=config.ocr_recognition_model,
         model_revision=config.ocr_model_revision,
@@ -1758,9 +1788,9 @@ def _load_or_run_ocr_features(
         try:
             records = _validate_modality_stage(
                 label="OCR",
-                output_path=paths.dense_ocr,
-                report_path=paths.dense_ocr_report,
-                materialized=materialized,
+                output_path=paths.selected_ocr,
+                report_path=paths.selected_ocr_report,
+                expected_records=selected_visual.records,
                 video_id=paths.video_id,
                 contract=contract,
             )
@@ -1773,49 +1803,49 @@ def _load_or_run_ocr_features(
         _stage_log(paths.video_id, STAGE_OCR, "RUN")
 
     overwrite = config.force or not config.resume or not _can_resume_modality_stage(
-        paths.dense_ocr,
-        paths.dense_ocr_report,
+        paths.selected_ocr,
+        paths.selected_ocr_report,
         contract=contract,
-        expected_candidates=materialized.records,
+        expected_candidates=selected_visual.records,
         video_id=paths.video_id,
     )
     _mark_modality_running(
-        paths.dense_ocr_report,
+        paths.selected_ocr_report,
         contract,
         append_allowed=not overwrite,
     )
     try:
         generated_report = _run_ocr_file_isolated(
-            metadata_path=paths.dense_metadata,
-            output_path=paths.dense_ocr,
-            report_path=paths.dense_ocr_report,
+            metadata_path=paths.selected_metadata,
+            output_path=paths.selected_ocr,
+            report_path=paths.selected_ocr_report,
             config=config,
             overwrite=overwrite,
         )
-        records = _read_jsonl(paths.dense_ocr)
+        records = _read_jsonl(paths.selected_ocr)
         _validate_modality_records(
             label="OCR",
             records=records,
-            expected_candidates=materialized.records,
+            expected_candidates=selected_visual.records,
             video_id=paths.video_id,
         )
         _finalize_modality_report(
-            output_path=paths.dense_ocr,
-            report_path=paths.dense_ocr_report,
+            output_path=paths.selected_ocr,
+            report_path=paths.selected_ocr_report,
             generated_report=generated_report,
             records=records,
             contract=contract,
         )
     except Exception as exc:
-        _mark_modality_failed(paths.dense_ocr_report, contract, exc)
+        _mark_modality_failed(paths.selected_ocr_report, contract, exc)
         raise
     finally:
         _release_accelerator_memory()
     validated = _validate_modality_stage(
         label="OCR",
-        output_path=paths.dense_ocr,
-        report_path=paths.dense_ocr_report,
-        materialized=materialized,
+        output_path=paths.selected_ocr,
+        report_path=paths.selected_ocr_report,
+        expected_records=selected_visual.records,
         video_id=paths.video_id,
         contract=contract,
     )
@@ -1831,14 +1861,14 @@ def _load_or_run_ocr_features(
 
 def _load_or_run_object_features(
     video_path: Path,
-    materialized: MaterializedStageResult,
+    selected_visual: MaterializedStageResult,
     config: OfflinePipelineConfig,
     paths: PerVideoPaths,
 ) -> tuple[tuple[dict[str, Any], ...], str]:
     contract = _modality_contract(
         STAGE_OBJECTS,
         paths,
-        materialized,
+        selected_visual,
         model_name=config.object_model_name,
         model_revision=config.object_model_revision,
         confidence_threshold=config.object_conf_threshold,
@@ -1848,9 +1878,9 @@ def _load_or_run_object_features(
         try:
             records = _validate_modality_stage(
                 label="object",
-                output_path=paths.dense_objects,
-                report_path=paths.dense_object_report,
-                materialized=materialized,
+                output_path=paths.selected_objects,
+                report_path=paths.selected_object_report,
+                expected_records=selected_visual.records,
                 video_id=paths.video_id,
                 contract=contract,
             )
@@ -1863,22 +1893,22 @@ def _load_or_run_object_features(
         _stage_log(paths.video_id, STAGE_OBJECTS, "RUN")
 
     overwrite = config.force or not config.resume or not _can_resume_modality_stage(
-        paths.dense_objects,
-        paths.dense_object_report,
+        paths.selected_objects,
+        paths.selected_object_report,
         contract=contract,
-        expected_candidates=materialized.records,
+        expected_candidates=selected_visual.records,
         video_id=paths.video_id,
     )
     _mark_modality_running(
-        paths.dense_object_report,
+        paths.selected_object_report,
         contract,
         append_allowed=not overwrite,
     )
     try:
         generated_report = run_object_file(
-            paths.dense_metadata,
-            output_path=paths.dense_objects,
-            report_path=paths.dense_object_report,
+            paths.selected_metadata,
+            output_path=paths.selected_objects,
+            report_path=paths.selected_object_report,
             device=config.device,
             batch_size=config.object_batch_size,
             conf_threshold=config.object_conf_threshold,
@@ -1888,30 +1918,30 @@ def _load_or_run_object_features(
             revision=config.object_model_revision,
             model_cache_dir=config.object_model_cache_dir,
         )
-        records = _read_jsonl(paths.dense_objects)
+        records = _read_jsonl(paths.selected_objects)
         _validate_modality_records(
             label="object",
             records=records,
-            expected_candidates=materialized.records,
+            expected_candidates=selected_visual.records,
             video_id=paths.video_id,
         )
         _finalize_modality_report(
-            output_path=paths.dense_objects,
-            report_path=paths.dense_object_report,
+            output_path=paths.selected_objects,
+            report_path=paths.selected_object_report,
             generated_report=generated_report,
             records=records,
             contract=contract,
         )
     except Exception as exc:
-        _mark_modality_failed(paths.dense_object_report, contract, exc)
+        _mark_modality_failed(paths.selected_object_report, contract, exc)
         raise
     finally:
         _release_accelerator_memory()
     validated = _validate_modality_stage(
         label="object",
-        output_path=paths.dense_objects,
-        report_path=paths.dense_object_report,
-        materialized=materialized,
+        output_path=paths.selected_objects,
+        report_path=paths.selected_object_report,
+        expected_records=selected_visual.records,
         video_id=paths.video_id,
         contract=contract,
     )
@@ -1927,14 +1957,14 @@ def _load_or_run_object_features(
 
 def _load_or_run_caption_features(
     video_path: Path,
-    materialized: MaterializedStageResult,
+    selected_visual: MaterializedStageResult,
     config: OfflinePipelineConfig,
     paths: PerVideoPaths,
 ) -> tuple[tuple[dict[str, Any], ...], str]:
     contract = _modality_contract(
         STAGE_CAPTIONS,
         paths,
-        materialized,
+        selected_visual,
         model_name=config.caption_model_name,
         requested_model_revision=config.caption_model_revision,
         max_new_tokens=config.caption_max_new_tokens,
@@ -1946,9 +1976,9 @@ def _load_or_run_caption_features(
         try:
             records = _validate_modality_stage(
                 label="caption",
-                output_path=paths.dense_captions,
-                report_path=paths.dense_caption_report,
-                materialized=materialized,
+                output_path=paths.selected_captions,
+                report_path=paths.selected_caption_report,
+                expected_records=selected_visual.records,
                 video_id=paths.video_id,
                 contract=contract,
                 required_nonempty_field="caption",
@@ -1962,22 +1992,22 @@ def _load_or_run_caption_features(
         _stage_log(paths.video_id, STAGE_CAPTIONS, "RUN")
 
     overwrite = config.force or not config.resume or not _can_resume_modality_stage(
-        paths.dense_captions,
-        paths.dense_caption_report,
+        paths.selected_captions,
+        paths.selected_caption_report,
         contract=contract,
-        expected_candidates=materialized.records,
+        expected_candidates=selected_visual.records,
         video_id=paths.video_id,
     )
     _mark_modality_running(
-        paths.dense_caption_report,
+        paths.selected_caption_report,
         contract,
         append_allowed=not overwrite,
     )
     try:
         generated_report = run_caption_file(
-            paths.dense_metadata,
-            output_path=paths.dense_captions,
-            report_path=paths.dense_caption_report,
+            paths.selected_metadata,
+            output_path=paths.selected_captions,
+            report_path=paths.selected_caption_report,
             device=config.device,
             batch_size=config.caption_batch_size,
             overwrite=overwrite,
@@ -1989,33 +2019,31 @@ def _load_or_run_caption_features(
             task_prompt=config.caption_task_prompt,
             model_cache_dir=config.caption_model_cache_dir,
         )
-        records = _read_jsonl(paths.dense_captions)
-        # Caption is soft inside the selector, but canonical default requires it
-        # for every dense candidate, so the orchestrator closes that gap here.
+        records = _read_jsonl(paths.selected_captions)
         _validate_modality_records(
             label="caption",
             records=records,
-            expected_candidates=materialized.records,
+            expected_candidates=selected_visual.records,
             video_id=paths.video_id,
             required_nonempty_field="caption",
         )
         _finalize_modality_report(
-            output_path=paths.dense_captions,
-            report_path=paths.dense_caption_report,
+            output_path=paths.selected_captions,
+            report_path=paths.selected_caption_report,
             generated_report=generated_report,
             records=records,
             contract=contract,
         )
     except Exception as exc:
-        _mark_modality_failed(paths.dense_caption_report, contract, exc)
+        _mark_modality_failed(paths.selected_caption_report, contract, exc)
         raise
     finally:
         _release_accelerator_memory()
     validated = _validate_modality_stage(
         label="caption",
-        output_path=paths.dense_captions,
-        report_path=paths.dense_caption_report,
-        materialized=materialized,
+        output_path=paths.selected_captions,
+        report_path=paths.selected_caption_report,
+        expected_records=selected_visual.records,
         video_id=paths.video_id,
         contract=contract,
         required_nonempty_field="caption",
@@ -2030,12 +2058,12 @@ def _load_or_run_caption_features(
     return validated, str(contract["contract_sha256"])
 
 
-def _extract_all_dense_features(
+def _extract_dense_visual_features(
     video_path: Path,
     materialized: MaterializedStageResult,
     config: OfflinePipelineConfig,
     paths: PerVideoPaths,
-) -> DenseFeatureArtifacts:
+) -> DenseVisualArtifacts:
     try:
         embeddings, embedding_records, siglip_contract = _load_or_run_siglip_features(
             video_path,
@@ -2045,10 +2073,35 @@ def _extract_all_dense_features(
         )
     except Exception as exc:
         raise OfflineStageError(paths.video_id, STAGE_SIGLIP, exc) from exc
+    expected_count = len(materialized.records)
+    if embeddings.shape[0] != len(embedding_records) or len(embedding_records) != expected_count:
+        raise RuntimeError("dense SigLIP2 bundle is not fully aligned")
+    return DenseVisualArtifacts(
+        embeddings=embeddings,
+        embedding_records=embedding_records,
+        contract_sha256=siglip_contract,
+    )
+
+
+def _extract_selected_multimodal_features(
+    video_path: Path,
+    selected_visual: MaterializedStageResult,
+    config: OfflinePipelineConfig,
+    paths: PerVideoPaths,
+) -> SelectedMultimodalArtifacts:
+    try:
+        caption_records, caption_contract = _load_or_run_caption_features(
+            video_path,
+            selected_visual,
+            config,
+            paths,
+        )
+    except Exception as exc:
+        raise OfflineStageError(paths.video_id, STAGE_CAPTIONS, exc) from exc
     try:
         ocr_records, ocr_contract = _load_or_run_ocr_features(
             video_path,
-            materialized,
+            selected_visual,
             config,
             paths,
         )
@@ -2057,73 +2110,60 @@ def _extract_all_dense_features(
     try:
         object_records, object_contract = _load_or_run_object_features(
             video_path,
-            materialized,
+            selected_visual,
             config,
             paths,
         )
     except Exception as exc:
         raise OfflineStageError(paths.video_id, STAGE_OBJECTS, exc) from exc
-    try:
-        caption_records, caption_contract = _load_or_run_caption_features(
-            video_path,
-            materialized,
-            config,
-            paths,
-        )
-    except Exception as exc:
-        raise OfflineStageError(paths.video_id, STAGE_CAPTIONS, exc) from exc
-    expected_count = len(materialized.records)
+
+    selected_count = len(selected_visual.records)
     if not (
-        embeddings.shape[0]
-        == len(embedding_records)
+        len(caption_records)
         == len(ocr_records)
         == len(object_records)
-        == len(caption_records)
-        == expected_count
+        == selected_count
     ):
-        raise RuntimeError("dense multimodal feature bundle is not fully aligned")
-    contract_sha256 = _sha256_value(
-        {
-            "siglip": siglip_contract,
-            "ocr": ocr_contract,
-            "objects": object_contract,
-            "captions": caption_contract,
-        }
-    )
-    return DenseFeatureArtifacts(
-        embeddings=embeddings,
-        embedding_records=embedding_records,
+        raise RuntimeError("selected multimodal feature bundle is not fully aligned")
+    return SelectedMultimodalArtifacts(
         caption_records=caption_records,
         ocr_records=ocr_records,
         object_records=object_records,
-        contract_sha256=contract_sha256,
+        contract_sha256=_sha256_value(
+            {
+                "architecture_version": ARCHITECTURE_VERSION,
+                "caption": caption_contract,
+                "ocr": ocr_contract,
+                "objects": object_contract,
+            }
+        ),
     )
 
 
 def _selection_contract(
     paths: PerVideoPaths,
     materialized: MaterializedStageResult,
-    features: DenseFeatureArtifacts,
+    features: DenseVisualArtifacts,
     config: OfflinePipelineConfig,
 ) -> dict[str, object]:
     selection_config = asdict(config.selection_config())
     return _stage_contract(
         STAGE_SELECTION,
+        architecture_version=ARCHITECTURE_VERSION,
+        artifact_layer="dense_visual_to_selected",
         materialization_contract_sha256=materialized.contract_sha256,
-        feature_contract_sha256=features.contract_sha256,
+        dense_siglip_contract_sha256=features.contract_sha256,
         dense_embeddings_sha256=_sha256_file(paths.dense_embeddings),
         dense_embedding_metadata_sha256=_sha256_file(paths.dense_embedding_metadata),
-        dense_captions_sha256=_sha256_file(paths.dense_captions),
-        dense_ocr_sha256=_sha256_file(paths.dense_ocr),
-        dense_objects_sha256=_sha256_file(paths.dense_objects),
+        dense_semantic_inference_count=0,
         selection_config=selection_config,
     )
 
 
-def _run_multimodal_selection(
+def _run_visual_temporal_selection(
     shot_stage: ShotStageResult,
     materialized: MaterializedStageResult,
-    features: DenseFeatureArtifacts,
+    features: DenseVisualArtifacts,
     config: OfflinePipelineConfig,
     paths: PerVideoPaths,
 ) -> tuple[MultimodalKeyframePipelineResult, dict[str, object]]:
@@ -2137,42 +2177,32 @@ def _run_multimodal_selection(
     expected_ids = _candidate_ids(materialized.records)
     if _candidate_ids(features.embedding_records) != expected_ids:
         raise ValueError("selector input embedding order is not aligned with dense candidates")
-    _validate_modality_records(
-        label="OCR",
-        records=features.ocr_records,
-        expected_candidates=materialized.records,
-        video_id=paths.video_id,
-    )
-    _validate_modality_records(
-        label="object",
-        records=features.object_records,
-        expected_candidates=materialized.records,
-        video_id=paths.video_id,
-    )
-    _validate_modality_records(
-        label="caption",
-        records=features.caption_records,
-        expected_candidates=materialized.records,
-        video_id=paths.video_id,
-        required_nonempty_field="caption",
-    )
-    result = run_multimodal_keyframe_pipeline(
+    result = run_visual_temporal_keyframe_pipeline(
         materialized.records,
         embeddings=features.embeddings,
         embedding_records=features.embedding_records,
-        ocr_records=features.ocr_records,
-        object_records=features.object_records,
-        caption_records=features.caption_records,
         video_duration=shot_stage.info.duration,
         selection_config=config.selection_config(),
-        allow_partial_features=False,
     )
     if not result.final_records:
-        raise RuntimeError("multimodal selection returned no final keyframes")
+        raise RuntimeError("visual-temporal selection returned no final keyframes")
     if result.guarantee_report.constraints_satisfied is not True:
-        raise RuntimeError("multimodal selection failed its independent guarantee audit")
+        raise RuntimeError("visual-temporal selection failed its independent guarantee audit")
     if len(result.candidate_ledger) != len(materialized.records):
         raise RuntimeError("selector candidate ledger does not cover the full dense pool")
+    available = dict(result.adapter_report.modality_available_counts)
+    if any(int(available.get(name, 0)) for name in ("caption", "ocr", "objects")):
+        raise RuntimeError("semantic modality evidence leaked into pre-selection")
+    if int(available.get("transition", 0)) != len(materialized.records):
+        raise RuntimeError("visual selector did not receive every dense SigLIP embedding")
+    if any(
+        (
+            result.final_caption_records,
+            result.final_ocr_records,
+            result.final_object_records,
+        )
+    ):
+        raise RuntimeError("pre-selection unexpectedly produced semantic artifacts")
     return result, contract
 
 
@@ -2200,6 +2230,8 @@ def _rebase_selected_record(
     value.update(
         {
             "artifact_role": "selected_keyframe",
+            "layer": "selected_multimodal",
+            "architecture_version": ARCHITECTURE_VERSION,
             "source_dense_keyframe_path": source,
             "image_path": canonical_path,
             "keyframe_path": canonical_path,
@@ -2233,15 +2265,16 @@ def _rebase_selected_feature_record(
     return value
 
 
-def _persist_selected_artifacts(
+def _persist_selected_visual_artifacts(
     video_path: Path,
     result: MultimodalKeyframePipelineResult,
     selection_contract: Mapping[str, Any],
     paths: PerVideoPaths,
     *,
     source_signature: Mapping[str, Any] | None = None,
-) -> None:
-    _stage_log(paths.video_id, STAGE_PERSISTENCE, "RUN")
+    selection_runtime_sec: float = 0.0,
+) -> MaterializedStageResult:
+    _stage_log(paths.video_id, STAGE_SELECTED_VISUAL, "RUN")
     canonical_records: list[dict[str, Any]] = []
     canonical_by_candidate: dict[str, dict[str, Any]] = {}
     for record in result.final_records:
@@ -2266,49 +2299,46 @@ def _persist_selected_artifacts(
         )
         for index, record in enumerate(result.final_embedding_records)
     ]
-    caption_records = [
-        _rebase_selected_feature_record(
-            record,
-            canonical_by_candidate[str(record["candidate_id"])],
-        )
-        for record in result.final_caption_records
-    ]
-    ocr_records = [
-        _rebase_selected_feature_record(
-            record,
-            canonical_by_candidate[str(record["candidate_id"])],
-        )
-        for record in result.final_ocr_records
-    ]
-    object_records = [
-        _rebase_selected_feature_record(
-            record,
-            canonical_by_candidate[str(record["candidate_id"])],
-        )
-        for record in result.final_object_records
-    ]
-    for label, records in (
-        ("selected embeddings", embedding_records),
-        ("selected captions", caption_records),
-        ("selected OCR", ocr_records),
-        ("selected objects", object_records),
-    ):
+    for label, records in (("selected embeddings", embedding_records),):
         if set(_candidate_ids(records)) != set(selected_ids) or len(records) != len(selected_ids):
             raise ValueError(f"{label} do not align with the selected keyframes")
+    if any(
+        (
+            result.final_caption_records,
+            result.final_ocr_records,
+            result.final_object_records,
+        )
+    ):
+        raise ValueError("visual selection must not carry semantic modality records")
 
     validate_embedding_artifacts(result.final_embeddings, embedding_records)
     _atomic_write_jsonl(paths.selected_metadata, canonical_records)
     _atomic_save_npy(paths.selected_embeddings, result.final_embeddings)
     _atomic_write_jsonl(paths.selected_embedding_metadata, embedding_records)
-    _atomic_write_jsonl(paths.selected_captions, caption_records)
-    _atomic_write_jsonl(paths.selected_ocr, ocr_records)
-    _atomic_write_jsonl(paths.selected_objects, object_records)
     _atomic_write_jsonl(paths.candidate_ledger, result.candidate_ledger)
     _atomic_write_jsonl(paths.event_ledger, result.event_ledger)
+    selected_visual_contract = _stage_contract(
+        STAGE_SELECTED_VISUAL,
+        architecture_version=ARCHITECTURE_VERSION,
+        selection_contract_sha256=selection_contract["contract_sha256"],
+        selected_metadata_sha256=_sha256_file(paths.selected_metadata),
+        selected_images_sha256=_images_sha256(canonical_records),
+        selected_embeddings_sha256=_sha256_file(paths.selected_embeddings),
+        selected_embedding_metadata_sha256=_sha256_file(
+            paths.selected_embedding_metadata
+        ),
+        selected_candidate_ids_sha256=_sha256_value(selected_ids),
+    )
     selection_report = _with_contract(
         {
             **result.to_report(),
-            "status": "passed",
+            "architecture_version": ARCHITECTURE_VERSION,
+            "selection_layer": "visual_temporal",
+            "semantic_modalities_used_for_selection": [],
+            "dense_semantic_inference_count": 0,
+            "selection_runtime_sec": max(0.0, float(selection_runtime_sec)),
+            "status": "visual_selected",
+            "visual_selection_contract": dict(selection_contract),
             "source_video": dict(source_signature or _file_signature(video_path)),
             "selected_metadata_sha256": _sha256_file(paths.selected_metadata),
             "selected_images_sha256": _images_sha256(canonical_records),
@@ -2316,21 +2346,79 @@ def _persist_selected_artifacts(
             "selected_embedding_metadata_sha256": _sha256_file(
                 paths.selected_embedding_metadata
             ),
+        },
+        selected_visual_contract,
+    )
+    _atomic_write_json(paths.selection_report, selection_report)
+    _write_state(
+        paths,
+        video_path=video_path,
+        stage=STAGE_SELECTED_VISUAL,
+        status="passed",
+        detail={
+            "selected_count": len(canonical_records),
+            "selection_contract_sha256": selection_contract["contract_sha256"],
+            "contract_sha256": selected_visual_contract["contract_sha256"],
+        },
+    )
+    return MaterializedStageResult(
+        records=tuple(canonical_records),
+        report=selection_report,
+        contract_sha256=str(selected_visual_contract["contract_sha256"]),
+    )
+
+
+def _finalize_selected_artifacts(
+    video_path: Path,
+    selected_visual: MaterializedStageResult,
+    modalities: SelectedMultimodalArtifacts,
+    paths: PerVideoPaths,
+) -> None:
+    _stage_log(paths.video_id, STAGE_PERSISTENCE, "RUN")
+    selected_ids = _candidate_ids(selected_visual.records)
+    for label, records in (
+        ("caption", modalities.caption_records),
+        ("OCR", modalities.ocr_records),
+        ("object", modalities.object_records),
+    ):
+        if _candidate_ids(records) != selected_ids:
+            raise ValueError(f"selected {label} order does not match selected keyframes")
+
+    report = dict(selected_visual.report)
+    report.update(
+        {
+            "status": "passed",
+            "artifact_layer": "selected_multimodal",
+            "selected_multimodal_contract_sha256": modalities.contract_sha256,
             "selected_captions_sha256": _sha256_file(paths.selected_captions),
             "selected_ocr_sha256": _sha256_file(paths.selected_ocr),
             "selected_objects_sha256": _sha256_file(paths.selected_objects),
-        },
-        selection_contract,
+            "selected_caption_report_sha256": _sha256_file(
+                paths.selected_caption_report
+            ),
+            "selected_ocr_report_sha256": _sha256_file(paths.selected_ocr_report),
+            "selected_object_report_sha256": _sha256_file(
+                paths.selected_object_report
+            ),
+            "inference_counts": {
+                "dense_caption": 0,
+                "dense_ocr": 0,
+                "dense_objects": 0,
+                "selected_caption": len(modalities.caption_records),
+                "selected_ocr": len(modalities.ocr_records),
+                "selected_objects": len(modalities.object_records),
+            },
+        }
     )
-    _atomic_write_json(paths.selection_report, selection_report)
+    _atomic_write_json(paths.selection_report, report)
     _write_state(
         paths,
         video_path=video_path,
         stage=STAGE_PERSISTENCE,
         status="passed",
         detail={
-            "selected_count": len(canonical_records),
-            "selection_contract_sha256": selection_contract["contract_sha256"],
+            "selected_count": len(selected_visual.records),
+            "selected_multimodal_contract_sha256": modalities.contract_sha256,
         },
     )
 
@@ -2350,9 +2438,12 @@ def _per_video_config_payload(config: OfflinePipelineConfig) -> dict[str, Any]:
         "bge_model_cache_dir",
     }
     return {
-        key: (value.as_posix() if isinstance(value, Path) else value)
-        for key, value in asdict(config).items()
-        if key not in excluded
+        "architecture_version": ARCHITECTURE_VERSION,
+        **{
+            key: (value.as_posix() if isinstance(value, Path) else value)
+            for key, value in asdict(config).items()
+            if key not in excluded
+        },
     }
 
 
@@ -2367,6 +2458,18 @@ def _validate_selected_bundle(
     selection_report = _read_json(paths.selection_report)
     if selection_report.get("status") != "passed":
         raise ValueError("selection report is not passed")
+    selection_contract = selection_report.get("offline_contract")
+    if (
+        selection_report.get("architecture_version") != ARCHITECTURE_VERSION
+        or selection_report.get("selection_layer") != "visual_temporal"
+        or selection_report.get("semantic_modalities_used_for_selection") != []
+        or not isinstance(selection_contract, dict)
+        or selection_contract.get("architecture_version") != ARCHITECTURE_VERSION
+        or selection_contract.get("stage") != STAGE_SELECTED_VISUAL
+    ):
+        raise ValueError(
+            "selected artifacts use an incompatible architecture; regenerate this video"
+        )
     guarantees = selection_report.get("guarantees")
     if not isinstance(guarantees, dict) or guarantees.get("constraints_satisfied") is not True:
         raise ValueError("selection hard guarantees are not satisfied")
@@ -2386,6 +2489,57 @@ def _validate_selected_bundle(
         raise ValueError("selection artifacts came from a different source video")
     _assert_source_unchanged(video_path, expected_source)
 
+    materialization_report = _read_json(paths.materialization_report)
+    materialization_contract = materialization_report.get("offline_contract")
+    materialization_contract_sha256 = materialization_report.get(
+        "offline_contract_sha256"
+    )
+    if (
+        materialization_report.get("status") != "satisfied"
+        or not isinstance(materialization_contract, dict)
+        or materialization_contract.get("stage") != STAGE_MATERIALIZATION
+        or materialization_contract_sha256 != _sha256_value(materialization_contract)
+    ):
+        raise ValueError("dense materialization contract is invalid")
+    dense_candidate_records = _read_jsonl(paths.dense_metadata)
+    if (
+        not dense_candidate_records
+        or materialization_report.get("dense_metadata_sha256")
+        != _sha256_file(paths.dense_metadata)
+        or materialization_report.get("dense_images_sha256")
+        != _images_sha256(dense_candidate_records)
+        or materialization_report.get("candidate_count") != len(dense_candidate_records)
+        or materialization_report.get("keyframe_count") != len(dense_candidate_records)
+    ):
+        raise ValueError("dense materialization records are missing or stale")
+    materialized = MaterializedStageResult(
+        records=tuple(dense_candidate_records),
+        report=materialization_report,
+        contract_sha256=str(materialization_contract_sha256),
+    )
+    siglip_contract = _siglip_contract(paths, materialized, config)
+    dense_embeddings, dense_embedding_records = _validate_siglip_stage(
+        paths,
+        materialized=materialized,
+        contract=siglip_contract,
+    )
+    dense_count = len(dense_embedding_records)
+    if _candidate_ids(dense_embedding_records) != _candidate_ids(dense_candidate_records):
+        raise ValueError("dense SigLIP2 identity does not match materialized candidates")
+
+    expected_selection_contract = _selection_contract(
+        paths,
+        materialized,
+        DenseVisualArtifacts(
+            embeddings=dense_embeddings,
+            embedding_records=dense_embedding_records,
+            contract_sha256=str(siglip_contract["contract_sha256"]),
+        ),
+        config,
+    )
+    if selection_report.get("visual_selection_contract") != expected_selection_contract:
+        raise ValueError("visual selection input contract is missing or stale")
+
     records = _read_jsonl(paths.selected_metadata)
     if not records:
         raise ValueError("selected keyframe metadata is empty")
@@ -2393,6 +2547,12 @@ def _validate_selected_bundle(
     frame_ids = _frame_ids(records)
     if any(record.get("artifact_role") != "selected_keyframe" for record in records):
         raise ValueError("canonical metadata contains a non-selected artifact role")
+    if any(
+        record.get("layer") != "selected_multimodal"
+        or record.get("architecture_version") != ARCHITECTURE_VERSION
+        for record in records
+    ):
+        raise ValueError("canonical metadata has an incompatible selected-layer schema")
     if any(str(record.get("video_id") or "") != paths.video_id for record in records):
         raise ValueError("canonical metadata contains the wrong video_id")
     image_validation = validate_records(
@@ -2415,6 +2575,61 @@ def _validate_selected_bundle(
         for record in embedding_records
     ):
         raise ValueError("selected embedding metadata has the wrong video_id")
+    if not set(candidate_ids).issubset(set(_candidate_ids(dense_embedding_records))):
+        raise ValueError("selected embeddings are not a subset of the dense SigLIP2 pool")
+    dense_row_by_candidate = {
+        str(record["candidate_id"]): (row, record)
+        for row, record in enumerate(dense_embedding_records)
+    }
+    for selected_row, (record, embedding_record) in enumerate(
+        zip(records, embedding_records, strict=True)
+    ):
+        candidate_id = str(record["candidate_id"])
+        dense_row, dense_record = dense_row_by_candidate[candidate_id]
+        for field_name in ("video_id", "frame_id", "frame_index"):
+            if record.get(field_name) != dense_record.get(field_name):
+                raise ValueError(
+                    f"selected {field_name} does not map to dense candidate {candidate_id}"
+                )
+        if not math.isclose(
+            float(record.get("timestamp")),
+            float(dense_record.get("timestamp")),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                f"selected timestamp does not map to dense candidate {candidate_id}"
+            )
+        if any(
+            embedding_record.get(field_name) != record.get(field_name)
+            for field_name in ("video_id", "frame_id", "frame_index")
+        ):
+            raise ValueError(
+                f"selected embedding lineage does not match candidate {candidate_id}"
+            )
+        if not np.allclose(
+            embeddings[selected_row],
+            dense_embeddings[dense_row],
+            atol=1e-7,
+            rtol=1e-7,
+        ):
+            raise ValueError(
+                f"selected embedding is not the dense SigLIP2 subset for {candidate_id}"
+            )
+    expected_selected_visual_contract = _stage_contract(
+        STAGE_SELECTED_VISUAL,
+        architecture_version=ARCHITECTURE_VERSION,
+        selection_contract_sha256=expected_selection_contract["contract_sha256"],
+        selected_metadata_sha256=_sha256_file(paths.selected_metadata),
+        selected_images_sha256=_images_sha256(records),
+        selected_embeddings_sha256=_sha256_file(paths.selected_embeddings),
+        selected_embedding_metadata_sha256=_sha256_file(
+            paths.selected_embedding_metadata
+        ),
+        selected_candidate_ids_sha256=_sha256_value(candidate_ids),
+    )
+    if not _contract_matches(selection_report, expected_selected_visual_contract):
+        raise ValueError("selected visual publication contract is missing or stale")
 
     for label, path in (
         ("caption", paths.selected_captions),
@@ -2439,12 +2654,39 @@ def _validate_selected_bundle(
         video_ids=(paths.video_id,),
     )
 
+    inference_counts = selection_report.get("inference_counts")
+    expected_inference_counts = {
+        "dense_caption": 0,
+        "dense_ocr": 0,
+        "dense_objects": 0,
+        "selected_caption": len(records),
+        "selected_ocr": len(records),
+        "selected_objects": len(records),
+    }
+    if inference_counts != expected_inference_counts:
+        raise ValueError("selected/dense inference-count invariants are not satisfied")
+    if int(selection_report.get("candidate_count", -1)) != dense_count:
+        raise ValueError("selection report does not cover the full dense SigLIP2 pool")
+    report_hashes = {
+        "selected_caption_report": _sha256_file(paths.selected_caption_report),
+        "selected_ocr_report": _sha256_file(paths.selected_ocr_report),
+        "selected_object_report": _sha256_file(paths.selected_object_report),
+    }
+    for field, actual in (
+        ("selected_caption_report_sha256", report_hashes["selected_caption_report"]),
+        ("selected_ocr_report_sha256", report_hashes["selected_ocr_report"]),
+        ("selected_object_report_sha256", report_hashes["selected_object_report"]),
+    ):
+        if selection_report.get(field) != actual:
+            raise ValueError(f"selection report has stale {field}")
+
     artifact_hashes = {
+        "dense_metadata": _sha256_file(paths.dense_metadata),
+        "dense_images": _images_sha256(dense_candidate_records),
+        "materialization_report": _sha256_file(paths.materialization_report),
         "dense_embeddings": _sha256_file(paths.dense_embeddings),
         "dense_embedding_metadata": _sha256_file(paths.dense_embedding_metadata),
-        "dense_captions": _sha256_file(paths.dense_captions),
-        "dense_ocr": _sha256_file(paths.dense_ocr),
-        "dense_objects": _sha256_file(paths.dense_objects),
+        "dense_embedding_report": _sha256_file(paths.dense_embedding_report),
         "candidate_ledger": _sha256_file(paths.candidate_ledger),
         "selected_metadata": _sha256_file(paths.selected_metadata),
         "selected_images": _images_sha256(records),
@@ -2453,14 +2695,26 @@ def _validate_selected_bundle(
         "selected_captions": _sha256_file(paths.selected_captions),
         "selected_ocr": _sha256_file(paths.selected_ocr),
         "selected_objects": _sha256_file(paths.selected_objects),
+        **report_hashes,
         "selection_report": _sha256_file(paths.selection_report),
+    }
+    runtime_seconds = {
+        "siglip": float(_read_json(paths.dense_embedding_report).get("runtime_sec") or 0.0),
+        "selection": float(selection_report.get("selection_runtime_sec") or 0.0),
+        "caption": float(_read_json(paths.selected_caption_report).get("runtime_sec") or 0.0),
+        "ocr": float(_read_json(paths.selected_ocr_report).get("runtime_sec") or 0.0),
+        "objects": float(_read_json(paths.selected_object_report).get("runtime_sec") or 0.0),
     }
     validation = {
         "status": "passed",
+        "architecture_version": ARCHITECTURE_VERSION,
         "video_id": paths.video_id,
         "source_video": expected_source,
-        "dense_candidate_count": int(selection_report.get("candidate_count", -1)),
+        "dense_candidate_count": dense_count,
+        "dense_siglip_count": dense_count,
         "selected_count": len(records),
+        "inference_counts": expected_inference_counts,
+        "runtime_seconds": runtime_seconds,
         "keyframe_validation": image_validation,
         "embedding_validation": validate_embedding_artifacts(embeddings, embedding_records),
         "artifact_hashes": artifact_hashes,
@@ -2468,6 +2722,14 @@ def _validate_selected_bundle(
     }
     if require_completion:
         completion = _read_json(paths.completion_report)
+        if (
+            completion.get("pipeline") != PIPELINE_NAME
+            or completion.get("schema_version") != PIPELINE_SCHEMA_VERSION
+            or completion.get("architecture_version") != ARCHITECTURE_VERSION
+        ):
+            raise ValueError(
+                "completion marker uses an incompatible architecture; regeneration required"
+            )
         if completion.get("status") != "passed":
             raise ValueError("completion report is not passed")
         if completion.get("source_video") != _file_signature(video_path):
@@ -2506,11 +2768,15 @@ def _validate_and_commit_video(
     completion = {
         "pipeline": PIPELINE_NAME,
         "schema_version": PIPELINE_SCHEMA_VERSION,
+        "architecture_version": ARCHITECTURE_VERSION,
         "status": "passed",
         "video_id": paths.video_id,
         "source_video": validation["source_video"],
         "dense_candidate_count": validation["dense_candidate_count"],
         "selected_count": validation["selected_count"],
+        "dense_siglip_count": validation["dense_siglip_count"],
+        "inference_counts": validation["inference_counts"],
+        "runtime_seconds": validation["runtime_seconds"],
         "artifact_hashes": validation["artifact_hashes"],
         "validation_report": paths.validation_report.as_posix(),
         "validation_report_sha256": _sha256_file(paths.validation_report),
@@ -2540,6 +2806,30 @@ def _validate_and_commit_video(
         dense_candidate_count=int(verified["dense_candidate_count"]),
         skipped=False,
         validation=verified,
+    )
+
+
+def _log_architecture_counts(
+    video_id: str,
+    validation: Mapping[str, Any],
+) -> None:
+    inference_counts = validation.get("inference_counts")
+    counts = inference_counts if isinstance(inference_counts, Mapping) else {}
+    LOGGER.info(
+        "[ARCH] %s :: dense_candidates=%d dense_siglip=%d selected=%d "
+        "caption_records=%d ocr_records=%d object_records=%d "
+        "dense_multimodal_inference=%d",
+        video_id,
+        int(validation.get("dense_candidate_count") or 0),
+        int(validation.get("dense_siglip_count") or 0),
+        int(validation.get("selected_count") or 0),
+        int(counts.get("selected_caption") or 0),
+        int(counts.get("selected_ocr") or 0),
+        int(counts.get("selected_objects") or 0),
+        sum(
+            int(counts.get(name) or 0)
+            for name in ("dense_caption", "dense_ocr", "dense_objects")
+        ),
     )
 
 
@@ -2579,8 +2869,8 @@ def process_video(
 ) -> VideoArtifacts:
     """Run the complete canonical preprocessing pipeline for exactly one video.
 
-    raw video -> shots -> dense candidates -> all images -> all multimodal
-    features -> multimodal selection -> canonical artifacts -> validation
+    raw video -> shots -> dense candidates -> dense images -> dense SigLIP2 ->
+    visual-temporal selection -> selected Caption/OCR/Object -> validation
     """
 
     path = Path(video_path)
@@ -2604,6 +2894,7 @@ def process_video(
             "SKIP",
             f"validated selected={existing.selected_count}",
         )
+        _log_architecture_counts(video_id, existing.validation)
         return existing
 
     current_stage = STAGE_SHOTS
@@ -2631,24 +2922,37 @@ def process_video(
             paths,
         )
         current_stage = STAGE_SIGLIP
-        features = _extract_all_dense_features(path, materialized, config, paths)
+        features = _extract_dense_visual_features(path, materialized, config, paths)
         current_stage = STAGE_SELECTION
-        result, selection_contract = _run_multimodal_selection(
+        selection_started = time.perf_counter()
+        result, selection_contract = _run_visual_temporal_selection(
             shots,
             materialized,
             features,
             config,
             paths,
         )
-        current_stage = STAGE_PERSISTENCE
+        selection_runtime_sec = time.perf_counter() - selection_started
+        current_stage = STAGE_SELECTED_VISUAL
         _assert_source_unchanged(path, source_signature)
-        _persist_selected_artifacts(
+        selected_visual = _persist_selected_visual_artifacts(
             path,
             result,
             selection_contract,
             paths,
             source_signature=source_signature,
+            selection_runtime_sec=selection_runtime_sec,
         )
+        current_stage = STAGE_CAPTIONS
+        modalities = _extract_selected_multimodal_features(
+            path,
+            selected_visual,
+            config,
+            paths,
+        )
+        current_stage = STAGE_PERSISTENCE
+        _assert_source_unchanged(path, source_signature)
+        _finalize_selected_artifacts(path, selected_visual, modalities, paths)
         current_stage = STAGE_VALIDATION
         artifacts = _validate_and_commit_video(
             path,
@@ -2682,6 +2986,7 @@ def process_video(
         "DONE",
         f"dense={artifacts.dense_candidate_count} selected={artifacts.selected_count}",
     )
+    _log_architecture_counts(video_id, artifacts.validation)
     return artifacts
 
 
@@ -2865,29 +3170,49 @@ def _corpus_source_contract(
     sources: list[dict[str, object]] = []
     for artifact in sorted(videos, key=lambda item: item.video_id):
         completion = _read_json(artifact.paths.completion_report)
-        dense_inputs = {
+        if completion.get("architecture_version") != ARCHITECTURE_VERSION:
+            raise ValueError(
+                f"incompatible per-video architecture for corpus: {artifact.video_id}"
+            )
+        dense_visual_inputs = {
             "embeddings": artifact.paths.dense_embeddings,
             "embedding_metadata": artifact.paths.dense_embedding_metadata,
-            "captions": artifact.paths.dense_captions,
-            "ocr": artifact.paths.dense_ocr,
-            "objects": artifact.paths.dense_objects,
             "candidate_ledger": artifact.paths.candidate_ledger,
+        }
+        selected_multimodal_inputs = {
+            "metadata": artifact.paths.selected_metadata,
+            "embeddings": artifact.paths.selected_embeddings,
+            "embedding_metadata": artifact.paths.selected_embedding_metadata,
+            "captions": artifact.paths.selected_captions,
+            "ocr": artifact.paths.selected_ocr,
+            "objects": artifact.paths.selected_objects,
+            "caption_report": artifact.paths.selected_caption_report,
+            "ocr_report": artifact.paths.selected_ocr_report,
+            "object_report": artifact.paths.selected_object_report,
         }
         sources.append(
             {
                 "video_id": artifact.video_id,
+                "architecture_version": ARCHITECTURE_VERSION,
                 "completion_report_sha256": _sha256_file(artifact.paths.completion_report),
                 "artifact_hashes": completion.get("artifact_hashes"),
                 "selected_count": artifact.selected_count,
                 "dense_candidate_count": artifact.dense_candidate_count,
-                "dense_input_hashes": {
-                    label: _sha256_file(path) for label, path in dense_inputs.items()
+                "dense_visual_input_hashes": {
+                    label: _sha256_file(path)
+                    for label, path in dense_visual_inputs.items()
+                },
+                "selected_multimodal_input_hashes": {
+                    label: _sha256_file(path)
+                    for label, path in selected_multimodal_inputs.items()
                 },
             }
         )
     contract = {
         "pipeline": PIPELINE_NAME,
         "schema_version": PIPELINE_SCHEMA_VERSION,
+        "architecture_version": ARCHITECTURE_VERSION,
+        "corpus_bundle_schema_version": CORPUS_BUNDLE_SCHEMA_VERSION,
         "video_ids": [item.video_id for item in sorted(videos, key=lambda item: item.video_id)],
         "sources": sources,
         "bge_enabled": config.bge_enabled,
@@ -2932,6 +3257,7 @@ def _write_corpus_stage_state(
         {
             "pipeline": PIPELINE_NAME,
             "schema_version": PIPELINE_SCHEMA_VERSION,
+            "architecture_version": ARCHITECTURE_VERSION,
             "source_contract": {
                 key: value
                 for key, value in source_contract.items()
@@ -3218,29 +3544,10 @@ def _build_visual_corpus_index(
     return result
 
 
-def _dense_object_labels(value: object) -> list[str]:
-    if not isinstance(value, (list, tuple)):
-        return []
-    labels: list[str] = []
-    for item in value:
-        label = ""
-        if isinstance(item, str):
-            label = item.strip()
-        elif isinstance(item, Mapping):
-            for key in ("class_name", "label", "name", "class"):
-                raw = item.get(key)
-                if isinstance(raw, str) and raw.strip():
-                    label = raw.strip()
-                    break
-        if label and label not in labels:
-            labels.append(label)
-    return labels
-
-
-def _dense_enriched_source_records(
+def _dense_visual_source_records(
     video: VideoArtifacts,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Join already-computed dense modalities without running inference."""
+    """Build full-pool SigLIP2 metadata without selected semantic evidence."""
 
     vectors, embedding_records, _, _ = validate_embedding_source(
         video.paths.dense_embeddings,
@@ -3254,33 +3561,31 @@ def _dense_enriched_source_records(
         )
     expected_ids = _candidate_ids(embedding_records)
     expected_id_set = set(expected_ids)
-
-    captions = _read_jsonl(video.paths.dense_captions)
-    ocr = _read_jsonl(video.paths.dense_ocr)
-    objects = _read_jsonl(video.paths.dense_objects)
-    for label, records, required in (
-        ("dense caption", captions, "caption"),
-        ("dense OCR", ocr, None),
-        ("dense object", objects, None),
-    ):
-        _validate_modality_records(
-            label=label,
-            records=records,
-            expected_candidates=embedding_records,
-            video_id=video.video_id,
-            required_nonempty_field=required,
-        )
     ledger = _read_jsonl(video.paths.candidate_ledger)
     if set(_candidate_ids(ledger)) != expected_id_set or len(ledger) != len(expected_ids):
         raise ValueError(f"candidate ledger does not align with dense pool: {video.video_id}")
     if any(str(record.get("video_id") or "") != video.video_id for record in ledger):
         raise ValueError(f"candidate ledger has wrong video_id: {video.video_id}")
 
-    caption_by_id = {str(record["candidate_id"]): record for record in captions}
-    ocr_by_id = {str(record["candidate_id"]): record for record in ocr}
-    objects_by_id = {str(record["candidate_id"]): record for record in objects}
     ledger_by_id = {str(record["candidate_id"]): record for record in ledger}
-    enriched: list[dict[str, Any]] = []
+    visual_records: list[dict[str, Any]] = []
+    forbidden_semantic_fields = {
+        "caption",
+        "caption_text",
+        "captions_aggregated",
+        "dense_caption",
+        "ocr",
+        "ocr_text",
+        "ocr_tokens",
+        "text_regions",
+        "dense_ocr",
+        "objects",
+        "object_classes",
+        "object_labels",
+        "detected_objects",
+        "dense_objects",
+        "modality_alignment",
+    }
     for record in embedding_records:
         candidate_id = str(record["candidate_id"])
         candidate_ledger = ledger_by_id[candidate_id]
@@ -3291,32 +3596,40 @@ def _dense_enriched_source_records(
             raise ValueError(
                 f"candidate ledger has invalid protected events: {candidate_id}"
             )
-        caption = str(caption_by_id[candidate_id].get("caption") or "").strip()
-        if not caption:
-            raise ValueError(f"dense caption evidence is empty: {candidate_id}")
+        contaminated_fields = sorted(forbidden_semantic_fields.intersection(record))
+        if contaminated_fields:
+            raise ValueError(
+                "dense SigLIP2 metadata contains selected semantic fields: "
+                + ", ".join(contaminated_fields)
+            )
+        component_scores = candidate_ledger.get("component_scores")
+        visual_component_scores = {
+            "transition": float(component_scores["transition"])
+        } if (
+            isinstance(component_scores, Mapping)
+            and isinstance(component_scores.get("transition"), (int, float))
+            and not isinstance(component_scores.get("transition"), bool)
+        ) else {}
         value = dict(record)
         value.update(
             {
-                "artifact_role": "dense_candidate",
-                "caption": caption,
-                "ocr_text": str(ocr_by_id[candidate_id].get("ocr_text") or ""),
-                "objects": _dense_object_labels(
-                    objects_by_id[candidate_id].get("objects")
-                ),
+                "artifact_role": DENSE_RECORD_ARTIFACT_ROLE,
+                "layer": DENSE_LAYER,
+                "architecture_version": ARCHITECTURE_VERSION,
                 "protected_event_ids": list(dict.fromkeys(protected_event_ids)),
                 "protected": bool(protected_event_ids),
                 "importance_score": candidate_ledger.get("importance_score"),
                 "semantic_novelty": candidate_ledger.get("semantic_novelty"),
-                "component_scores": dict(
-                    candidate_ledger.get("component_scores")
-                    if isinstance(candidate_ledger.get("component_scores"), Mapping)
-                    else {}
-                ),
-                "available_modalities": list(
-                    candidate_ledger.get("available_modalities")
-                    if isinstance(candidate_ledger.get("available_modalities"), list)
-                    else []
-                ),
+                "visual_component_scores": visual_component_scores,
+                "available_visual_signals": [
+                    value
+                    for value in (
+                        candidate_ledger.get("available_modalities")
+                        if isinstance(candidate_ledger.get("available_modalities"), list)
+                        else []
+                    )
+                    if value in {"transition", "siglip2", "visual"}
+                ],
                 "offline_selected": bool(candidate_ledger.get("selected")),
                 "selection_rank": candidate_ledger.get("selection_rank"),
                 "selection_phase": candidate_ledger.get("selection_phase"),
@@ -3327,8 +3640,8 @@ def _dense_enriched_source_records(
                 ),
             }
         )
-        enriched.append(value)
-    return vectors, enriched
+        visual_records.append(value)
+    return vectors, visual_records
 
 
 def _expected_dense_index_records(
@@ -3337,7 +3650,7 @@ def _expected_dense_index_records(
     records: list[dict[str, Any]] = []
     vector_batches: list[np.ndarray] = []
     for video in sorted(videos, key=lambda item: item.video_id):
-        vectors, source_records = _dense_enriched_source_records(video)
+        vectors, source_records = _dense_visual_source_records(video)
         vector_batches.append(vectors)
         for record in source_records:
             indexed = dict(record)
@@ -3364,6 +3677,13 @@ def _validate_dense_bundle_manifest(
         raise ValueError("dense manifest has an unsupported schema version")
     if manifest.get("artifact_role") != DENSE_ARTIFACT_ROLE:
         raise ValueError("dense manifest has the wrong artifact role")
+    if (
+        manifest.get("layer") != DENSE_LAYER
+        or manifest.get("modalities") != list(DENSE_MODALITIES)
+        or manifest.get("source_kind") != "full_dense_candidates"
+        or manifest.get("semantic_enrichment") is not False
+    ):
+        raise ValueError("dense manifest is not a visual-only SigLIP2 bundle")
     declared = manifest.get("artifacts")
     if not isinstance(declared, dict):
         raise ValueError("dense manifest is missing bundle artifact checksums")
@@ -3401,6 +3721,17 @@ def _validate_dense_corpus_index(
     ):
         if not path.is_file():
             raise FileNotFoundError(f"Missing dense index artifact: {path}")
+    # Reuse the exact online loader contract at the offline publication gate so
+    # a bundle cannot be marked complete and then fail on first query.
+    validate_dense_candidate_artifacts(
+        DenseCandidateIndexConfig(
+            index_path=paths.dense_index,
+            metadata_path=paths.dense_metadata,
+            frame_map_path=paths.dense_frame_map,
+            manifest_path=paths.dense_manifest,
+            report_path=paths.dense_report,
+        )
+    )
     faiss = require_faiss()
     index = faiss.read_index(paths.dense_index.as_posix())
     if type(index).__name__ != "IndexFlatIP":
@@ -3418,7 +3749,7 @@ def _validate_dense_corpus_index(
     if [_sha256_value(record) for record in indexed_records] != [
         _sha256_value(record) for record in expected_records
     ]:
-        raise ValueError("dense index metadata does not match enriched dense candidates")
+        raise ValueError("dense index metadata does not match visual dense candidates")
     raw_frame_map = _read_json(paths.dense_frame_map)
     expected_frame_map = {
         str(row): frame_map_record(record)
@@ -3439,6 +3770,12 @@ def _validate_dense_corpus_index(
     if report.get("status") != "passed":
         raise ValueError("dense index build report is not passed")
     if (
+        report.get("layer") != DENSE_LAYER
+        or report.get("modalities") != list(DENSE_MODALITIES)
+        or report.get("semantic_enrichment") is not False
+    ):
+        raise ValueError("dense index report is not visual-only")
+    if (
         manifest.get("vector_count") != expected_count
         or manifest.get("metadata_record_count") != expected_count
         or report.get("vector_count") != expected_count
@@ -3456,6 +3793,49 @@ def _validate_dense_corpus_index(
         raise ValueError("dense candidate metadata has an empty clip identity")
     if manifest.get("clip_count") != len(clip_keys):
         raise ValueError("dense index manifest clip count mismatch")
+    dense_frame_keys = {
+        (str(record["video_id"]), str(record["frame_id"]))
+        for record in expected_records
+    }
+    selected_frame_keys: set[tuple[str, str]] = set()
+    selected_identity_keys: set[tuple[str, str, str]] = set()
+    for video in videos:
+        for record in _read_jsonl(video.paths.selected_metadata):
+            video_id = str(record.get("video_id") or "")
+            candidate_id = str(record.get("candidate_id") or "")
+            frame_id = str(record.get("frame_id") or "")
+            selected_frame_keys.add((video_id, frame_id))
+            selected_identity_keys.add((video_id, candidate_id, frame_id))
+    if not selected_frame_keys.issubset(dense_frame_keys):
+        missing = sorted(selected_frame_keys - dense_frame_keys)
+        raise ValueError(
+            "selected frame identities are not a subset of the dense visual pool: "
+            f"{missing[:5]}"
+        )
+    dense_identity_keys = {
+        (
+            str(record.get("video_id") or ""),
+            str(record.get("candidate_id") or ""),
+            str(record.get("frame_id") or ""),
+        )
+        for record in expected_records
+    }
+    offline_selected_keys = {
+        (
+            str(record.get("video_id") or ""),
+            str(record.get("candidate_id") or ""),
+            str(record.get("frame_id") or ""),
+        )
+        for record in expected_records
+        if record.get("offline_selected") is True
+    }
+    if (
+        not selected_identity_keys.issubset(dense_identity_keys)
+        or selected_identity_keys != offline_selected_keys
+    ):
+        raise ValueError(
+            "canonical selected identities do not match the dense visual selection ledger"
+        )
     generation = _validate_dense_bundle_manifest(manifest, paths)
     return {
         "status": "passed",
@@ -3464,12 +3844,12 @@ def _validate_dense_corpus_index(
         "video_ids": sorted({key[0] for key in clip_keys}),
         "frame_map": frame_report,
         "bundle_generation": generation,
-        "enriched_fields": [
-            "caption",
-            "ocr_text",
-            "objects",
-            "protected_event_ids",
-        ],
+        "layer": DENSE_LAYER,
+        "modalities": list(DENSE_MODALITIES),
+        "semantic_enrichment": False,
+        "selected_subset_verified": True,
+        "selected_frame_count": len(selected_frame_keys),
+        "index_build_runtime_sec": float(report.get("index_build_runtime_sec") or 0.0),
     }
 
 
@@ -3504,6 +3884,7 @@ def _build_dense_corpus_index(
     else:
         LOGGER.info("[RUN] corpus :: dense candidate FAISS")
 
+    build_started = time.perf_counter()
     sources = [
         video.dense_visual_source for video in sorted(videos, key=lambda item: item.video_id)
     ]
@@ -3535,7 +3916,7 @@ def _build_dense_corpus_index(
         built_ids = [str(record.get("candidate_id") or "") for record in built["index_records"]]
         expected_ids = [str(record["candidate_id"]) for record in expected_records]
         if built_ids != expected_ids:
-            raise CorpusIndexError("dense FAISS row order changed during enrichment")
+            raise CorpusIndexError("dense FAISS row order changed during visual publication")
         _atomic_write_jsonl(staged["metadata"], expected_records)
         dense_frame_map = {
             str(row): frame_map_record(record)
@@ -3561,14 +3942,12 @@ def _build_dense_corpus_index(
         report.update(
             {
                 "artifact_role": DENSE_ARTIFACT_ROLE,
+                "layer": DENSE_LAYER,
+                "modalities": list(DENSE_MODALITIES),
+                "semantic_enrichment": False,
                 "metadata_record_count": len(expected_records),
                 "clip_count": len(clip_keys),
-                "enriched_fields": [
-                    "caption",
-                    "ocr_text",
-                    "objects",
-                    "protected_event_ids",
-                ],
+                "index_build_runtime_sec": time.perf_counter() - build_started,
                 "manifest_path": paths.dense_manifest.as_posix(),
                 "index_path": paths.dense_index.as_posix(),
                 "metadata_path": paths.dense_metadata.as_posix(),
@@ -3583,7 +3962,12 @@ def _build_dense_corpus_index(
         manifest = _read_json(staged["manifest"])
         manifest.update(
             {
+                "schema_version": DENSE_MANIFEST_SCHEMA_VERSION,
                 "artifact_role": DENSE_ARTIFACT_ROLE,
+                "architecture_version": ARCHITECTURE_VERSION,
+                "layer": DENSE_LAYER,
+                "modalities": list(DENSE_MODALITIES),
+                "semantic_enrichment": False,
                 "source_kind": "full_dense_candidates",
                 "clip_count": len(clip_keys),
                 "index_path": paths.dense_index.as_posix(),
@@ -3591,14 +3975,19 @@ def _build_dense_corpus_index(
                 "frame_map_path": paths.dense_frame_map.as_posix(),
                 "report_path": paths.dense_report.as_posix(),
                 "bundle_generation": _sha256_value(bundle_hashes),
-                "enrichment": {
-                    "inference_performed": False,
+                "visual_selector_annotations": {
                     "join_key": "candidate_id",
                     "fields": [
-                        "caption",
-                        "ocr_text",
-                        "objects",
                         "protected_event_ids",
+                        "protected",
+                        "importance_score",
+                        "semantic_novelty",
+                        "visual_component_scores",
+                        "available_visual_signals",
+                        "offline_selected",
+                        "selection_rank",
+                        "selection_phase",
+                        "selection_reasons",
                     ],
                 },
                 "artifacts": {
@@ -3623,6 +4012,9 @@ def _build_dense_corpus_index(
             {
                 "schema_version": DENSE_MANIFEST_SCHEMA_VERSION,
                 "artifact_role": DENSE_ARTIFACT_ROLE,
+                "layer": DENSE_LAYER,
+                "modalities": list(DENSE_MODALITIES),
+                "semantic_enrichment": False,
                 "publication_status": "publishing",
                 "bundle_generation": "publishing",
                 "artifacts": {},
@@ -4290,6 +4682,7 @@ def _corpus_bundle_manifest_payload(
         "schema_version": CORPUS_BUNDLE_SCHEMA_VERSION,
         "status": "passed",
         "pipeline": PIPELINE_NAME,
+        "architecture_version": ARCHITECTURE_VERSION,
         "source_contract_sha256": source_contract["contract_sha256"],
         "video_ids": list(video_ids),
         "bge_enabled": bge_enabled,
@@ -4315,6 +4708,7 @@ def _validate_corpus_bundle_commit(
     if (
         manifest.get("schema_version") != CORPUS_BUNDLE_SCHEMA_VERSION
         or manifest.get("status") != "passed"
+        or manifest.get("architecture_version") != ARCHITECTURE_VERSION
         or manifest.get("source_contract_sha256")
         != source_contract.get("contract_sha256")
         or manifest.get("video_ids") != list(video_ids)
@@ -4551,6 +4945,7 @@ def build_corpus_indexes(
         report = {
             "pipeline": PIPELINE_NAME,
             "schema_version": PIPELINE_SCHEMA_VERSION,
+            "architecture_version": ARCHITECTURE_VERSION,
             "status": "passed",
             "partial_corpus_allowed": config.allow_partial_corpus,
             "video_ids": list(video_ids),
@@ -4587,6 +4982,7 @@ def build_corpus_indexes(
             {
                 "pipeline": PIPELINE_NAME,
                 "schema_version": PIPELINE_SCHEMA_VERSION,
+                "architecture_version": ARCHITECTURE_VERSION,
                 "status": "passed",
                 "source_contract_sha256": source_contract["contract_sha256"],
                 "video_ids": list(video_ids),
@@ -4605,6 +5001,21 @@ def build_corpus_indexes(
             video_ids=video_ids,
             bge_enabled=config.bge_enabled,
         )
+        # Corpus builders can run long enough for an external process to mutate a
+        # per-video bundle after the initial validation.  Revalidate the complete
+        # bundle immediately before publication so referenced dense/selected JPEGs
+        # are hashed live as well as the JSON/vector sources below.
+        for artifact in ordered:
+            _validate_selected_bundle(
+                video_path=artifact.video_path,
+                config=config,
+                paths=artifact.paths,
+                require_completion=True,
+            )
+        if _corpus_source_contract(ordered, config) != source_contract:
+            raise RuntimeError(
+                "per-video artifacts changed during corpus construction; retry the build"
+            )
         _publish_staged_corpus_bundle(
             staged_paths,
             paths,
@@ -4838,7 +5249,7 @@ def _config_from_args(args: argparse.Namespace) -> OfflinePipelineConfig:
     output_dir = Path(args.output_dir)
     target_density = args.target_density_per_second
     if args.target_keyframes is None and target_density is None:
-        target_density = DEFAULT_TARGET_DENSITY_PER_SECOND
+        target_density = 1.0 / float(args.max_gap_seconds)
     quick_mode = args.video_path is not None or args.video_id is not None
     build_corpus = args.build_corpus
     if build_corpus is None:
@@ -4926,11 +5337,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "CorpusIndexError",
     "DatasetProcessResult",
-    "DenseFeatureArtifacts",
+    "DenseVisualArtifacts",
     "MaterializedStageResult",
     "OfflinePipelineConfig",
     "OfflineStageError",
     "PerVideoPaths",
+    "SelectedMultimodalArtifacts",
     "VideoArtifacts",
     "VideoFailure",
     "build_corpus_indexes",
