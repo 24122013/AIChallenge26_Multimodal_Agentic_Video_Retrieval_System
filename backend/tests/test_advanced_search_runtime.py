@@ -8,11 +8,18 @@ import numpy as np
 from backend.app.models.retrieval import RetrievalResult
 from backend.app.services.agent.query_expansion import QueryExpansionConfig
 from backend.app.services.retrieval import advanced_search as advanced_search_module
-from backend.app.services.retrieval.advanced_rerank import AdvancedRerankWeights
+from backend.app.services.retrieval.advanced_rerank import (
+    AdvancedRerankWeights,
+    ContextRerankConfig,
+    rerank_dense_candidates,
+)
 from backend.app.services.retrieval.advanced_search import (
     AdvancedSearchConfig,
     advanced_vector_search,
 )
+from backend.app.services.retrieval.cses import CSESSelection
+from backend.app.services.retrieval.online_context import OnlineContextIndex
+from backend.app.services.retrieval.query_plan import build_query_plan
 
 
 class _DenseIndex:
@@ -60,6 +67,10 @@ class _DenseIndex:
             ("V1", "SHOT_A"): [0],
             ("V2", "SHOT_B"): [0, 1],
         }
+        self.row_by_frame = {
+            (str(record["video_id"]), str(record["frame_id"])): row
+            for row, record in enumerate(self.records)
+        }
         self.calls: list[tuple[np.ndarray, int]] = []
 
     def search(self, query_vector: np.ndarray, top_k: int):
@@ -69,6 +80,22 @@ class _DenseIndex:
 
 
 class AdvancedSearchRuntimeTest(unittest.TestCase):
+    @staticmethod
+    def _unit_vector(cosine: float) -> list[float]:
+        return [cosine, float(np.sqrt(max(0.0, 1.0 - cosine * cosine)))]
+
+    @staticmethod
+    def _selection(row: int, relevance: float) -> CSESSelection:
+        return CSESSelection(
+            row=row,
+            selection_rank=row + 1,
+            selection_gain=0.5,
+            relevance=relevance,
+            visual_coverage_gain=0.0,
+            temporal_coverage_gain=0.0,
+            preserved_event_ids=(),
+        )
+
     def test_dense_rescue_timing_dedupe_and_existing_result_mapping(self) -> None:
         dense = _DenseIndex()
         coarse = [
@@ -98,6 +125,7 @@ class AdvancedSearchRuntimeTest(unittest.TestCase):
             max_total_clips=2,
             dense_frames_per_clip=2,
             rerank_weights=weights,
+            context_config=ContextRerankConfig(neighbor_enabled=True),
             query_expansion=QueryExpansionConfig(enabled=False),
         )
 
@@ -152,8 +180,17 @@ class AdvancedSearchRuntimeTest(unittest.TestCase):
         self.assertEqual(payload["trace"]["latency"], response.stage_latency_ms)
         self.assertNotIn("stage_latency_ms", payload["trace"])
         self.assertNotIn("results", payload["trace"])
+        self.assertTrue(payload["trace"]["context_scoring"]["neighbor"]["requested"])
+        self.assertEqual(
+            payload["trace"]["context_scoring"]["neighbor"]["fallback_reason"],
+            "context_index_unavailable",
+        )
 
     def test_config_and_weight_bounds_fail_closed(self) -> None:
+        self.assertAlmostEqual(
+            sum(AdvancedRerankWeights().__dict__.values()),
+            1.0,
+        )
         with self.assertRaisesRegex(ValueError, "at least coarse_top_n"):
             AdvancedSearchConfig(
                 coarse_top_n=50,
@@ -165,6 +202,15 @@ class AdvancedSearchRuntimeTest(unittest.TestCase):
             AdvancedRerankWeights(dense_visual=float("nan"))
         with self.assertRaisesRegex(ValueError, "finite numbers"):
             AdvancedRerankWeights(dense_visual=True)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            AdvancedRerankWeights(neighbor_support=-0.01)
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            ContextRerankConfig(
+                segment_candidate_limit=2,
+                segment_top_k=3,
+            )
+        with self.assertRaisesRegex(ValueError, "within"):
+            ContextRerankConfig(max_bonus=1.01)
 
     def test_to_dict_rejects_non_positive_top_k(self) -> None:
         dense = _DenseIndex()
@@ -226,6 +272,187 @@ class AdvancedSearchRuntimeTest(unittest.TestCase):
             for item in response.results
         }
         self.assertGreater(coarse_by_id["A0"], coarse_by_id["B0"])
+
+    def test_neighbor_support_can_break_close_tie_but_is_capped_for_weak_frame(
+        self,
+    ) -> None:
+        records = [
+            {
+                "candidate_id": candidate_id,
+                "frame_id": frame_id,
+                "video_id": "V1",
+                "segment_id": segment_id,
+                "timestamp": timestamp,
+                "caption": "",
+                "ocr_text": "",
+                "objects": [],
+            }
+            for candidate_id, frame_id, segment_id, timestamp in (
+                ("A", "A", "SA", 10.0),
+                ("B", "B", "SB", 20.0),
+                ("C", "C", "SC", 30.0),
+                ("AN", "AN", "SA", 9.8),
+                ("BN", "BN", "SB", 19.8),
+                ("CN", "CN", "SC", 29.8),
+            )
+        ]
+        vectors = np.asarray(
+            [
+                self._unit_vector(0.40),  # direct score 0.70
+                self._unit_vector(0.42),  # direct score 0.71
+                self._unit_vector(-0.80),  # very weak direct score 0.10
+                self._unit_vector(1.0),
+                self._unit_vector(-1.0),
+                self._unit_vector(1.0),
+            ],
+            dtype=np.float32,
+        )
+        context = OnlineContextIndex(
+            neighbor_records=[
+                {
+                    "video_id": "V1",
+                    "frame_id": center,
+                    "neighbors_before": [
+                        {"frame_id": neighbor, "delta_seconds": -0.2}
+                    ],
+                    "neighbors_after": [],
+                }
+                for center, neighbor in (("A", "AN"), ("B", "BN"), ("C", "CN"))
+            ]
+        )
+        ranked = rerank_dense_candidates(
+            plan=build_query_plan("target action", profile="kis"),
+            selections=[
+                self._selection(0, 0.70),
+                self._selection(1, 0.71),
+                self._selection(2, 0.10),
+                # AN is both A's bounded context frame and a direct CSES
+                # candidate. Context lookup must never materialize a second
+                # output candidate for the same canonical frame identity.
+                self._selection(3, 1.00),
+            ],
+            records=records,
+            vectors=vectors,
+            query_vector=np.asarray([1.0, 0.0], dtype=np.float32),
+            row_by_frame={
+                ("V1", str(record["frame_id"])): row
+                for row, record in enumerate(records)
+            },
+            context_index=context,
+            context_config=ContextRerankConfig(
+                neighbor_enabled=True,
+                max_bonus=0.04,
+            ),
+        )
+
+        ordered = [str(item.record["candidate_id"]) for item in ranked]
+        self.assertLess(ordered.index("A"), ordered.index("B"))
+        self.assertNotEqual(ordered[0], "C")
+        by_id = {str(item.record["candidate_id"]): item for item in ranked}
+        self.assertTrue(by_id["A"].context_trace["neighbor_used_for_scoring"])
+        self.assertTrue(
+            by_id["C"].context_trace["cap_applied"],
+            by_id["C"].context_trace,
+        )
+        self.assertLessEqual(
+            by_id["C"].contributions["context_bonus_after_cap"],
+            0.04,
+        )
+        self.assertEqual(len(ordered), len(set(ordered)))
+        self.assertEqual(ordered.count("AN"), 1)
+
+    def test_segment_support_uses_bounded_top_mean_not_raw_frame_count(self) -> None:
+        centers = [
+            ("A", "SA", 10.0, 0.40),
+            ("B", "SB", 20.0, 0.42),
+            ("D", "SD", 30.0, 0.40),
+        ]
+        children = [
+            ("A1", "SA", 9.8, 1.0),
+            ("A2", "SA", 10.2, 1.0),
+            ("D1", "SD", 29.8, 1.0),
+            *[
+                (f"D{index}", "SD", 30.0 + index / 10.0, -1.0)
+                for index in range(2, 10)
+            ],
+        ]
+        values = centers + children
+        records = [
+            {
+                "candidate_id": frame_id,
+                "frame_id": frame_id,
+                "video_id": "V1",
+                "segment_id": segment_id,
+                "timestamp": timestamp,
+                "caption": "",
+                "ocr_text": "",
+                "objects": [],
+            }
+            for frame_id, segment_id, timestamp, _cosine in values
+        ]
+        vectors = np.asarray(
+            [self._unit_vector(cosine) for *_prefix, cosine in values],
+            dtype=np.float32,
+        )
+        context = OnlineContextIndex(
+            segment_records=[
+                {
+                    "video_id": "V1",
+                    "segment_id": "SA",
+                    "start_time": 9.0,
+                    "end_time": 11.0,
+                    "keyframe_ids": ["A1", "A", "A2"],
+                },
+                {
+                    "video_id": "V1",
+                    "segment_id": "SB",
+                    "start_time": 19.0,
+                    "end_time": 21.0,
+                    "keyframe_ids": ["B"],
+                },
+                {
+                    "video_id": "V1",
+                    "segment_id": "SD",
+                    "start_time": 29.0,
+                    "end_time": 32.0,
+                    "keyframe_ids": ["D1", "D", *[f"D{i}" for i in range(2, 10)]],
+                },
+            ]
+        )
+        ranked = rerank_dense_candidates(
+            plan=build_query_plan("target action", profile="kis"),
+            selections=[
+                self._selection(0, 0.70),
+                self._selection(1, 0.71),
+                self._selection(2, 0.70),
+            ],
+            records=records,
+            vectors=vectors,
+            query_vector=np.asarray([1.0, 0.0], dtype=np.float32),
+            row_by_frame={
+                ("V1", str(record["frame_id"])): row
+                for row, record in enumerate(records)
+            },
+            context_index=context,
+            context_config=ContextRerankConfig(
+                segment_enabled=True,
+                segment_candidate_limit=12,
+                segment_top_k=3,
+            ),
+        )
+
+        by_id = {str(item.record["candidate_id"]): item for item in ranked}
+        ordered = [str(item.record["candidate_id"]) for item in ranked]
+        self.assertLess(ordered.index("A"), ordered.index("B"))
+        self.assertGreater(
+            by_id["A"].breakdown["segment_support"],
+            by_id["B"].breakdown["segment_support"],
+        )
+        self.assertGreater(
+            by_id["A"].breakdown["segment_support"],
+            by_id["D"].breakdown["segment_support"],
+        )
+        self.assertLessEqual(by_id["D"].context_trace["segment_evidence_count"], 12)
 
 
 if __name__ == "__main__":

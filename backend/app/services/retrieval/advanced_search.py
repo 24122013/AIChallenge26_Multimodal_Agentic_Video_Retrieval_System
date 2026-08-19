@@ -18,9 +18,11 @@ from backend.app.services.agent.query_expansion import (
 from backend.app.services.retrieval.advanced_rerank import (
     AdvancedRankedFrame,
     AdvancedRerankWeights,
+    ContextRerankConfig,
     rerank_dense_candidates,
 )
 from backend.app.services.retrieval.cses import CSESConfig, CSESSelection, select_cses
+from backend.app.services.retrieval.online_context import OnlineContextIndex
 from backend.app.services.retrieval.query_plan import QueryPlan, build_query_plan
 from backend.app.services.retrieval.rank_fusion import (
     aggregate_clips,
@@ -36,6 +38,7 @@ class DenseCandidateIndex(Protocol):
     records: Sequence[Mapping[str, Any]]
     vectors: np.ndarray
     rows_by_clip: Mapping[tuple[str, str], Sequence[int]]
+    row_by_frame: Mapping[tuple[str, str], int]
 
     def search(self, query_vector: np.ndarray, top_k: int) -> list[tuple[int, float]]: ...
 
@@ -58,6 +61,7 @@ class AdvancedSearchConfig:
     cses_enabled: bool = True
     deterministic_rerank_enabled: bool = True
     rerank_weights: AdvancedRerankWeights = AdvancedRerankWeights()
+    context_config: ContextRerankConfig = ContextRerankConfig()
     query_expansion: QueryExpansionConfig = QueryExpansionConfig()
 
     def __post_init__(self) -> None:
@@ -109,6 +113,8 @@ class AdvancedSearchConfig:
                 raise ValueError(f"Advanced search {name} must be a boolean")
         if not isinstance(self.rerank_weights, AdvancedRerankWeights):
             raise TypeError("rerank_weights must be an AdvancedRerankWeights instance")
+        if not isinstance(self.context_config, ContextRerankConfig):
+            raise TypeError("context_config must be a ContextRerankConfig instance")
         if not isinstance(self.query_expansion, QueryExpansionConfig):
             raise TypeError("query_expansion must be a QueryExpansionConfig instance")
 
@@ -126,6 +132,7 @@ class AdvancedSearchResponse:
     skipped_modalities: Mapping[str, str]
     inter_modality_trace: Sequence[Mapping[str, object]]
     stage_latency_ms: Mapping[str, float] = field(default_factory=dict)
+    context_trace: Mapping[str, object] = field(default_factory=dict)
     exact_duplicate_count: int = 0
 
     def trace(self) -> dict[str, object]:
@@ -145,6 +152,7 @@ class AdvancedSearchResponse:
             "skipped_modalities": dict(self.skipped_modalities),
             "inter_modality_fusion": [dict(value) for value in self.inter_modality_trace],
             "rerank_canonical_query": self.plan.original_query,
+            "context_scoring": dict(self.context_trace),
         }
 
     def to_dict(self, top_k: int | None = None) -> dict[str, object]:
@@ -178,6 +186,7 @@ def advanced_text_search(
     config: AdvancedSearchConfig | None = None,
     expansion_provider: QueryExpansionProvider | None = None,
     plan: QueryPlan | None = None,
+    context_index: OnlineContextIndex | None = None,
 ) -> AdvancedSearchResponse:
     overall_started = time.perf_counter()
     stage_latency_ms = _empty_stage_latency()
@@ -345,6 +354,7 @@ def advanced_text_search(
         inter_modality_trace=inter_trace,
         overall_started=overall_started,
         stage_latency_ms=stage_latency_ms,
+        context_index=context_index,
     )
 
 
@@ -354,6 +364,7 @@ def advanced_vector_search(
     coarse_results: Sequence[RetrievalResult],
     dense_index: DenseCandidateIndex,
     config: AdvancedSearchConfig | None = None,
+    context_index: OnlineContextIndex | None = None,
 ) -> AdvancedSearchResponse:
     overall_started = time.perf_counter()
     stage_latency_ms = _empty_stage_latency()
@@ -392,6 +403,7 @@ def advanced_vector_search(
         inter_modality_trace=[],
         overall_started=overall_started,
         stage_latency_ms=stage_latency_ms,
+        context_index=context_index,
     )
 
 
@@ -409,6 +421,7 @@ def _select_and_rerank(
     inter_modality_trace: Sequence[Mapping[str, object]],
     overall_started: float,
     stage_latency_ms: dict[str, float],
+    context_index: OnlineContextIndex | None,
 ) -> AdvancedSearchResponse:
     _validate_dense_index_contract(dense_index, query_vector)
     stage_started = time.perf_counter()
@@ -516,6 +529,9 @@ def _select_and_rerank(
             event_vectors=event_vectors,
             max_event_gap_seconds=config.max_event_gap_seconds,
             weights=config.rerank_weights,
+            context_index=context_index,
+            row_by_frame=dense_index.row_by_frame,
+            context_config=config.context_config,
         )
     else:
         ranked = [
@@ -540,6 +556,12 @@ def _select_and_rerank(
     exact_duplicate_count += before_result_dedupe - len(ranked)
     stage_latency_ms["deterministic_rerank_ms"] = _elapsed_ms(stage_started)
     stage_latency_ms["total_ms"] = _elapsed_ms(overall_started)
+    context_trace = _context_trace_summary(
+        ranked,
+        requested=config.context_config,
+        context_index=context_index,
+        rerank_enabled=config.deterministic_rerank_enabled,
+    )
     return AdvancedSearchResponse(
         plan=plan,
         results=tuple(ranked),
@@ -552,6 +574,7 @@ def _select_and_rerank(
         skipped_modalities=skipped_modalities,
         inter_modality_trace=inter_modality_trace,
         stage_latency_ms=stage_latency_ms,
+        context_trace=context_trace,
         exact_duplicate_count=exact_duplicate_count,
     )
 
@@ -625,6 +648,8 @@ def _validate_dense_index_contract(
         raise ValueError("Dense candidate query vector must have a positive finite norm")
     if not isinstance(dense_index.rows_by_clip, Mapping):
         raise TypeError("Dense candidate rows_by_clip must be a mapping")
+    if not isinstance(dense_index.row_by_frame, Mapping):
+        raise TypeError("Dense candidate row_by_frame must be a mapping")
 
 
 def _validated_dense_hits(
@@ -658,6 +683,54 @@ def _record_clip_key(record: Mapping[str, Any]) -> tuple[str, str]:
         str(record.get("video_id") or ""),
         str(record.get("segment_id") or record.get("shot_id") or ""),
     )
+
+
+def _context_trace_summary(
+    frames: Sequence[AdvancedRankedFrame],
+    *,
+    requested: ContextRerankConfig,
+    context_index: OnlineContextIndex | None,
+    rerank_enabled: bool,
+) -> dict[str, object]:
+    summary = context_index.summary() if context_index is not None else {}
+
+    def feature(name: str, *, record_count_key: str) -> dict[str, object]:
+        was_requested = bool(getattr(requested, f"{name}_enabled"))
+        available = bool(
+            context_index is not None and int(summary.get(record_count_key) or 0) > 0
+        )
+        executed = bool(was_requested and available and rerank_enabled)
+        if not was_requested:
+            fallback_reason = "disabled_by_config"
+        elif not rerank_enabled:
+            fallback_reason = "deterministic_rerank_disabled"
+        elif context_index is None:
+            fallback_reason = "context_index_unavailable"
+        elif not available:
+            fallback_reason = f"{name}_artifact_unavailable"
+        else:
+            fallback_reason = ""
+        evidence_key = f"{name}_evidence_count"
+        return {
+            "requested": was_requested,
+            "artifact_available": available,
+            "executed": executed,
+            "fallback_reason": fallback_reason,
+            "results_with_evidence": sum(
+                1
+                for frame in frames
+                if int(frame.context_trace.get(evidence_key) or 0) > 0
+            ),
+        }
+
+    return {
+        "neighbor": feature("neighbor", record_count_key="neighbor_record_count"),
+        "segment": feature("segment", record_count_key="segment_record_count"),
+        "max_neighbors_each_side": requested.max_neighbors_each_side,
+        "segment_candidate_limit": requested.segment_candidate_limit,
+        "segment_top_k": requested.segment_top_k,
+        "context_bonus_cap": requested.max_bonus,
+    }
 
 
 def _validated_clip_rows(
@@ -712,12 +785,12 @@ def _dedupe_selections(
 def _ranked_identity(frame: AdvancedRankedFrame) -> tuple[str, str, str]:
     record = frame.record
     video_id = str(record.get("video_id") or "")
-    candidate_id = str(record.get("candidate_id") or "")
-    if candidate_id:
-        return ("candidate", video_id, candidate_id)
     frame_id = str(record.get("frame_id") or record.get("keyframe_id") or "")
     if frame_id:
         return ("frame", video_id, frame_id)
+    candidate_id = str(record.get("candidate_id") or "")
+    if candidate_id:
+        return ("candidate", video_id, candidate_id)
     return ("dense_row", "", str(frame.dense_row))
 
 

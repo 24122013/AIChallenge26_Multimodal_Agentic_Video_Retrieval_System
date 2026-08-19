@@ -60,8 +60,10 @@ vì TRAKE phải giữ chính xác event count/order do caller cung cấp.
 .\.venv\Scripts\python.exe backend\app\services\ingestion\run_object_detection.py --help
 
 $env:RETRIEVAL_QUERY_EXPANSION_ENABLED = "false" # optional low-latency smoke
+$env:ONLINE_NEIGHBOR_CONTEXT_ENABLED = "true"
+$env:ONLINE_SEGMENT_CONTEXT_ENABLED = "true"
 .\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline `
-  --task kis --top-k 20 --debug `
+  --task kis --top-k 20 --with-context --debug `
   --query "người đàn ông mặc áo đỏ đang mở cửa xe" `
   --output data/reports/kis_query.json
 
@@ -83,6 +85,9 @@ chỉ được xác nhận khi output có
 `routing_trace.coarse_to_dense.executed=true` và `mode="coarse_to_dense"`.
 `mode="selected_only_fallback"` nghĩa là request vẫn chạy selected-keyframe path
 nhưng dense rescue/CSES chưa chạy; đừng lấy kết quả đó làm bằng chứng full path.
+Context chỉ được xác nhận khi `routing_trace.context_scoring` cho biết artifact
+available và feature `executed=true`; file optional bị thiếu được báo fallback chứ
+không làm smoke fail.
 
 `QA_ANSWER_MODE=off` vẫn chạy QA evidence nhưng không load answer model;
 `optional` giữ evidence và trả error/abstention status nếu generation lỗi;
@@ -144,7 +149,8 @@ qa = search_online(
 KIS response có `query_plan` và ranked `candidates`; `keyframe_id`/`frame_id` là
 technical retrieval identity, còn `frame_index` là canonical original-frame
 lineage khi metadata có sẵn. Mỗi dense-path candidate giữ `score_breakdown`,
-`modality_scores`, `cses_selection` và các identity/metadata field hiện hữu;
+`score_contributions`, `context_scoring`, `modality_scores`, `cses_selection` và
+các identity/metadata field hiện hữu;
 `routing_trace.latency` tách thời gian planning, expansion, selected visual, text,
 fusion, dense global/rescue, CSES, deterministic rerank và context attachment.
 QA response giữ evidence riêng trong `evidence` và
@@ -161,12 +167,14 @@ Khi router được mount, các request chính xác là:
 
 | Task | Route/body |
 |---|---|
-| KIS/KIST | `POST /retrieval/online` với `{"query":"...","task":"kis","top_k":20,"expanded_queries":[]}` |
+| KIS/KIST | `POST /retrieval/online` với `{"query":"...","task":"kis","top_k":20,"expanded_queries":[],"include_context":true,"debug":true}` |
 | TRAKE | `POST /retrieval/online` với `{"query":"...","task":"trake","top_k":100,"expanded_queries":[]}` hoặc `POST /retrieval/trake` với `{"query":"...","top_k":100}` |
 | QA | `POST /retrieval/qa` với `{"query":"...","top_k":5,"task_mode":"qa","expanded_queries":[]}` |
 
-`POST /search` dùng `mode="kis"|"trake"|"qa"` thay cho field `task`. Router bọc
-kết quả thành `{"success":true,"data":...,"message":null}`. Repository hiện
+`POST /search` dùng `mode="kis"|"trake"|"qa"` thay cho field `task` và cũng nhận
+`include_context`/`debug`. Bỏ hai field này hoặc gửi `null` giữ runtime default;
+boolean là explicit per-request override. Router bọc kết quả thành
+`{"success":true,"data":...,"message":null}`. Repository hiện
 chưa có FastAPI app factory/uvicorn entrypoint, nên đây là service/router contract,
 không phải URL đang lắng nghe trên một host/port mặc định.
 
@@ -202,7 +210,9 @@ search_online
   -> coarse clip aggregation
   -> full dense-candidate FAISS global search + missed-clip rescue
   -> per-clip CSES
-  -> deterministic evidence rerank + exact candidate dedup
+  -> bounded canonical neighbor/segment scoring
+  -> deterministic evidence rerank + exact candidate dedup -> Top-K
+  -> bounded neighbor/segment response attachment
   -> existing Candidate/public response schema
 ```
 
@@ -213,18 +223,34 @@ search_online
 `dense_frames_per_clip: 12`, `rrf_k: 60`, `cses_enabled: true` và
 `deterministic_rerank_enabled: true`. Rerank cuối là phép cộng có trọng số của
 coarse RRF, dense visual, caption, OCR, objects, CSES gain, temporal consistency
-và modality alignment. Hai cờ `learned_rerank_enabled` và `vlm_rerank_enabled`
-mặc định `false`; canonical implementation hiện không load cross-encoder/VLM
-retrieval reranker, kể cả trong request bình thường. Query-expansion Qwen là một
-feature riêng của planner, không phải reranker này.
+và modality alignment, cộng neighbor/segment support khi context khả dụng. Không
+có heavy learned/VLM retrieval reranker trong canonical KIS/AVS path. Các key/env
+legacy tương ứng chỉ được parse để phát warning rồi bỏ qua; query-expansion Qwen
+là feature riêng của planner, không phải final reranker.
 
 Mọi field `online` có env override prefix `RETRIEVAL_ONLINE_`; các switch chính
 là `RETRIEVAL_ONLINE_COARSE_TO_DENSE_ENABLED`,
 `RETRIEVAL_ONLINE_DENSE_ENABLED`,
 `RETRIEVAL_ONLINE_DENSE_MISSING_BEHAVIOR`,
-`RETRIEVAL_ONLINE_LEARNED_RERANK_ENABLED`,
-`RETRIEVAL_ONLINE_VLM_RERANK_ENABLED` và `RETRIEVAL_ONLINE_DEBUG_ENABLED`.
+`RETRIEVAL_ONLINE_NEIGHBOR_SCORING_ENABLED`,
+`RETRIEVAL_ONLINE_SEGMENT_SCORING_ENABLED`,
+`RETRIEVAL_ONLINE_MAX_NEIGHBORS_EACH_SIDE`,
+`RETRIEVAL_ONLINE_SEGMENT_CONTEXT_CANDIDATE_LIMIT`,
+`RETRIEVAL_ONLINE_SEGMENT_CONTEXT_TOP_K`,
+`RETRIEVAL_ONLINE_CONTEXT_MAX_BONUS`,
+`RETRIEVAL_ONLINE_RERANK_NEIGHBOR_SUPPORT_WEIGHT`,
+`RETRIEVAL_ONLINE_RERANK_SEGMENT_SUPPORT_WEIGHT` và
+`RETRIEVAL_ONLINE_DEBUG_ENABLED`.
 CLI `--debug` override debug cho riêng request và mở detailed fusion trace.
+
+Defaults context scoring lần lượt là `true`, `true`, `2`, `12`, `3` và cap
+`0.08`. Chúng chỉ có hiệu lực khi request/context default bật nguồn tương ứng và
+`ONLINE_NEIGHBOR_CONTEXT_ENABLED`/`ONLINE_SEGMENT_CONTEXT_ENABLED` đã load được
+artifact. Scoring chạy sau CSES, trước final rerank/dedup/Top-K; nó reuse
+original-query vector, full-dense rows và metadata hiện có, không encode/search
+toàn corpus lần nữa. Neighbor aggregate là `0.65 * max + 0.35 * mean`; segment
+aggregate là `0.60 * max + 0.40 * mean(Top-3)`. Hai support weights mặc định đều
+`0.05`. Sau Top-K, pipeline mới attach payload context vào candidate public.
 
 Selected/coarse artifact paths vẫn lấy từ `RETRIEVAL_INDEX_PATH`,
 `RETRIEVAL_FRAME_MAP_PATH`, `RETRIEVAL_MANIFEST_PATH` và
@@ -246,6 +272,15 @@ selected-only route và trace ghi `selected_only_fallback`;
 dimension, row order, source lineage, khai báo bundle dở dang hoặc lệch encoder
 contract với selected index luôn fail closed ở cả hai mode. Giới hạn public vẫn
 là `hybrid.max_top_k: 200`.
+
+Canonical context paths mặc định là `data/metadata/neighbors_all.jsonl` và
+`data/metadata/segments_all.jsonl`. Một nguồn đã bật nhưng file còn thiếu chỉ bị
+đánh dấu unavailable trong `context`/`routing_trace.context_scoring`; request vẫn
+chạy không context bonus. Ngược lại, file đã có nhưng corrupt, trùng composite
+`(video_id, frame_id)` hoặc không khớp committed manifest không được fail-open.
+Một selected-only smoke cũng không chứng minh các dense row tham chiếu bởi context
+đã tồn tại; cần xem `executed`, evidence counts và missing-reference counts trong
+trace/candidate diagnostics.
 
 QA dùng cùng canonical corpus nhưng có feature flags riêng:
 

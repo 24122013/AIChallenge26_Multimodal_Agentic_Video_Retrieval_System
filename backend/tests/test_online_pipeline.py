@@ -109,7 +109,7 @@ class _QaPipeline:
 
     def search(self, query, top_k, *, task_mode, expanded_queries):
         self.calls.append((query, top_k, task_mode, tuple(expanded_queries)))
-        plan = build_query_plan(query, profile="qa")
+        plan = build_query_plan(query, task_mode=task_mode)
         return {
             "query_plan": plan.to_dict(),
             "routing_trace": {"route": "qa"},
@@ -125,7 +125,7 @@ class _TemporalEvidence:
 
     def search(self, query, top_k, *, task_mode, expanded_queries):
         self.calls.append((query, top_k, task_mode, tuple(expanded_queries)))
-        plan = build_query_plan(query, profile="temporal")
+        plan = build_query_plan(query, task_mode=task_mode)
         result = _result().to_dict()
         result["temporal_event_index"] = 0
         result["temporal_chain_id"] = "chain-1"
@@ -237,14 +237,31 @@ class _DenseIndex:
                 "objects": ["person", "refrigerator", "bottle"],
                 "protected_event_ids": ["EVENT_BOTTLE"],
             },
+            {
+                "candidate_id": "RESCUED:N1",
+                "frame_id": "RESCUED:F1",
+                "video_id": "RESCUED",
+                "shot_id": "S1",
+                "segment_id": "S1",
+                "timestamp": 4.2,
+                "frame_index": 105,
+                "caption": "a person opens a refrigerator and takes a bottle",
+                "ocr_text": "",
+                "objects": ["person", "refrigerator", "bottle"],
+                "protected_event_ids": [],
+            },
         ]
         self.vectors = np.asarray(
-            [[0.6, 0.8], [1.0, 0.0]],
+            [[0.6, 0.8], [1.0, 0.0], [1.0, 0.0]],
             dtype=np.float32,
         )
         self.rows_by_clip = {
             ("COARSE", "S0"): [0],
-            ("RESCUED", "S1"): [1],
+            ("RESCUED", "S1"): [1, 2],
+        }
+        self.row_by_frame = {
+            (str(record["video_id"]), str(record["frame_id"])): row
+            for row, record in enumerate(self.records)
         }
         self.search_calls: list[int] = []
 
@@ -287,6 +304,89 @@ class OnlinePipelineTest(unittest.TestCase):
         self.assertIsNotNone(candidate["caption_score"])
         self.assertIsNotNone(candidate["fusion_score"])
         self.assertEqual(candidate["rerank_score"], candidate["score"])
+
+    def test_auto_temporal_skips_generic_expansion_and_keeps_route_provenance(
+        self,
+    ) -> None:
+        hybrid, _visual, _text = _hybrid()
+        provider = _Provider()
+        temporal = _TemporalEvidence()
+        pipeline = OnlinePipeline(
+            hybrid_engine=hybrid,
+            runtime_config=RetrievalRuntimeConfig(
+                query_expansion=QueryExpansionConfig(enabled=True)
+            ),
+            query_expansion_provider=provider,
+            qa_evidence_engine=temporal,
+        )
+
+        response = pipeline.run(
+            "a man enters the room then sits down",
+            task="auto",
+            top_k=2,
+        )
+
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(response["task"], "temporal")
+        self.assertEqual(response["query_plan"]["requested_profile"], "auto")
+        self.assertEqual(response["query_plan"]["profile_source"], "inferred")
+        expansion = response["routing_trace"]["query_expansion"]
+        self.assertTrue(expansion["requested"])
+        self.assertFalse(expansion["executed"])
+        self.assertEqual(expansion["provider_call_count"], 0)
+        self.assertEqual(expansion["skip_reason"], "temporal_route")
+
+    def test_explicit_kis_and_avs_still_call_generic_expansion(self) -> None:
+        query = "a man opens a car door with the text CITY"
+        for task in ("kis", "avs"):
+            with self.subTest(task=task):
+                hybrid, _visual, _text = _hybrid()
+                provider = _Provider()
+                pipeline = OnlinePipeline(
+                    hybrid_engine=hybrid,
+                    runtime_config=RetrievalRuntimeConfig(
+                        query_expansion=QueryExpansionConfig(enabled=True)
+                    ),
+                    query_expansion_provider=provider,
+                )
+
+                response = pipeline.run(query, task=task, top_k=2)
+
+                self.assertEqual(provider.calls, [query])
+                expansion = response["routing_trace"]["query_expansion"]
+                self.assertTrue(expansion["executed"])
+                self.assertEqual(expansion["provider_call_count"], 1)
+
+    def test_qa_and_trake_skip_generic_expansion_when_enabled(self) -> None:
+        hybrid, _visual, _text = _hybrid()
+        provider = _Provider()
+        qa = _QaPipeline()
+        trake = _TrakePipeline()
+        pipeline = OnlinePipeline(
+            hybrid_engine=hybrid,
+            runtime_config=RetrievalRuntimeConfig(
+                query_expansion=QueryExpansionConfig(enabled=True)
+            ),
+            query_expansion_provider=provider,
+            qa_pipeline=qa,
+            trake_pipeline=trake,
+        )
+
+        qa_response = pipeline.run("What is the man holding?", task="qa")
+        trake_response = pipeline.run(
+            "a man enters then sits down",
+            task="trake",
+        )
+
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(
+            qa_response["routing_trace"]["query_expansion"]["skip_reason"],
+            "qa_route",
+        )
+        self.assertEqual(
+            trake_response["trace"]["query_expansion"]["skip_reason"],
+            "trake_route",
+        )
 
     def test_context_reads_canonical_neighbor_and_segment_artifacts(self) -> None:
         hybrid, _visual, _text = _hybrid()
@@ -474,7 +574,7 @@ class OnlinePipelineTest(unittest.TestCase):
         self.assertTrue(segment_trace["enabled"])
         self.assertGreater(segment_trace["mapped_candidate_count"], 0)
 
-    def test_context_override_fails_closed_when_artifacts_are_not_loaded(self) -> None:
+    def test_context_override_degrades_when_optional_artifacts_are_not_loaded(self) -> None:
         hybrid, _visual, _text = _hybrid()
         pipeline = OnlinePipeline(
             hybrid_engine=hybrid,
@@ -483,8 +583,24 @@ class OnlinePipelineTest(unittest.TestCase):
             ),
         )
 
-        with self.assertRaises(FileNotFoundError):
-            pipeline.run("a red car", include_context=True)
+        response = pipeline.run("a red car", include_context=True)
+
+        self.assertTrue(response["candidates"])
+        self.assertEqual(
+            response["context"]["fallback_reason"],
+            "requested_context_artifact_unavailable",
+        )
+        context_trace = response["routing_trace"]["context_scoring"]
+        self.assertFalse(context_trace["neighbor"]["executed"])
+        self.assertFalse(context_trace["segment"]["executed"])
+        self.assertEqual(
+            context_trace["neighbor"]["fallback_reason"],
+            "neighbor_artifact_unavailable",
+        )
+        self.assertEqual(
+            context_trace["segment"]["fallback_reason"],
+            "segment_artifact_unavailable",
+        )
 
     def test_real_search_online_factory_executes_dense_rescue_cses_and_rerank(
         self,
@@ -507,6 +623,27 @@ class OnlinePipelineTest(unittest.TestCase):
             bundle_generation=None,
             manifest_contract_sha256=None,
         )
+        context = OnlineContextIndex(
+            neighbor_records=[
+                {
+                    "video_id": "RESCUED",
+                    "frame_id": "RESCUED:F0",
+                    "neighbors_before": [],
+                    "neighbors_after": [
+                        {"frame_id": "RESCUED:F1", "delta_seconds": 0.2}
+                    ],
+                }
+            ],
+            segment_records=[
+                {
+                    "video_id": "RESCUED",
+                    "segment_id": "S1",
+                    "start_time": 3.5,
+                    "end_time": 4.5,
+                    "keyframe_ids": ["RESCUED:F0", "RESCUED:F1"],
+                }
+            ],
+        )
 
         with (
             mock.patch.object(
@@ -527,7 +664,7 @@ class OnlinePipelineTest(unittest.TestCase):
             mock.patch.object(
                 retrieval_manager,
                 "get_online_context_index",
-                return_value=None,
+                return_value=context,
             ),
             mock.patch.object(
                 retrieval_manager,
@@ -566,6 +703,7 @@ class OnlinePipelineTest(unittest.TestCase):
                 "a person opens a refrigerator and takes a bottle",
                 task="kis",
                 top_k=2,
+                include_context=True,
                 debug=True,
             )
 
@@ -597,8 +735,13 @@ class OnlinePipelineTest(unittest.TestCase):
             item for item in response["candidates"] if item["video_id"] == "RESCUED"
         )
         self.assertTrue(rescued["score_breakdown"])
+        self.assertGreater(rescued["score_breakdown"]["neighbor_support"], 0.0)
+        self.assertGreater(rescued["score_breakdown"]["segment_support"], 0.0)
+        self.assertTrue(rescued["context_scoring"]["neighbor_used_for_scoring"])
+        self.assertTrue(trace["context_scoring"]["neighbor"]["executed"])
+        self.assertTrue(trace["context_scoring"]["segment"]["executed"])
         self.assertIsNotNone(rescued["cses_selection"])
-        self.assertFalse(trace["heavy_rerankers"]["loaded_by_online_pipeline"])
+        self.assertNotIn("heavy_rerankers", trace)
         for heavy in (
             bge_reranker,
             trake_reranker,

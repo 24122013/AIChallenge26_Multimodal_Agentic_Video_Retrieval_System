@@ -5,7 +5,7 @@ import argparse
 import json
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -49,9 +49,11 @@ class _TimedExpansionProvider:
         self.model_name = provider.model_name
         self.model_revision = provider.model_revision
         self.elapsed_ms = 0.0
+        self.calls = 0
 
     def expand(self, query, protected):
         started = time.perf_counter()
+        self.calls += 1
         try:
             return self.provider.expand(query, protected)
         finally:
@@ -102,6 +104,8 @@ class Candidate:
     objects: tuple[str, ...] = ()
     modality_scores: dict[str, float] = field(default_factory=dict)
     score_breakdown: dict[str, float] = field(default_factory=dict)
+    score_contributions: dict[str, float] = field(default_factory=dict)
+    context_scoring: dict[str, Any] = field(default_factory=dict)
     cses_selection: dict[str, Any] | None = None
     temporal: dict[str, Any] = field(default_factory=dict)
     context_sources: tuple[str, ...] = ()
@@ -114,6 +118,7 @@ class Candidate:
         context_index: OnlineContextIndex | None = None,
         include_neighbors: bool = False,
         include_segments: bool = False,
+        max_neighbors_each_side: int | None = None,
     ) -> "Candidate":
         modality_scores = _float_mapping(value.get("modality_scores"))
         video_id = str(value.get("video_id") or "")
@@ -139,6 +144,7 @@ class Candidate:
                 timestamp=timestamp,
                 segment_id=segment_id,
                 existing_neighbors=neighbors,
+                max_neighbors_each_side=max_neighbors_each_side,
             )
             if include_neighbors:
                 neighbors = context.neighbors
@@ -201,6 +207,12 @@ class Candidate:
             score_breakdown=_float_mapping(
                 value.get("score_breakdown") or value.get("breakdown")
             ),
+            score_contributions=_float_mapping(value.get("score_contributions")),
+            context_scoring=(
+                dict(value["context_scoring"])
+                if isinstance(value.get("context_scoring"), Mapping)
+                else {}
+            ),
             cses_selection=(
                 dict(value["cses_selection"])
                 if isinstance(value.get("cses_selection"), Mapping)
@@ -249,6 +261,8 @@ class Candidate:
             "objects": list(self.objects),
             "modality_scores": dict(self.modality_scores),
             "score_breakdown": dict(self.score_breakdown),
+            "score_contributions": dict(self.score_contributions),
+            "context_scoring": dict(self.context_scoring),
             "cses_selection": (
                 dict(self.cses_selection)
                 if self.cses_selection is not None
@@ -302,7 +316,7 @@ class OnlinePipeline:
         include_context: bool | None = None,
         debug: bool | None = None,
     ) -> dict[str, Any]:
-        """Plan once, route by task, then normalize all result candidates."""
+        """Route by task, then normalize all result candidates."""
 
         started_at = time.perf_counter()
         original_query = " ".join(str(query).split())
@@ -328,18 +342,24 @@ class OnlinePipeline:
                 query=original_query,
                 top_k=requested_top_k,
                 started_at=started_at,
+                expansion_requested=self.runtime_config.query_expansion.enabled,
             )
 
         plan: QueryPlan | None = None
-        stage_latency: dict[str, float] = {}
+        stage_latency: dict[str, float] = {
+            "query_planning_ms": 0.0,
+            "query_expansion_ms": 0.0,
+        }
+        expansion_provider_calls = 0
         debug_enabled = (
             self.runtime_config.online.debug_enabled
             if debug is None
             else bool(debug)
         )
+        include_neighbors, include_segments = self._context_flags(include_context)
         resolved_task = requested_task
         if requested_task in {"auto", "kis", "avs"}:
-            plan, planning_ms, expansion_ms = self._plan(
+            plan, planning_ms, expansion_ms, expansion_provider_calls = self._plan(
                 original_query,
                 requested_task,
             )
@@ -356,6 +376,8 @@ class OnlinePipeline:
                 plan=plan,
                 top_k=requested_top_k,
                 debug=debug_enabled,
+                include_neighbors=include_neighbors,
+                include_segments=include_segments,
             )
         elif resolved_task == "qa":
             if self.qa_pipeline is None:
@@ -363,7 +385,7 @@ class OnlinePipeline:
             raw = self.qa_pipeline.search(
                 original_query,
                 top_k=min(requested_top_k, 5),
-                task_mode="qa",
+                task_mode="auto" if requested_task == "auto" else "qa",
                 expanded_queries=tuple(expanded_queries),
             )
         elif resolved_task == "temporal":
@@ -374,7 +396,7 @@ class OnlinePipeline:
             raw = self.qa_evidence_engine.search(
                 original_query,
                 top_k=requested_top_k,
-                task_mode="temporal",
+                task_mode="auto" if requested_task == "auto" else "temporal",
                 # Event decomposition owns temporal queries; whole-question
                 # expansions must not alter event order or meaning.
                 expanded_queries=(),
@@ -384,12 +406,6 @@ class OnlinePipeline:
 
         query_plan = _query_plan_payload(raw, plan)
         _validate_original_anchor(original_query, query_plan)
-        include_neighbors, include_segments = self._context_flags(include_context)
-        if (include_neighbors or include_segments) and self.context_index is None:
-            raise FileNotFoundError(
-                "Online context was requested but canonical neighbor/segment "
-                "artifacts are not loaded"
-            )
         context_started = time.perf_counter()
         raw_candidates = raw.get("results") or ()
         candidates = [
@@ -398,11 +414,19 @@ class OnlinePipeline:
                 context_index=self.context_index,
                 include_neighbors=include_neighbors,
                 include_segments=include_segments,
+                max_neighbors_each_side=(
+                    self.runtime_config.online.context_config.max_neighbors_each_side
+                ),
             )
             for item in raw_candidates
             if isinstance(item, Mapping)
         ]
         stage_latency["context_attachment_ms"] = _elapsed_ms(context_started)
+        context_summary = (
+            self.context_index.summary() if self.context_index is not None else {}
+        )
+        neighbors_available = int(context_summary.get("neighbor_record_count") or 0) > 0
+        segments_available = int(context_summary.get("segment_record_count") or 0) > 0
 
         response: dict[str, Any] = {
             "schema_version": ONLINE_SCHEMA_VERSION,
@@ -416,11 +440,17 @@ class OnlinePipeline:
                 "enabled": include_neighbors or include_segments,
                 "neighbors_enabled": include_neighbors,
                 "segments_enabled": include_segments,
-                "index": (
-                    self.context_index.summary()
-                    if self.context_index is not None
-                    else None
+                "neighbors_available": neighbors_available,
+                "segments_available": segments_available,
+                "fallback_reason": (
+                    ""
+                    if (
+                        (not include_neighbors or neighbors_available)
+                        and (not include_segments or segments_available)
+                    )
+                    else "requested_context_artifact_unavailable"
                 ),
+                "index": context_summary if self.context_index is not None else None,
             },
             "latency_ms": _elapsed_ms(started_at),
         }
@@ -439,6 +469,12 @@ class OnlinePipeline:
         stage_latency["total_ms"] = response["latency_ms"]
         routing_trace["latency"] = stage_latency
         routing_trace["debug_enabled"] = debug_enabled
+        routing_trace["query_expansion"] = _query_expansion_trace(
+            requested=self.runtime_config.query_expansion.enabled,
+            executed_calls=expansion_provider_calls,
+            resolved_task=resolved_task,
+            query_plan=query_plan,
+        )
         response["routing_trace"] = routing_trace
         for field_name in (
             "answer",
@@ -453,7 +489,7 @@ class OnlinePipeline:
                 response[field_name] = raw[field_name]
         return response
 
-    def _plan(self, query: str, task: str) -> tuple[QueryPlan, float, float]:
+    def _plan(self, query: str, task: str) -> tuple[QueryPlan, float, float, int]:
         started = time.perf_counter()
         provider = (
             self.query_expansion_provider
@@ -469,7 +505,13 @@ class OnlinePipeline:
         )
         total_ms = _elapsed_ms(started)
         expansion_ms = timed_provider.elapsed_ms if timed_provider is not None else 0.0
-        return plan, round(max(0.0, total_ms - expansion_ms), 3), expansion_ms
+        provider_calls = timed_provider.calls if timed_provider is not None else 0
+        return (
+            plan,
+            round(max(0.0, total_ms - expansion_ms), 3),
+            expansion_ms,
+            provider_calls,
+        )
 
     def _run_kis_avs(
         self,
@@ -478,8 +520,15 @@ class OnlinePipeline:
         plan: QueryPlan,
         top_k: int,
         debug: bool,
+        include_neighbors: bool,
+        include_segments: bool,
     ) -> dict[str, Any]:
         online = self.runtime_config.online
+        context_summary = (
+            self.context_index.summary() if self.context_index is not None else {}
+        )
+        neighbor_available = int(context_summary.get("neighbor_record_count") or 0) > 0
+        segment_available = int(context_summary.get("segment_record_count") or 0) > 0
         dense_index: DenseCandidateIndex | None = None
         fallback_reason = ""
         if online.coarse_to_dense_enabled and online.dense_enabled:
@@ -515,10 +564,49 @@ class OnlinePipeline:
                 "missing_behavior": online.dense_missing_behavior,
                 "fallback_reason": fallback_reason,
             }
-            trace["heavy_rerankers"] = {
-                "learned_enabled": bool(online.learned_rerank_enabled),
-                "vlm_enabled": bool(online.vlm_rerank_enabled),
-                "loaded_by_online_pipeline": False,
+            neighbor_scoring_requested = bool(
+                include_neighbors and online.context_config.neighbor_enabled
+            )
+            segment_scoring_requested = bool(
+                include_segments and online.context_config.segment_enabled
+            )
+            trace["context_scoring"] = {
+                "neighbor": {
+                    "requested": neighbor_scoring_requested,
+                    "artifact_available": neighbor_available,
+                    "executed": False,
+                    "fallback_reason": (
+                        "disabled_by_request"
+                        if not include_neighbors
+                        else (
+                            "disabled_by_config"
+                            if not online.context_config.neighbor_enabled
+                            else (
+                                "dense_rerank_unavailable"
+                                if neighbor_available
+                                else "neighbor_artifact_unavailable"
+                            )
+                        )
+                    ),
+                },
+                "segment": {
+                    "requested": segment_scoring_requested,
+                    "artifact_available": segment_available,
+                    "executed": False,
+                    "fallback_reason": (
+                        "disabled_by_request"
+                        if not include_segments
+                        else (
+                            "disabled_by_config"
+                            if not online.context_config.segment_enabled
+                            else (
+                                "dense_rerank_unavailable"
+                                if segment_available
+                                else "segment_artifact_unavailable"
+                            )
+                        )
+                    ),
+                },
             }
             sparse["trace"] = trace
             return sparse
@@ -550,7 +638,19 @@ class OnlinePipeline:
                 deterministic_rerank_enabled=online.deterministic_rerank_enabled,
                 query_expansion=self.runtime_config.query_expansion,
                 rerank_weights=online.rerank_weights,
+                context_config=replace(
+                    online.context_config,
+                    neighbor_enabled=(
+                        online.context_config.neighbor_enabled
+                        and include_neighbors
+                    ),
+                    segment_enabled=(
+                        online.context_config.segment_enabled
+                        and include_segments
+                    ),
+                ),
             ),
+            context_index=self.context_index,
         )
         raw = response.to_dict(top_k=top_k)
         trace = dict(raw.get("trace") or {})
@@ -561,11 +661,6 @@ class OnlinePipeline:
             "mode": "coarse_to_dense",
             "missing_behavior": online.dense_missing_behavior,
             "fallback_reason": "",
-        }
-        trace["heavy_rerankers"] = {
-            "learned_enabled": bool(online.learned_rerank_enabled),
-            "vlm_enabled": bool(online.vlm_rerank_enabled),
-            "loaded_by_online_pipeline": False,
         }
         if not debug:
             trace.pop("intra_modality_fusion", None)
@@ -636,6 +731,7 @@ def _trake_response(
     query: str,
     top_k: int,
     started_at: float,
+    expansion_requested: bool,
 ) -> dict[str, Any]:
     """Preserve the sequence-first TRAKE contract without candidate flattening."""
 
@@ -676,6 +772,15 @@ def _trake_response(
     response["task"] = "trake"
     response["top_k"] = top_k
     response["hypotheses"] = hypotheses
+    trace = response.get("trace")
+    trace_payload = dict(trace) if isinstance(trace, Mapping) else {}
+    trace_payload["query_expansion"] = {
+        "requested": bool(expansion_requested),
+        "executed": False,
+        "provider_call_count": 0,
+        "skip_reason": "trake_route",
+    }
+    response["trace"] = trace_payload
     if "candidates" in response:
         # The compatibility alias, when supplied by the core pipeline, remains
         # a list of complete sequences and must obey the same public limit.
@@ -685,6 +790,39 @@ def _trake_response(
         round((time.perf_counter() - started_at) * 1000.0, 3),
     )
     return response
+
+
+def _query_expansion_trace(
+    *,
+    requested: bool,
+    executed_calls: int,
+    resolved_task: str,
+    query_plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    expansion_plan = query_plan.get("expansion_plan")
+    expansion_payload = (
+        dict(expansion_plan) if isinstance(expansion_plan, Mapping) else {}
+    )
+    executed = int(executed_calls) > 0
+    if resolved_task not in {"kis", "avs"}:
+        skip_reason = f"{resolved_task}_route"
+    elif not requested:
+        skip_reason = "disabled_by_config"
+    elif not executed:
+        skip_reason = str(
+            expansion_payload.get("fallback_reason")
+            or expansion_payload.get("status")
+            or "provider_not_called"
+        )
+    else:
+        skip_reason = ""
+    return {
+        "requested": bool(requested),
+        "executed": executed,
+        "provider_call_count": int(executed_calls),
+        "skip_reason": skip_reason,
+        "status": str(expansion_payload.get("status") or ""),
+    }
 
 
 def _validate_original_anchor(query: str, plan: Mapping[str, Any]) -> None:
@@ -766,7 +904,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const",
         const=True,
         default=None,
-        help="Require canonical neighbor and segment context for this query.",
+        help=(
+            "Request canonical neighbor and segment context; unavailable optional "
+            "artifacts are reported in the trace."
+        ),
     )
     parser.add_argument(
         "--debug",

@@ -56,18 +56,25 @@ online:
   rrf_enabled: true
   cses_enabled: true
   deterministic_rerank_enabled: true
-  # Heavy learned/VLM retrieval rerankers remain outside the default path.
-  learned_rerank_enabled: false
-  vlm_rerank_enabled: false
   debug_enabled: false
-  rerank_coarse_rrf_weight: 0.16
-  rerank_dense_visual_weight: 0.43
-  rerank_caption_weight: 0.12
-  rerank_ocr_weight: 0.11
-  rerank_objects_weight: 0.08
-  rerank_cses_gain_weight: 0.05
+  # Context scoring is metadata-only and runs after CSES, before final Top-K.
+  # It activates only when the matching ONLINE_*_CONTEXT_ENABLED artifact is loaded.
+  neighbor_scoring_enabled: true
+  segment_scoring_enabled: true
+  max_neighbors_each_side: 2
+  segment_context_candidate_limit: 12
+  segment_context_top_k: 3
+  context_max_bonus: 0.08
+  rerank_coarse_rrf_weight: 0.14
+  rerank_dense_visual_weight: 0.39
+  rerank_caption_weight: 0.11
+  rerank_ocr_weight: 0.10
+  rerank_objects_weight: 0.07
+  rerank_cses_gain_weight: 0.04
   rerank_temporal_consistency_weight: 0.03
   rerank_modality_alignment_weight: 0.02
+  rerank_neighbor_support_weight: 0.05
+  rerank_segment_support_weight: 0.05
 
 trake:
   # BGE-M3 is independently opt-in for TRAKE; QA flags never enable it here.

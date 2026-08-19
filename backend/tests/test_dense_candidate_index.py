@@ -9,6 +9,7 @@ import numpy as np
 
 from backend.app.pipelines import offline_pipeline as pipeline
 from backend.app.services.indexing import build_faiss_index as faiss_builder
+from backend.app.services.retrieval import dense_candidate_index as dense_module
 from backend.app.services.retrieval.dense_candidate_index import (
     DENSE_ARTIFACT_ROLE,
     DenseCandidateIndexConfig,
@@ -163,6 +164,14 @@ class DenseCandidateIndexIntegrationTests(unittest.TestCase):
                 (self.video_id, f"SHOT_{self.video_id}_000001"): (2,),
             },
         )
+        self.assertEqual(
+            dense.row_by_frame,
+            {
+                (self.video_id, f"{self.video_id}:F0000"): 0,
+                (self.video_id, f"{self.video_id}:F0001"): 1,
+                (self.video_id, f"{self.video_id}:F0002"): 2,
+            },
+        )
         self.assertEqual(dense.records[1]["caption"], "caption evidence 1")
         self.assertEqual(dense.records[1]["ocr_text"], "SALE")
         self.assertEqual(dense.records[1]["objects"], ["bottle"])
@@ -188,7 +197,6 @@ class DenseCandidateIndexIntegrationTests(unittest.TestCase):
                     report_path=self.corpus_paths.dense_report,
                 )
             )
-
     def test_loader_rejects_manifest_count_drift(self) -> None:
         self._build()
         manifest = json.loads(self.corpus_paths.dense_manifest.read_text(encoding="utf-8"))
@@ -208,6 +216,37 @@ class DenseCandidateIndexIntegrationTests(unittest.TestCase):
                     report_path=self.corpus_paths.dense_report,
                 )
             )
+
+
+class DenseCandidateIdentityValidationTests(unittest.TestCase):
+    @staticmethod
+    def _record(candidate_id: str, frame_id: str) -> dict:
+        return {
+            "faiss_index": 0,
+            "candidate_id": candidate_id,
+            "frame_id": frame_id,
+            "video_id": "V1",
+            "segment_id": "S1",
+            "vector_dim": 2,
+            "normalized": True,
+            "caption": "caption",
+            "ocr_text": "",
+            "objects": [],
+            "protected_event_ids": [],
+        }
+
+    def test_dense_contract_rejects_empty_and_duplicate_frame_identity(self) -> None:
+        with self.assertRaisesRegex(ValueError, "frame_id"):
+            dense_module._validate_records(
+                [self._record("C0", "")],
+                vector_dim=2,
+            )
+
+        first = self._record("C0", "F0")
+        second = self._record("C1", "F0")
+        second["faiss_index"] = 1
+        with self.assertRaisesRegex(ValueError, "Duplicate dense frame identity"):
+            dense_module._validate_records([first, second], vector_dim=2)
 
 
 if __name__ == "__main__":

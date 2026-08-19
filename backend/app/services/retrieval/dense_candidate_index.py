@@ -55,6 +55,7 @@ class ValidatedDenseCandidateArtifacts:
     manifest: Mapping[str, Any]
     records: tuple[Mapping[str, Any], ...]
     rows_by_clip: Mapping[tuple[str, str], tuple[int, ...]]
+    row_by_frame: Mapping[tuple[str, str], int]
     index: Any
     vectors: np.ndarray
 
@@ -155,20 +156,26 @@ def _validate_records(
     records: list[dict[str, Any]],
     *,
     vector_dim: int,
-) -> dict[tuple[str, str], tuple[int, ...]]:
+) -> tuple[
+    dict[tuple[str, str], tuple[int, ...]],
+    dict[tuple[str, str], int],
+]:
     if not records:
         raise ValueError("Dense candidate metadata must not be empty")
     candidate_ids: set[str] = set()
-    mutable_rows: dict[tuple[str, str], list[int]] = {}
+    mutable_clip_rows: dict[tuple[str, str], list[int]] = {}
+    row_by_frame: dict[tuple[str, str], int] = {}
     for row, record in enumerate(records):
         if record.get("faiss_index") != row:
             raise ValueError(f"Dense metadata faiss_index mismatch at row {row}")
         candidate_id = str(record.get("candidate_id") or "")
         video_id = str(record.get("video_id") or "")
+        frame_id = str(record.get("frame_id") or record.get("keyframe_id") or "")
         clip_id = str(record.get("segment_id") or record.get("shot_id") or "")
-        if not candidate_id or not video_id or not clip_id:
+        if not candidate_id or not video_id or not frame_id or not clip_id:
             raise ValueError(
-                f"Dense metadata row {row} requires candidate_id, video_id, and clip id"
+                "Dense metadata row "
+                f"{row} requires candidate_id, video_id, frame_id, and clip id"
             )
         if candidate_id in candidate_ids:
             raise ValueError(f"Duplicate dense candidate_id: {candidate_id}")
@@ -189,8 +196,15 @@ def _validate_records(
             not isinstance(value, str) for value in record["protected_event_ids"]
         ):
             raise ValueError(f"Dense metadata row {row} has invalid protected events")
-        mutable_rows.setdefault((video_id, clip_id), []).append(row)
-    return {key: tuple(rows) for key, rows in mutable_rows.items()}
+        frame_key = (video_id, frame_id)
+        if frame_key in row_by_frame:
+            raise ValueError(f"Duplicate dense frame identity: {frame_key}")
+        mutable_clip_rows.setdefault((video_id, clip_id), []).append(row)
+        row_by_frame[frame_key] = row
+    return (
+        {key: tuple(rows) for key, rows in mutable_clip_rows.items()},
+        row_by_frame,
+    )
 
 
 def _index_vectors(index: Any, faiss_module: Any, count: int, dim: int) -> np.ndarray:
@@ -258,7 +272,7 @@ def validate_dense_candidate_artifacts(
         raise ValueError("Dense bundle generation does not match artifact checksums")
 
     records = _read_jsonl(config.metadata_path)
-    rows_by_clip = _validate_records(records, vector_dim=vector_dim)
+    rows_by_clip, row_by_frame = _validate_records(records, vector_dim=vector_dim)
     raw_frame_map = _read_json_object(config.frame_map_path)
     expected_frame_map = {
         str(row): frame_map_record(record) for row, record in enumerate(records)
@@ -300,6 +314,7 @@ def validate_dense_candidate_artifacts(
         manifest=manifest,
         records=tuple(records),
         rows_by_clip=rows_by_clip,
+        row_by_frame=row_by_frame,
         index=index,
         vectors=vectors,
     )
@@ -313,6 +328,7 @@ class FaissDenseCandidateIndex:
         self.records = self.artifacts.records
         self.vectors = self.artifacts.vectors
         self.rows_by_clip = self.artifacts.rows_by_clip
+        self.row_by_frame = self.artifacts.row_by_frame
         self.encoder_contract = self.artifacts.manifest["encoder"]
 
     def search(self, query_vector: np.ndarray, top_k: int) -> list[tuple[int, float]]:

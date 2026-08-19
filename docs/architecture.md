@@ -12,7 +12,7 @@ Hệ thống phải hỗ trợ:
 * Object Retrieval
 * Temporal Retrieval
 * TRAKE ordered-sequence retrieval
-* Agentic Retrieval
+* Deterministic query planning và optional query expansion
 
 Người dùng nhập truy vấn tự nhiên.
 
@@ -29,13 +29,13 @@ Hệ thống sẽ:
 # 2. High-Level Architecture
 
 ```text
-Frontend
+CLI / service caller / future HTTP host
     │
     ▼
-FastAPI Backend
+`search_online` hoặc router contract
     │
     ▼
-Agent Layer
+OnlinePipeline + typed QueryPlan
     │
     ▼
 Retrieval Layer
@@ -54,11 +54,15 @@ Index Layer
     ├── Full dense-candidate visual FAISS (global rescue + CSES)
     ├── Sparse/optional dense text indexes
     ├── Metadata Store
-    └── Neighbor Index
+    └── Canonical neighbor/segment indexes
     │
     ▼
 Dataset
 ```
+
+Đây là kiến trúc runtime đã triển khai. Repository hiện chỉ định nghĩa FastAPI
+routers, chưa có `FastAPI()` app factory/mount, health endpoint hay frontend chạy
+được; vì vậy sơ đồ không ngầm hứa một HTTP server sẵn có.
 
 ---
 
@@ -118,7 +122,9 @@ search_online -> get_online_pipeline -> OnlinePipeline.run
     │         -> selected visual/caption/OCR/object retrieval
     │         -> weighted RRF -> coarse clips
     │         -> full dense FAISS global rescue -> per-clip CSES
-    │         -> deterministic evidence rerank -> exact dedup
+    │         -> bounded neighbor/segment context scoring
+    │         -> deterministic evidence rerank -> exact dedup -> Top-K
+    │         -> response context attachment
     ├── temporal / QA
     │     └── existing evidence-oriented routes
     └── TRAKE
@@ -139,9 +145,21 @@ The full dense-candidate loader is lazy and cached by committed corpus
 generation, so QA and TRAKE are not blocked merely because the dense KIS/AVS
 bundle is absent. KIS/AVS use `online.dense_missing_behavior` to choose explicit
 `selected_only_fallback` or an error on missing files. Integrity/lineage/encoder
-contract failures always fail closed. Learned and VLM retrieval rerankers are
-disabled by default; the canonical final rerank is deterministic and exposes a
-score breakdown plus per-stage latency trace.
+contract failures always fail closed. Canonical KIS/AVS has no heavy learned/VLM
+retrieval reranker; legacy settings for those branches are ignored with a warning.
+The final rerank is deterministic and exposes score breakdown, weighted
+contributions, context evidence/cap diagnostics and per-stage latency.
+
+Neighbor/segment scoring is an opt-in advanced path because loading the artifacts
+is disabled by default. When requested and available, it runs after CSES and
+before final dedup/Top-K. It resolves at most two neighbors on each side and a
+12-keyframe canonical segment window, aggregates the segment Top-3, and caps the
+combined context bonus at `0.08`. It reuses the normalized original-query vector,
+full-dense vectors and existing caption/OCR/object metadata: no second encode and
+no additional global FAISS/BM25 search. After Top-K, the same context index
+hydrates public `neighbors`/`segment_context`. Missing optional files produce an
+explicit fallback trace; present but corrupt or lineage-mismatched artifacts fail
+validation.
 
 ---
 
@@ -196,19 +214,18 @@ frame lineage.
 
 ---
 
-## Agent
+## Query Planning
 
 Nhiệm vụ:
 
-* Query Understanding
-* Query Expansion
-* Query Decomposition
-* Tool Calling
-* Result Fusion
+* Typed task/profile planning
+* Optional bounded query expansion
+* Modality hints and query variants
+* Deterministic retrieval/fusion orchestration
 
 Output:
 
-Intelligent Search Pipeline.
+`QueryPlan` consumed directly by the canonical search pipeline.
 
 ---
 
@@ -227,9 +244,9 @@ Performance Reports.
 
 ---
 
-# 6. Frontend Architecture
+# 6. Future Frontend Architecture (chưa triển khai)
 
-Frontend chỉ chịu trách nhiệm hiển thị.
+Khi được triển khai, frontend chỉ chịu trách nhiệm hiển thị.
 
 ```text
 Search Page
@@ -253,7 +270,7 @@ Frontend không thực hiện:
 * Retrieval
 * Metadata Processing
 
-Frontend chỉ giao tiếp qua API.
+Frontend tương lai chỉ giao tiếp qua API sau khi có app/router mount thực tế.
 
 ---
 
@@ -271,7 +288,9 @@ Query
  │     ├── Coarse clip aggregation
  │     ├── Full dense-candidate global FAISS rescue
  │     ├── Per-clip CSES visual/temporal coverage selection
- │     └── Deterministic evidence rerank + exact dedup
+ │     ├── Bounded canonical neighbor/segment scoring
+ │     ├── Deterministic evidence rerank + exact dedup + Top-K
+ │     └── Bounded context payload attachment
  │
  ├── Temporal Evidence / QA
  │
@@ -299,7 +318,9 @@ Mỗi search engine có thể phát triển độc lập, nhưng KIS/AVS product
 `advanced_search` như một orphan utility: nó được route trực tiếp từ
 `OnlinePipeline.run` qua canonical public manager entrypoint. Coarse RRF chỉ chọn
 clip pool; dense similarity và evidence features được tính riêng ở deterministic
-rerank, tránh cộng một raw score hai lần như thể chúng cùng thang đo.
+rerank, tránh cộng một raw score hai lần như thể chúng cùng thang đo. Context
+lookup cho mỗi candidate bị chặn bởi một cửa sổ nhỏ; nó không scan segment/corpus
+tùy ý và không gọi encoder/search engine lần nữa.
 
 TRAKE is orchestrated by `backend/app/services/trake/pipeline.py` and is cached
 with the same corpus generation as the hybrid engine. Every complete hypothesis
@@ -323,11 +344,12 @@ VLM verification branch, and no full-corpus semantic-boundary quality claim.
 
 ---
 
-# 8. Agent Architecture
+# 8. Query Planning Architecture
 
-Agent không trực tiếp truy cập database.
-
-Agent chỉ gọi Retrieval Tools.
+Runtime hiện tại không có generic agent loop tự chọn tool. `OnlinePipeline` tạo
+một typed `QueryPlan`, có thể gọi optional bounded query-expansion provider, rồi
+điều phối các retrieval branch cố định. Vì vậy “agentic” ở đây là query planning
+có trace, không phải autonomous tool calling.
 
 ```text
 User Query
@@ -336,16 +358,16 @@ User Query
 Planner
     │
     ▼
-Tool Selection
+Typed QueryPlan
     │
     ▼
-Retrieval APIs
+Fixed retrieval branches
     │
     ▼
 Result Fusion
     │
     ▼
-Explanation
+Ranked response + routing trace
 ```
 
 Ví dụ:
@@ -354,14 +376,13 @@ Query:
 
 "Người đàn ông mặc áo đỏ bước vào xe bus"
 
-Agent có thể:
+Planner có thể:
 
 1. Tách đối tượng.
 2. Tạo nhiều query con.
-3. Gọi OCR Search.
-4. Gọi Object Search.
-5. Gọi Temporal Search.
-6. Hợp nhất kết quả.
+3. Gắn modality hints cho visual/OCR/object.
+4. Chạy các branch đã cấu hình.
+5. Hợp nhất bằng weighted RRF rồi đi qua canonical dense/rerank path.
 
 ---
 
@@ -486,9 +507,9 @@ Temporal Search
 
 ## P5
 
-Agent
+Query Planning
 
-Frontend
+Future Frontend
 
 Competition Workflow
 
@@ -496,15 +517,15 @@ Competition Workflow
 
 # 12. Design Principles
 
-1. Backend và Frontend tách biệt hoàn toàn.
+1. Backend và frontend tương lai tách biệt hoàn toàn.
 
-2. Mọi giao tiếp thông qua API Contract.
+2. HTTP client chỉ giao tiếp qua API Contract sau khi router được mount.
 
 3. Metadata Schema là nguồn dữ liệu chuẩn duy nhất.
 
 4. Retrieval modules phải độc lập.
 
-5. Agent không truy cập dữ liệu trực tiếp.
+5. Query planner không truy cập dữ liệu trực tiếp; `OnlinePipeline` điều phối retrieval.
 
 6. Mọi experiment phải tái lập được.
 

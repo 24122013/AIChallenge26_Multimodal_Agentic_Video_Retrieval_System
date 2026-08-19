@@ -873,10 +873,10 @@ def get_online_context_index(
     frame_map_path = load_visual_search_config().frame_map_path
     required_roles: list[str] = []
     overrides: dict[str, Path] = {}
-    if neighbors_enabled:
+    if neighbors_enabled and neighbor_path.is_file():
         required_roles.append("neighbor_metadata")
         overrides["neighbor_metadata"] = neighbor_path
-    if segments_enabled:
+    if segments_enabled and segment_path.is_file():
         required_roles.append("segment_metadata")
         overrides["segment_metadata"] = segment_path
     before = _validate_expected_corpus(
@@ -888,8 +888,13 @@ def get_online_context_index(
         neighbor_path=neighbor_path,
         segment_path=segment_path,
         frame_map_path=frame_map_path,
-        require_neighbors=neighbors_enabled,
-        require_segments=segments_enabled,
+        load_neighbors=neighbors_enabled,
+        load_segments=segments_enabled,
+        # Context is optional for KIS/AVS. A missing enabled artifact disables
+        # only that evidence source; a present but corrupt/uncommitted artifact
+        # still fails validation above or while parsing here.
+        require_neighbors=False,
+        require_segments=False,
     )
     after = _validate_expected_corpus(
         corpus_key,

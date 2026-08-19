@@ -1,6 +1,7 @@
 """Config loader for Retrieval Phase 2/3 settings."""
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -11,14 +12,26 @@ import yaml
 from dotenv import load_dotenv
 from yaml.nodes import MappingNode, Node, ScalarNode
 
-from backend.app.services.retrieval.hybrid_search import HybridSearchConfig
-from backend.app.services.retrieval.advanced_rerank import AdvancedRerankWeights
-from backend.app.services.retrieval.rerank import RerankConfig, RerankWeights
 from backend.app.services.agent.query_expansion import QueryExpansionConfig
+from backend.app.services.retrieval.advanced_rerank import (
+    AdvancedRerankWeights,
+    ContextRerankConfig,
+)
+from backend.app.services.retrieval.hybrid_search import HybridSearchConfig
+from backend.app.services.retrieval.rerank import RerankConfig, RerankWeights
 
 
 DEFAULT_RETRIEVAL_CONFIG_PATH = Path("configs/retrieval.yaml")
 DEFAULT_ENV_PATH = Path(__file__).resolve().parents[4] / ".env"
+_LOGGER = logging.getLogger(__name__)
+_DEPRECATED_ONLINE_SETTINGS = {
+    "learned_rerank_enabled": "boolean",
+    "vlm_rerank_enabled": "boolean",
+}
+_DEPRECATED_ONLINE_ENV = (
+    "RETRIEVAL_ONLINE_LEARNED_RERANK_ENABLED",
+    "RETRIEVAL_ONLINE_VLM_RERANK_ENABLED",
+)
 
 
 def load_project_env() -> bool:
@@ -82,9 +95,13 @@ _CONFIG_SCHEMA = {
         "rrf_enabled": "boolean",
         "cses_enabled": "boolean",
         "deterministic_rerank_enabled": "boolean",
-        "learned_rerank_enabled": "boolean",
-        "vlm_rerank_enabled": "boolean",
         "debug_enabled": "boolean",
+        "neighbor_scoring_enabled": "boolean",
+        "segment_scoring_enabled": "boolean",
+        "max_neighbors_each_side": "positive integer",
+        "segment_context_candidate_limit": "positive integer",
+        "segment_context_top_k": "positive integer",
+        "context_max_bonus": "unit interval number",
         "rerank_coarse_rrf_weight": "non-negative number",
         "rerank_dense_visual_weight": "non-negative number",
         "rerank_caption_weight": "non-negative number",
@@ -93,6 +110,8 @@ _CONFIG_SCHEMA = {
         "rerank_cses_gain_weight": "non-negative number",
         "rerank_temporal_consistency_weight": "non-negative number",
         "rerank_modality_alignment_weight": "non-negative number",
+        "rerank_neighbor_support_weight": "non-negative number",
+        "rerank_segment_support_weight": "non-negative number",
     },
     "trake": {
         "bge_dense_enabled": "boolean",
@@ -180,10 +199,12 @@ class OnlineRetrievalConfig:
     rrf_enabled: bool = True
     cses_enabled: bool = True
     deterministic_rerank_enabled: bool = True
-    learned_rerank_enabled: bool = False
-    vlm_rerank_enabled: bool = False
     debug_enabled: bool = False
     rerank_weights: AdvancedRerankWeights = AdvancedRerankWeights()
+    context_config: ContextRerankConfig = ContextRerankConfig(
+        neighbor_enabled=True,
+        segment_enabled=True,
+    )
 
     def __post_init__(self) -> None:
         for name in (
@@ -247,14 +268,14 @@ class OnlineRetrievalConfig:
             "rrf_enabled",
             "cses_enabled",
             "deterministic_rerank_enabled",
-            "learned_rerank_enabled",
-            "vlm_rerank_enabled",
             "debug_enabled",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"online.{name} must be a boolean")
         if not isinstance(self.rerank_weights, AdvancedRerankWeights):
             raise TypeError("online.rerank_weights must be AdvancedRerankWeights")
+        if not isinstance(self.context_config, ContextRerankConfig):
+            raise TypeError("online.context_config must be ContextRerankConfig")
         values = tuple(float(value) for value in self.rerank_weights.__dict__.values())
         if any(not math.isfinite(value) or value < 0 for value in values):
             raise ValueError("online deterministic rerank weights must be non-negative")
@@ -424,6 +445,7 @@ def load_retrieval_runtime_config(
         or DEFAULT_RETRIEVAL_CONFIG_PATH
     )
     raw = _load_yaml_config(path) if path.exists() else {}
+    _warn_deprecated_online_env()
     hybrid_raw = _section(raw, "hybrid")
     weights_raw = _section(raw, "weights")
     dedupe_raw = _section(raw, "dedupe")
@@ -656,16 +678,6 @@ def load_retrieval_runtime_config(
             online_raw.get("deterministic_rerank_enabled"),
             OnlineRetrievalConfig.deterministic_rerank_enabled,
         ),
-        learned_rerank_enabled=_bool_env(
-            "RETRIEVAL_ONLINE_LEARNED_RERANK_ENABLED",
-            online_raw.get("learned_rerank_enabled"),
-            OnlineRetrievalConfig.learned_rerank_enabled,
-        ),
-        vlm_rerank_enabled=_bool_env(
-            "RETRIEVAL_ONLINE_VLM_RERANK_ENABLED",
-            online_raw.get("vlm_rerank_enabled"),
-            OnlineRetrievalConfig.vlm_rerank_enabled,
-        ),
         debug_enabled=_bool_env(
             "RETRIEVAL_ONLINE_DEBUG_ENABLED",
             online_raw.get("debug_enabled"),
@@ -711,6 +723,48 @@ def load_retrieval_runtime_config(
                 "RETRIEVAL_ONLINE_RERANK_MODALITY_ALIGNMENT_WEIGHT",
                 online_raw.get("rerank_modality_alignment_weight"),
                 AdvancedRerankWeights.modality_alignment,
+            ),
+            neighbor_support=_float_env(
+                "RETRIEVAL_ONLINE_RERANK_NEIGHBOR_SUPPORT_WEIGHT",
+                online_raw.get("rerank_neighbor_support_weight"),
+                AdvancedRerankWeights.neighbor_support,
+            ),
+            segment_support=_float_env(
+                "RETRIEVAL_ONLINE_RERANK_SEGMENT_SUPPORT_WEIGHT",
+                online_raw.get("rerank_segment_support_weight"),
+                AdvancedRerankWeights.segment_support,
+            ),
+        ),
+        context_config=ContextRerankConfig(
+            neighbor_enabled=_bool_env(
+                "RETRIEVAL_ONLINE_NEIGHBOR_SCORING_ENABLED",
+                online_raw.get("neighbor_scoring_enabled"),
+                True,
+            ),
+            segment_enabled=_bool_env(
+                "RETRIEVAL_ONLINE_SEGMENT_SCORING_ENABLED",
+                online_raw.get("segment_scoring_enabled"),
+                True,
+            ),
+            max_neighbors_each_side=_int_env(
+                "RETRIEVAL_ONLINE_MAX_NEIGHBORS_EACH_SIDE",
+                online_raw.get("max_neighbors_each_side"),
+                ContextRerankConfig.max_neighbors_each_side,
+            ),
+            segment_candidate_limit=_int_env(
+                "RETRIEVAL_ONLINE_SEGMENT_CONTEXT_CANDIDATE_LIMIT",
+                online_raw.get("segment_context_candidate_limit"),
+                ContextRerankConfig.segment_candidate_limit,
+            ),
+            segment_top_k=_int_env(
+                "RETRIEVAL_ONLINE_SEGMENT_CONTEXT_TOP_K",
+                online_raw.get("segment_context_top_k"),
+                ContextRerankConfig.segment_top_k,
+            ),
+            max_bonus=_float_env(
+                "RETRIEVAL_ONLINE_CONTEXT_MAX_BONUS",
+                online_raw.get("context_max_bonus"),
+                ContextRerankConfig.max_bonus,
             ),
         ),
     )
@@ -883,6 +937,18 @@ def load_retrieval_runtime_config(
     )
 
 
+def _warn_deprecated_online_env() -> None:
+    for name in _DEPRECATED_ONLINE_ENV:
+        if os.getenv(name) is None:
+            continue
+        _bool_env(name, None, False)
+        _LOGGER.warning(
+            "%s is deprecated and ignored; canonical KIS/AVS uses only the "
+            "deterministic multimodal reranker",
+            name,
+        )
+
+
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     value = raw.get(name)
     if value is None:
@@ -1027,6 +1093,25 @@ def _validate_config_schema(
             line_number = locations.get((section_name, key), section_line)
             setting = f"{section_name}.{key}"
             if expected is None:
+                deprecated_expected = (
+                    _DEPRECATED_ONLINE_SETTINGS.get(key)
+                    if section_name == "online"
+                    else None
+                )
+                if deprecated_expected is not None:
+                    if not _matches_expected_type(value, deprecated_expected):
+                        raise _yaml_error(
+                            path,
+                            line_number,
+                            f"deprecated {setting} must be a {deprecated_expected}; "
+                            f"got {value!r}",
+                        )
+                    _LOGGER.warning(
+                        "%s is deprecated and ignored; canonical KIS/AVS uses "
+                        "only the deterministic multimodal reranker",
+                        setting,
+                    )
+                    continue
                 supported = ", ".join(sorted(section_schema))
                 raise _yaml_error(
                     path,

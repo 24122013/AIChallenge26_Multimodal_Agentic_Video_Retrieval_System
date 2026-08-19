@@ -1,884 +1,842 @@
 # AIChallenge26 Multimodal Agentic Video Retrieval System
 
-Hệ thống truy hồi video đa phương thức cho KIS, AVS, truy hồi temporal, TRAKE
-(Temporal Retrieval and Alignment of Key Events) và hỏi đáp có dẫn chứng (QA).
-Kiến trúc hiện hành chỉ dùng thông tin thị giác: ảnh keyframe, caption, OCR và
-object labels. **Không có ASR, không đọc audio và không lập chỉ mục transcript.**
+Runbook này mô tả đường chạy canonical của repo trên Windows/PowerShell, từ lúc
+tạo môi trường đến khi build offline corpus và query online. Các lệnh bên dưới
+được viết để chạy tại thư mục gốc của repo.
 
-Các phần chính của hệ thống:
+Hệ thống hỗ trợ sáu task online:
 
-| Phạm vi | Vai trò | Nguồn sự thật | Entrypoint | Input | Output |
-|---|---|---|---|---|---|
-| `backend/` | Backend chính | Canonical implementation | Các module `python -m backend...` | Video, metadata, query | Keyframe/index, KIS/QA/TRAKE result |
-| `src/indexing/` | Tiện ích dùng chung | Code neighbor/segment thực tế | Backend wrapper gọi | Canonical metadata | Neighbor/segment artifacts |
-| `frontend/` | Placeholder | Không có implementation | Chưa có | — | Chưa có UI chạy được |
+- `kis`: tìm một khoảnh khắc/đối tượng/sự kiện khá cụ thể.
+- `avs`: tìm nhiều video phù hợp với mô tả ngữ nghĩa rộng.
+- `temporal`: truy hồi chuỗi sự kiện có thứ tự.
+- `trake`: parse nhiều event, căn chỉnh thành sequence cùng video và refine về
+  original frame.
+- `qa`: truy hồi evidence và có thể sinh grounded answer bằng Qwen.
+- `auto`: tự route sang KIS, AVS, temporal hoặc QA. `auto` **không** tự route
+  sang TRAKE.
 
-## Pipeline thực tế
+> Phạm vi dữ liệu hiện tại là visual: keyframe, caption, OCR và object labels.
+> Repo chưa có ASR, audio retrieval hay transcript index.
+
+## 1. Luồng chạy ngắn nhất
 
 ```text
-OFFLINE
-video
-  -> dense candidates + shot anchors/endpoints
-  -> SigLIP2 + Qwen caption + PP-OCRv5 + YOLOE features
-  -> (A) full dense-candidate pool -> corpus-wide SigLIP2 FAISS + metadata/map/manifest/report
-  -> (B) protected-event/MMR/dedup/gap-aware selection -> canonical selected keyframes
-         -> selected-keyframe SigLIP2 FAISS + neighbor/segment metadata
-         -> BM25 text index + optional BGE-M3 dense text index
-
-ONLINE (canonical: search_online -> get_online_pipeline -> OnlinePipeline.run)
-query + task (KIS/AVS/temporal/TRAKE/QA/auto)
-  -> KIS/AVS: typed query plan + optional expansion
-              -> selected visual/caption/OCR/object retrieval -> weighted RRF
-              -> coarse clips -> corpus-wide dense FAISS global rescue
-              -> per-clip CSES -> deterministic evidence rerank -> exact dedup
-  -> temporal/QA: existing evidence-oriented routes
-  -> TRAKE: conservative event parser -> event-wise hybrid retrieval
-            -> video coverage gating -> K-best original-frame alignment
-            -> bounded local decode + shared-SigLIP2 scoring -> diverse sequence ranking
-  -> QA only: evidence bundle -> optional Qwen grounded answer, or abstain
+video gốc
+  -> shot detection
+  -> dense frame candidates
+  -> SigLIP2 + caption + OCR + objects cho toàn bộ candidate
+  -> chọn canonical keyframes
+  -> publish selected FAISS + dense FAISS + BM25 + context + BGE-M3
+  -> query qua OnlinePipeline
 ```
 
-- KIS trả về frame/segment đã xếp hạng từ visual, caption, OCR, objects và
-  temporal metadata.
-- QA dùng cùng retrieval stack, tối đa Top-3 evidence cho câu hỏi thường hoặc
-  strict temporal chain tối đa 5 event.
-  Answerer chỉ nhận caption/OCR/object/image metadata, sinh JSON có citation và
-  phải abstain khi evidence không đủ.
-- Query expansion thuộc query planner cho KIS nâng cao. External expansion bị bỏ
-  qua ở temporal QA để không phá cấu trúc chuỗi sự kiện; quyết định này có trace.
-- `temporal` và `trake` là hai task khác nhau. `temporal` giữ contract evidence
-  phục vụ QA hiện hữu; `trake` trả một ranked list các sequence cùng video, mỗi
-  sequence có đúng một original `frame_index` cho từng event. `auto` hiện không
-  tự chuyển query sang TRAKE; caller phải truyền rõ `task="trake"`.
-- Keyframe kỹ thuật là frame sparse được offline pipeline chọn để lập chỉ mục.
-  Semantic keyframe của TRAKE là frame thỏa criterion của event (ví dụ lần đầu
-  chạm, rời hoàn toàn hoặc đạt đỉnh) và có thể nằm cạnh keyframe kỹ thuật. Local
-  refinement chỉ decode một cửa sổ bounded quanh coarse frame. Nó không đọc full
-  dense-candidate FAISS của KIS/AVS và không biến mọi raw video frame thành một
-  corpus index thứ ba.
-
-Chi tiết truy vết theo file/function và risk register nằm tại
-[`docs/PIPELINE_AUDIT.md`](docs/PIPELINE_AUDIT.md).
-
-## Model và artifact contract
-
-| Thành phần | Model/checkpoint | Phương pháp | File triển khai | Thiết bị | Artifact |
-|---|---|---|---|---|---|
-| Shot detection | `TransNetV2` | Shot boundaries + dense sampling | `indexing/extract_keyframes.py`, `keyframe_candidates.py` | CPU/CUDA (`auto`) | keyframe JSONL/report |
-| Visual embedding | `google/siglip2-so400m-patch16-384` | normalized embedding, FAISS IP; selected-keyframe coarse index và full dense-candidate rescue index là hai bundle riêng | `build_siglip2_index.py`, `dense_candidate_index.py`, `search_visual.py` | CPU/CUDA | `.npy`, FAISS, metadata/map/manifest/report |
-| Caption | `florence-community/Florence-2-base-ft` (~0.23B) @ `0b03b6f15a4a211370fb204aee4e7dd48887ea37` | `<MORE_DETAILED_CAPTION>` frame caption | `ingestion/caption_pipeline.py` | CPU/CUDA | caption JSONL/report |
-| OCR | `PP-OCRv5_server_det` + `latin_PP-OCRv5_mobile_rec` | Vietnamese/English OCR | `ingestion/ocr_pipeline.py` | CPU/CUDA | OCR JSONL/report |
-| Object evidence | `yoloe-26l-seg.pt` | Open-vocabulary soft evidence | `ingestion/object_pipeline.py` | CPU/CUDA | object JSONL/report |
-| Keyframe selection | Không có checkpoint | protected events, gap repair, dedup, MMR | `keyframe_selection.py` | CPU | selected metadata/ledgers |
-| Sparse text | Không có checkpoint | BM25 caption/OCR/objects | `build_text_index.py`, `text_index.py` | CPU | text-index JSON |
-| Dense text | `BAAI/bge-m3` | 1024-d normalized FAISS IP | `build_bge_m3_index.py`, `bge_dense.py` | CPU/CUDA | index + map + manifest |
-| Text reranker | `BAAI/bge-reranker-v2-m3` | Cross-encoder blend | `bge_reranker.py` | CPU/CUDA | scores/trace |
-| Grounded QA | `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a` | Evidence-only JSON + citation validation | `qa_answerer.py` | CPU/CUDA; lazy-load | answer/cache/report |
-| Query expansion | `Qwen/Qwen3.5-9B` @ `c202236` | bounded paraphrase/decomposition | `agent/query_expansion.py`, `query_plan.py` | CPU/CUDA | expansion plan/trace |
-| TRAKE | Reuse canonical SigLIP2 checkpoint | deterministic parse, per-event retrieval, coverage gating, K-best alignment, bounded local decode + text/image cosine scoring, sequence NMS | `backend/app/services/trake/` | CPU/CUDA cho SigLIP2; OpenCV decode | sequence hypotheses + lineage/trace |
-
-Không có model ASR trong runtime hoặc dependency manifest. Các revision `main`
-của BGE nên được thay bằng commit hash trước một benchmark chính thức.
-
-## Cài đặt
-
-Khuyến nghị Python 3.11 hoặc 3.12 và FFmpeg/ffprobe có trong `PATH`. PyTorch và
-PaddlePaddle được cài riêng trước `requirements.txt` để pip không thay nhầm wheel
-CPU/CUDA. Chỉ chọn **một** profile dưới đây.
-
-Code không áp đặt mức RAM/VRAM tối thiểu. Full corpus cần dung lượng cho video,
-dense candidates và model cache; Qwen 8B/9B phải được profile batch, VRAM và disk
-trên máy đích thay vì dựa vào một ước lượng chung.
-
-### CPU
+Nếu máy đã có môi trường và model cache, E2E tối thiểu là:
 
 ```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
-python -m pip install paddlepaddle==3.2.0
-python -m pip install -r requirements.txt
+# 1) Build toàn bộ corpus từ data/raw/video/*.mp4
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.offline_pipeline `
+  --video-dir data\raw\video `
+  --video-glob *.mp4 `
+  --output-dir data `
+  --device auto `
+  --build-corpus `
+  --resume `
+  --verbose
+
+# 2) Query KIS
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.online_pipeline `
+  --task kis `
+  --query "một người mặc áo đỏ đang mở cửa ô tô" `
+  --top-k 20 `
+  --debug
 ```
 
-### NVIDIA CUDA 11.8
+Đừng skip phần kiểm tra artifact ở dưới. File tồn tại nhưng sai checksum,
+dimension, row order hoặc corpus generation vẫn là artifact hỏng.
+
+## 2. Yêu cầu hệ thống
+
+- Windows PowerShell.
+- Python 3.11 hoặc 3.12; ví dụ dưới đây dùng Python 3.12.
+- FFmpeg và ffprobe có trong `PATH`.
+- Kết nối mạng cho lần tải model đầu tiên, hoặc model cache đã chuẩn bị sẵn.
+- Dung lượng đĩa đủ cho video gốc, dense JPEG, feature, index và model cache.
+
+Kiểm tra trước khi cài:
 
 ```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu118
-python -m pip install paddlepaddle-gpu==3.2.0 --index-url https://www.paddlepaddle.org.cn/packages/stable/cu118/
-python -m pip install -r requirements.txt
-```
-
-### NVIDIA CUDA 12.6
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu126
-python -m pip install paddlepaddle-gpu==3.2.0 --index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/
-python -m pip install -r requirements.txt
-```
-
-Không cài đồng thời `paddlepaddle` và `paddlepaddle-gpu`. Wheel phải phù hợp với
-Python, hệ điều hành và driver; xem trang cài đặt chính thức của
-[PyTorch](https://pytorch.org/get-started/previous-versions/) và
-[PaddlePaddle](https://www.paddlepaddle.org.cn/install/quick).
-
-Kiểm tra môi trường:
-
-```powershell
+py -0p
 ffmpeg -version
 ffprobe -version
-python -m pip check
-python -c "import torch, paddle, transformers, faiss; print({'torch': torch.__version__, 'cuda': torch.cuda.is_available(), 'paddle': paddle.__version__, 'paddle_cuda': paddle.is_compiled_with_cuda()})"
+nvidia-smi    # Chỉ cần khi định chạy CUDA
 ```
 
-## Cấu hình runtime
+Repo không áp đặt một con số RAM/VRAM “chuẩn”. Full corpus và Qwen 9B có thể
+rất nặng; cần đo thật trên máy đích, không nên đoán từ việc unit test pass.
 
-[`configs/retrieval.yaml`](configs/retrieval.yaml) giữ hybrid weights, query
-expansion, coarse-to-dense `online` và section `trake`. [`.env.example`](.env.example) liệt kê các biến
-artifact/QA quan trọng. Sao chép file này thành `.env` để cấu hình local; các
-retrieval CLI entrypoint tự load `.env`. Biến đã đặt bằng shell hoặc process manager
-được ưu tiên hơn giá trị trong file.
+## 3. Tạo môi trường Python
 
-| Biến/config | Bắt buộc | Mặc định | Phạm vi | Ý nghĩa |
-|---|---|---|---|---|
-| `RETRIEVAL_CONFIG_PATH` | Không | `configs/retrieval.yaml` | Backend | Weights, limits, query expansion |
-| `RETRIEVAL_INDEX_PATH` | Khi search visual | SigLIP2 path dưới `data/indexes` | Backend | FAISS coarse index |
-| `RETRIEVAL_FRAME_MAP_PATH` | Khi search visual | Path dưới `data/metadata` | Backend | Map row sang video/frame/timestamp |
-| `RETRIEVAL_MANIFEST_PATH` | Khi search visual | Path dưới `data/metadata` | Backend | Encoder dimension/normalization/lineage |
-| `RETRIEVAL_DENSE_INDEX_PATH` | Khi KIS/AVS chạy dense | `data/indexes/siglip2_so400m_patch16_384_dense_flat_ip.faiss` | KIS/AVS | Full dense-candidate FAISS; không phải selected-keyframe index |
-| `RETRIEVAL_DENSE_METADATA_PATH`, `RETRIEVAL_DENSE_FRAME_MAP_PATH`, `RETRIEVAL_DENSE_MANIFEST_PATH`, `RETRIEVAL_DENSE_REPORT_PATH` | Khi KIS/AVS chạy dense | Các path `*_dense_*` trong `.env.example` | KIS/AVS | Bundle metadata/map/manifest/report phải cùng corpus generation |
-| `RETRIEVAL_TEXT_INDEX_PATH` | Khi bật text | `data/indexes/retrieval_text_index.json` | Backend | Caption/OCR/object sparse index |
-| `RETRIEVAL_DEVICE` | Không | `auto` | Backend | `auto`, `cpu` hoặc `cuda` |
-| `online.coarse_to_dense_enabled`, `online.dense_enabled` | Không | `true`, `true` | KIS/AVS | Bật canonical coarse-to-dense route và nhánh global dense rescue |
-| `online.dense_missing_behavior` | Không | `fallback_sparse` | KIS/AVS | `fallback_sparse` trả selected-only với trace rõ; `error` fail closed |
-| `online.learned_rerank_enabled`, `online.vlm_rerank_enabled` | Không | `false`, `false` | KIS/AVS | Chỉ là feature flags; canonical online path không load heavy learned/VLM reranker |
-| `ONLINE_NEIGHBOR_CONTEXT_ENABLED` | Không | `false` | Online pipeline | Đọc trực tiếp `neighbors_all.jsonl` sau rerank |
-| `ONLINE_SEGMENT_CONTEXT_ENABLED` | Không | `false` | Online/temporal | Gắn canonical segment trước temporal matching |
-| `ONLINE_NEIGHBOR_PATH` | Khi bật neighbor | `data/metadata/neighbors_all.jsonl` | Online pipeline | Canonical neighbor artifact |
-| `ONLINE_SEGMENT_PATH` | Khi bật segment | `data/metadata/segments_all.jsonl` | Online pipeline | Canonical segment artifact |
-| `QA_BGE_DENSE_ENABLED` | Không | `false` | QA backend | Bật BGE dense retrieval |
-| `QA_BGE_INDEX_ROOT` | Khi bật BGE | `data/indexes/bge_m3` | QA backend | BGE index/map/manifest root |
-| `QA_BGE_RERANKER_ENABLED` | Không | `false` | QA backend | Bật cross-encoder rerank |
-| `QA_ANSWER_MODE` | Không | `off` | QA backend | `off`, `optional`, `required` |
-| `QA_MODELS_LOCAL_ONLY` | Không | `false` | QA backend | Chỉ đọc model cache |
-| `trake.*` trong retrieval YAML | Không | Xem `configs/retrieval.yaml` | TRAKE | Retrieval width, video gating, alignment, refinement, max answers và cutoffs |
-| `RETRIEVAL_TRAKE_VIDEO_ROOT` | Không | `data/raw/video` | TRAKE local refinement | Canonical root để resolve `<video_id>.mp4`; không nhận path từ query |
+PyTorch và PaddlePaddle không nằm trong `requirements.txt` để pip không tự thay
+wheel CPU/CUDA. Chọn đúng **một** profile bên dưới; không cài đồng thời
+`paddlepaddle` và `paddlepaddle-gpu`.
+
+### 3.1. Tạo virtual environment
 
 ```powershell
-$env:RETRIEVAL_INDEX_PATH = "data/indexes/siglip2_so400m_patch16_384_flat_ip.faiss"
-$env:RETRIEVAL_FRAME_MAP_PATH = "data/metadata/siglip2_so400m_patch16_384_frame_map.json"
-$env:RETRIEVAL_MANIFEST_PATH = "data/metadata/siglip2_so400m_patch16_384_faiss_manifest.json"
-$env:RETRIEVAL_DENSE_INDEX_PATH = "data/indexes/siglip2_so400m_patch16_384_dense_flat_ip.faiss"
-$env:RETRIEVAL_DENSE_METADATA_PATH = "data/metadata/siglip2_so400m_patch16_384_dense_faiss_metadata.jsonl"
-$env:RETRIEVAL_DENSE_FRAME_MAP_PATH = "data/metadata/siglip2_so400m_patch16_384_dense_frame_map.json"
-$env:RETRIEVAL_DENSE_MANIFEST_PATH = "data/metadata/siglip2_so400m_patch16_384_dense_faiss_manifest.json"
-$env:RETRIEVAL_DENSE_REPORT_PATH = "data/metadata/siglip2_so400m_patch16_384_dense_index_report.json"
-$env:RETRIEVAL_TEXT_INDEX_PATH = "data/indexes/retrieval_text_index.json"
-$env:RETRIEVAL_CORPUS_MANIFEST_PATH = "data/metadata/offline_corpus_manifest.json"
-$env:RETRIEVAL_DEVICE = "cuda"
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
 ```
 
-Dense bundle được resolve lazy và cache theo `bundle_generation`; mỗi request
-KIS/AVS không rebuild hay reload FAISS. `fallback_sparse` chỉ xử lý trường hợp
-bundle dense chưa có và ghi `routing_trace.coarse_to_dense.mode` là
-`selected_only_fallback`. Bundle có mặt nhưng sai checksum, row order, dimension
-hoặc encoder contract vẫn fail closed; fallback không được dùng để che artifact hỏng.
-
-Smoke qua đúng production entrypoint (PowerShell):
+Không bắt buộc activate venv vì mọi lệnh trong README gọi trực tiếp
+`.venv\Scripts\python.exe`. Nếu vẫn muốn activate:
 
 ```powershell
-$env:RETRIEVAL_QUERY_EXPANSION_ENABLED = "false" # optional low-latency smoke
-.\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline `
-  --task kis --top-k 20 --debug `
-  --query "a person opens a refrigerator and takes a bottle" `
-  --output data/reports/kis_online_smoke.json
+Set-ExecutionPolicy -Scope Process Bypass
+.\.venv\Scripts\Activate.ps1
 ```
 
-Để xác nhận **full** path đã chạy, kiểm tra
-`routing_trace.coarse_to_dense.executed=true`, `mode="coarse_to_dense"`,
-`dense_rescue_clip_count` và `routing_trace.latency`. Nếu mode là
-`selected_only_fallback`, command chỉ chứng minh route selected-keyframe còn chạy;
-chưa chứng minh dense rescue/CSES trên corpus hiện tại.
-
-| Task | Nguồn cấu hình chính | Model nặng mặc định |
-|---|---|---|
-| KIS/KIST (`kis`) | `hybrid`, `weights`, `text_index`, `query_expansion`, `online` trong retrieval YAML và các `RETRIEVAL_*` artifact paths | SigLIP2; learned/VLM rerank mặc định tắt; query expansion chỉ chạy khi enabled và provider khả dụng |
-| QA (`qa`) | Cùng retrieval artifacts cộng các biến `QA_*` | BGE dense/reranker mặc định tắt; Qwen answerer mặc định `off` |
-| TRAKE (`trake`) | Section `trake` và các override `RETRIEVAL_TRAKE_*` | BGE dense/reranker mặc định tắt; local refinement reuse canonical SigLIP2 khi enabled |
-
-Các lựa chọn QA đáng chú ý:
-
-- `QA_ANSWER_MODE=off|optional|required` (mặc định `off`).
-- `QA_BGE_DENSE_ENABLED=true` và `QA_BGE_INDEX_ROOT=...` để bật dense text.
-- `QA_BGE_RERANKER_ENABLED=true` để bật cross-encoder.
-- `QA_MODELS_LOCAL_ONLY=true` cho máy đã chuẩn bị cache và không có mạng.
-
-TRAKE có BGE feature flags riêng trong section `trake`; chúng không đọc hoặc suy
-ra trạng thái từ `QA_BGE_DENSE_ENABLED` và `QA_BGE_RERANKER_ENABLED`:
-
-```yaml
-trake:
-  bge_dense_enabled: false
-  bge_dense_top_k: 300
-  bge_reranker_enabled: false
-  bge_reranker_top_k: 150
-  retrieval_fusion: rrf
-  rrf_k: 60
-  hybrid_rrf_weight: 1.0
-  bge_rrf_weight: 1.0
-  bge_required: false
-```
-
-| YAML field | Environment override |
-|---|---|
-| `bge_dense_enabled` | `RETRIEVAL_TRAKE_BGE_DENSE_ENABLED` |
-| `bge_dense_top_k` | `RETRIEVAL_TRAKE_BGE_DENSE_TOP_K` |
-| `bge_reranker_enabled` | `RETRIEVAL_TRAKE_BGE_RERANKER_ENABLED` |
-| `bge_reranker_top_k` | `RETRIEVAL_TRAKE_BGE_RERANKER_TOP_K` |
-| `retrieval_fusion` | `RETRIEVAL_TRAKE_RETRIEVAL_FUSION` |
-| `rrf_k` | `RETRIEVAL_TRAKE_RRF_K` |
-| `hybrid_rrf_weight` | `RETRIEVAL_TRAKE_HYBRID_RRF_WEIGHT` |
-| `bge_rrf_weight` | `RETRIEVAL_TRAKE_BGE_RRF_WEIGHT` |
-| `bge_required` | `RETRIEVAL_TRAKE_BGE_REQUIRED` |
-
-Các field YAML ở trên là policy/pool/rank-fusion settings. Model, artifact path và
-execution settings chỉ có dưới dạng environment variable:
-
-| Runtime-only environment variable | Mặc định | Vai trò |
-|---|---|---|
-| `RETRIEVAL_TRAKE_BGE_INDEX_ROOT` | `data/indexes/bge_m3` | Root BGE FAISS, frame map và manifest |
-| `RETRIEVAL_TRAKE_BGE_MODEL_NAME` | `BAAI/bge-m3` | Dense encoder |
-| `RETRIEVAL_TRAKE_BGE_MODEL_REVISION` | Không ép revision | Để trống dùng resolved revision trong BGE manifest; override phải khớp manifest |
-| `RETRIEVAL_TRAKE_BGE_BATCH_SIZE` | `16` | Dense query batch size |
-| `RETRIEVAL_TRAKE_BGE_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | Cross-encoder reranker |
-| `RETRIEVAL_TRAKE_BGE_RERANKER_REVISION` | `main` | Optional/dev default; required mode bắt buộc commit hash bất biến |
-| `RETRIEVAL_TRAKE_BGE_RERANKER_ALPHA` | `0.5` | Blend coefficient của reranker adapter |
-| `RETRIEVAL_TRAKE_BGE_RERANKER_BATCH_SIZE` | `16` | Cross-encoder batch size |
-| `RETRIEVAL_TRAKE_BGE_DEVICE` | `auto` | `auto`, `cpu` hoặc `cuda` |
-| `RETRIEVAL_TRAKE_BGE_MODEL_CACHE_DIR` | `data/model_cache/bge_m3` | Model cache; có thể dùng chung engine với QA khi contract trùng khớp |
-| `RETRIEVAL_TRAKE_BGE_LOCAL_FILES_ONLY` | `false` | Không tải mạng khi đặt `true` |
-
-Với mỗi event, pipeline luôn chạy canonical hybrid retrieval. Khi
-`bge_dense_enabled: true`, BGE-M3 tạo thêm một ranked list cho chính event đó;
-`retrieval_fusion: rrf` kết hợp hybrid/BGE bằng Reciprocal Rank Fusion với `rrf_k`
-và hai weight tương ứng. Optional BGE reranker chỉ xử lý tối đa
-`bge_reranker_top_k` candidate ở đầu list; tail không được chấm lại nhưng vẫn được
-giữ để bảo vệ recall. Union dedupe theo `(video_id, original frame_index)` và ưu
-tiên canonical hybrid object trên overlap, đồng thời giữ raw/RRF contributions
-trong `modality_scores`. Fusion/rerank diễn ra **theo từng event trước**
-shot/temporal diversity, video coverage gating và chronological alignment; không
-fusion các event thành một intent chung. Context branch vẫn hybrid-only vì chỉ là
-video-level prior.
-
-`bge_required: false` là fail-open: lỗi init/artifact/search/rerank ở nhánh BGE
-được ghi warning/trace và event tiếp tục bằng canonical hybrid results.
-`bge_required: true` biến cùng lỗi thành lỗi request để benchmark không âm thầm
-chạy thiếu nhánh bắt buộc. Hai policy này chỉ thuộc TRAKE; `QA_BGE_*` tiếp tục điều
-khiển riêng QA evidence runtime. Kiểm tra per-event status/count/fallback tại
-`trace.event_retrieval.events[*].sources`, `.fusion`, `.reranker` và aggregate tại
-`trace.event_retrieval.bge`; `trace.bge_contract` ghi corpus generation, resolved
-dense revision/checksum cùng requested reranker revision và trạng thái `revision_pinned`,
-nhưng không chứa local path, exception text hoặc query text.
-
-TRAKE được khởi tạo lazy theo task, vì vậy request `kis` hoặc `qa` không load TRAKE
-index/model; QA/temporal cũng chỉ được khởi tạo khi route tương ứng được chọn. Khi
-QA và TRAKE dùng cùng dense artifact, model, revision, device và
-cache directory, runtime dùng chung một BGE-M3 engine để tránh nhân đôi RAM/VRAM;
-hai bộ cờ bật/tắt và fail policy vẫn hoàn toàn độc lập. `bge_required: true` là
-request-time fail-closed (HTTP 503 ở API), không phải startup readiness: model vẫn
-lazy-load ở TRAKE request đầu tiên. Trước benchmark, nên chạy một query warm-up và
-kiểm tra `trace.bge_contract` cùng per-event status.
-
-Mọi BGE dense runtime yêu cầu `data/metadata/offline_corpus_manifest.json` (hoặc
-`RETRIEVAL_CORPUS_MANIFEST_PATH`) đã publish và khớp checksum; thiếu manifest thì
-optional TRAKE quay về hybrid. Chế độ `bge_required: true` luôn yêu cầu manifest,
-kể cả khi chỉ bật reranker, để benchmark có corpus lineage kiểm chứng được.
-
-Ví dụ bật dense + reranker ở chế độ optional/fail-open trên máy đã có artifact và
-model cache:
+### 3.2. Profile CPU
 
 ```powershell
-$env:RETRIEVAL_TRAKE_BGE_DENSE_ENABLED = "true"
-$env:RETRIEVAL_TRAKE_BGE_RERANKER_ENABLED = "true"
-$env:RETRIEVAL_TRAKE_BGE_REQUIRED = "false"
-$env:RETRIEVAL_TRAKE_BGE_INDEX_ROOT = "data/indexes/bge_m3"
-$env:RETRIEVAL_TRAKE_BGE_MODEL_CACHE_DIR = "data/model_cache/bge_m3"
-$env:RETRIEVAL_TRAKE_BGE_LOCAL_FILES_ONLY = "true"
-python -m backend.app.pipelines.online_pipeline `
-  --task trake --top-k 100 `
-  --query "Context: a jump. Events: 1. first leaves ground 2. reaches peak"
+.\.venv\Scripts\python.exe -m pip install `
+  torch==2.7.1 torchvision==0.22.1 `
+  --index-url https://download.pytorch.org/whl/cpu
+
+.\.venv\Scripts\python.exe -m pip install paddlepaddle==3.2.0
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Ví dụ required benchmark; lệnh sẽ fail closed nếu dense index/model hoặc reranker
-không load/chạy được:
+### 3.3. Profile NVIDIA CUDA 11.8
 
 ```powershell
-$env:RETRIEVAL_TRAKE_BGE_DENSE_ENABLED = "true"
-$env:RETRIEVAL_TRAKE_BGE_RERANKER_ENABLED = "true"
-$env:RETRIEVAL_TRAKE_BGE_REQUIRED = "true"
-$env:RETRIEVAL_TRAKE_BGE_INDEX_ROOT = "data/indexes/bge_m3"
-$env:RETRIEVAL_TRAKE_BGE_MODEL_NAME = "BAAI/bge-m3"
-$env:RETRIEVAL_TRAKE_BGE_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
-$env:RETRIEVAL_TRAKE_BGE_RERANKER_REVISION = "<exact-40-hex-commit-from-cache>"
-$env:RETRIEVAL_TRAKE_BGE_DEVICE = "cuda"
-$env:RETRIEVAL_TRAKE_BGE_MODEL_CACHE_DIR = "data/model_cache/bge_m3"
-$env:RETRIEVAL_TRAKE_BGE_LOCAL_FILES_ONLY = "true"
-python -m backend.app.pipelines.online_pipeline `
-  --task trake --top-k 100 `
-  --query "Context: a jump. Events: 1. first leaves ground 2. reaches peak" `
-  --output data/reports/trake_bge_required.json
+.\.venv\Scripts\python.exe -m pip install `
+  torch==2.7.1 torchvision==0.22.1 `
+  --index-url https://download.pytorch.org/whl/cu118
+
+.\.venv\Scripts\python.exe -m pip install `
+  paddlepaddle-gpu==3.2.0 `
+  --index-url https://www.paddlepaddle.org.cn/packages/stable/cu118/
+
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Dense `MODEL_REVISION` được cố ý để trống: loader dùng immutable resolved revision
-trong BGE index manifest; đặt tùy tiện `main` có thể lệch manifest. Chỉ set
-`RETRIEVAL_TRAKE_BGE_MODEL_REVISION` khi dùng đúng revision đã ghi trong manifest.
-Reranker mặc định `main` chỉ dùng cho optional/dev. `bge_required: true` từ chối
-`main`, local model path và revision không bất biến; hãy thay placeholder trong ví
-dụ bằng đúng commit hash 40–64 ký tự hex đã tải vào cache.
-Required mode cũng kiểm tra dense manifest có hub model id và resolved commit hash
-bất biến; tag như `main` hoặc local model path đều bị từ chối để tránh lệch encoder
-đã tạo FAISS vectors.
-
-Section `trake` mặc định lấy 300 candidate mỗi event, giữ 30 video, dùng beam
-width 200, 10 path/video, log-gap penalty, refinement window ±60 original frame
-và tối đa 100 answer tại cutoffs `[1, 5, 20, 50, 100]`. Loader kiểm tra type và
-bounds; mỗi field có override `RETRIEVAL_TRAKE_*` tương ứng trong
-`retrieval_config.py`. Không dùng `hybrid.max_gap_seconds=180` làm hard cutoff
-cho TRAKE: alignment chỉ áp soft gap penalty trên original frame indexes.
-
-`refinement_enabled: true` làm cached production pipeline inject
-`Siglip2LocalFrameScorer`, reuse encoder của canonical visual engine và score
-bounded decoded windows trong cùng SigLIP2 text/image vector space. Không có model
-thứ hai hoặc corpus index được load cho bước này. Khi video/decode/scoring lỗi,
-refiner vẫn giữ coarse canonical `frame_index` và ghi fallback warning. Repository
-không tuyên bố có pose/contact model, VLM verifier hay geometric boundary
-verification đang hoạt động; cosine similarity vẫn cần adjudicated full-corpus
-evaluation trước khi claim semantic-boundary accuracy.
-
-Model được lazy-load và cache dưới `data/model_cache/`. Lần đầu cần mạng nếu
-checkpoint chưa có. Caption/QA 4-bit hoặc 8-bit cần CUDA và bitsandbytes tương
-thích; nếu OOM, giảm batch trước, sau đó mới cân nhắc quantization.
-
-## Chạy backend canonical
-
-Entrypoint dưới đây chạy toàn bộ video `*.mp4` trong `data/raw/video/` theo thứ
-tự deterministic. Mỗi video phải hoàn tất dense candidates → materialize toàn
-bộ ảnh → SigLIP2/OCR/object/caption cho toàn pool → multimodal selection →
-canonical publish/validation trước khi video kế tiếp bắt đầu. Chỉ sau khi mọi
-video requested thành công, pipeline mới build selected-keyframe FAISS, full
-dense-candidate FAISS, BM25, BGE-M3, neighbor mapping và segment/event metadata
-rồi commit tất cả thành một corpus generation.
+### 3.4. Profile NVIDIA CUDA 12.6
 
 ```powershell
-python -m backend.app.pipelines.offline_pipeline `
-  --video-dir data/raw/video `
-  --video-glob "*.mp4" `
+.\.venv\Scripts\python.exe -m pip install `
+  torch==2.7.1 torchvision==0.22.1 `
+  --index-url https://download.pytorch.org/whl/cu126
+
+.\.venv\Scripts\python.exe -m pip install `
+  paddlepaddle-gpu==3.2.0 `
+  --index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/
+
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+### 3.5. Kiểm tra môi trường
+
+```powershell
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -c "import torch, paddle, transformers, faiss; print({'torch': torch.__version__, 'torch_cuda': torch.cuda.is_available(), 'paddle': paddle.__version__, 'paddle_cuda': paddle.is_compiled_with_cuda(), 'transformers': transformers.__version__})"
+```
+
+Nếu `torch_cuda` hoặc `paddle_cuda` là `False` trong profile GPU, dừng tại đây
+và sửa wheel/driver trước. Đừng chạy full offline rồi mới phát hiện model đang
+fallback sang CPU.
+
+## 4. Cấu hình runtime
+
+Tạo `.env` local từ file mẫu. `.env` đã được Git ignore, nhưng vẫn không nên bỏ
+token hay secret vào log/report.
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+Các giá trị nên kiểm tra ngay:
+
+```dotenv
+RETRIEVAL_CONFIG_PATH=configs/retrieval.yaml
+RETRIEVAL_DEVICE=auto
+RETRIEVAL_QUERY_EXPANSION_ENABLED=true
+RETRIEVAL_TRAKE_VIDEO_ROOT=data/raw/video
+QA_ANSWER_MODE=off
+```
+
+- `RETRIEVAL_DEVICE=auto|cpu|cuda` áp dụng cho online retrieval.
+- `RETRIEVAL_QUERY_EXPANSION_ENABLED=true` bật Qwen query expansion cho KIS/AVS.
+  Auto-query được resolve là temporal/QA sẽ không gọi generic expansion.
+- `QA_ANSWER_MODE=off|optional|required` là Qwen answerer riêng của QA; nó không
+  phải query expansion.
+- Biến đã đặt trong terminal như `$env:RETRIEVAL_DEVICE="cpu"` được ưu tiên hơn
+  cùng biến trong `.env`.
+
+Weights và giới hạn retrieval nằm trong
+[`configs/retrieval.yaml`](configs/retrieval.yaml). Các path artifact/model và
+feature flag runtime nằm trong [`.env.example`](.env.example).
+
+Lần chạy model đầu có thể tải nhiều GB và mất khá lâu. Chỉ dùng
+`--local-files-only` hoặc `QA_MODELS_LOCAL_ONLY=true` sau khi cache đã đầy đủ.
+
+## 5. Chuẩn bị dữ liệu
+
+Tạo các thư mục runtime và chép video vào `data/raw/video`. Tên file không được
+trùng nhau nếu bỏ qua hoa/thường vì stem của file chính là `video_id`.
+
+```powershell
+$runtimeDirs = @(
+  "data\raw\video",
+  "data\candidates",
+  "data\dense_keyframes",
+  "data\candidate_features",
+  "data\keyframes",
+  "data\metadata",
+  "data\embeddings",
+  "data\indexes",
+  "data\model_cache",
+  "data\cache",
+  "data\reports",
+  "data\submissions"
+)
+$runtimeDirs | ForEach-Object {
+  New-Item -ItemType Directory -Force $_ | Out-Null
+}
+
+Copy-Item "C:\duong-dan-dataset\*.mp4" data\raw\video\
+Get-ChildItem data\raw\video\*.mp4 | Select-Object Name, Length
+```
+
+Mặc định full run chỉ discover `*.mp4`. Nếu dataset dùng extension khác, đổi
+`--video-glob`; quick mode vẫn kiểm tra suffix được pipeline hỗ trợ.
+
+## 6. Chạy offline pipeline
+
+Entrypoint canonical là `backend.app.pipelines.offline_pipeline`. Nó xử lý xong
+mọi stage của video A rồi mới sang video B; sau cùng mới build/publish corpus
+index một lần. Repo không có một bộ lệnh stage rời nào tương đương contract này.
+
+Xem toàn bộ option thật của checkout hiện tại:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.offline_pipeline --help
+```
+
+### 6.1. Smoke một video trước
+
+Thay `L01_V001.mp4` bằng file thật:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.offline_pipeline `
+  --video-path data\raw\video\L01_V001.mp4 `
   --output-dir data `
-  --dense-interval 0.5 `
-  --device cuda `
+  --device auto `
+  --skip-corpus `
   --resume `
-  --build-corpus
+  --verbose
 ```
 
-Quick mode cho một video và build corpus retrieval chứa video đó:
+`--skip-corpus` là điểm cực quan trọng. Quick mode chỉ xử lý một video; nếu cố
+thêm `--build-corpus`, global index sẽ bị thay bằng corpus chỉ chứa đúng video
+được request. Chỉ làm vậy khi đó thực sự là mục tiêu.
+
+Có thể chọn theo stem thay vì path:
 
 ```powershell
-python -m backend.app.pipelines.offline_pipeline `
-  --video-dir data/raw/video `
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.offline_pipeline `
+  --video-dir data\raw\video `
   --video-id L01_V001 `
   --output-dir data `
-  --device cuda `
+  --skip-corpus `
   --resume `
-  --build-corpus
+  --verbose
 ```
 
-Workflow retrieval phải build global FAISS/BM25/BGE, vì vậy các lệnh canonical
-ở trên luôn ghi rõ `--build-corpus`. Corpus mới chứa đúng tập video đang request;
-với quick mode một video, corpus chỉ chứa video đó. Pipeline không tự quét artifact
-cũ vì làm vậy có thể kéo metadata stale vào index. Chỉ dùng `--skip-corpus` khi
-chủ đích muốn tạo/publish artifact per-video mà chưa dùng chúng cho retrieval.
+### 6.2. Các stage offline chạy bên trong command
 
-`--resume` là mặc định và chỉ skip stage khi contract, checksum, identity
-alignment và artifact validator đều pass. `--force` recompute toàn bộ;
-`--skip-bge` tắt riêng BGE-M3; `--allow-partial-corpus` cho phép index các video
-thành công khi video khác fail (mặc định corpus indexing bị chặn). Full-dataset
-mode build corpus mặc định; `--skip-corpus` chỉ chạy/publish các stage per-video.
-Neighbor mặc định nối các selected keyframe cùng video trong cửa sổ ±5 giây;
-segment mặc định dùng shot/segment boundary có sẵn và fallback cửa sổ 10 giây.
-Có thể đổi bằng `--neighbor-window-seconds`, `--segment-strategy` và
-`--segment-fixed-duration-seconds`.
-
-Dense workspace được cô lập tại `data/candidates/`, `data/dense_keyframes/` và
-`data/candidate_features/`. Nó không bị glob nhầm vào selected-keyframe
-FAISS/BM25; corpus builder đọc explicit full-pool records/embeddings để tạo dense
-candidate bundle riêng.
-OCR được chạy trong một child process chỉ nạp Paddle để tránh xung đột DLL cuDNN
-giữa wheel Torch và Paddle trên Windows; parent pipeline vẫn dùng Torch/CUDA cho
-SigLIP2, object detection và caption như bình thường.
-Selected artifacts nằm tại `data/keyframes/`, `data/embeddings/` và
-`data/metadata/`; dense candidate FAISS nằm dưới `data/indexes/`, còn dense
-metadata/map/manifest/report dùng các tên `siglip2_so400m_patch16_384_dense_*`.
-Per-video/corpus reports nằm dưới `data/reports/offline/`.
-`data/metadata/neighbors_all.jsonl` và `segments_all.jsonl` cũng được build từ
-đúng tập selected keyframe vừa hoàn tất, không scan artifact stale. Cả hai visual
-FAISS bundle, BM25, BGE-M3, neighbor và segment đều được build/validate trong staging; manifest
-corpus được publish cuối cùng. Nếu crash giữa lúc promote, runtime fail-closed
-thay vì trộn artifact thuộc hai generation khác nhau.
-
-Các CLI service riêng lẻ vẫn hữu ích để debug một stage, nhưng không thay thế
-entrypoint canonical vì chúng không tự đảm bảo thứ tự full-pool multimodal.
-
-Neighbor/segment CLI riêng vẫn dùng được để debug từng builder, nhưng canonical
-offline entrypoint đã tự chạy và commit hai artifact này. Kiểm tra output:
+Giả sử `$videoId = "L01_V001"`:
 
 ```powershell
-Test-Path data/metadata/neighbors_all.jsonl
-Test-Path data/metadata/segments_all.jsonl
-Get-Content data/metadata/neighbors_all.jsonl -TotalCount 1
-Get-Content data/metadata/segments_all.jsonl -TotalCount 1
+$videoId = "L01_V001"
 ```
 
-Logic chọn keyframe đa phương thức vẫn nằm trong
-`backend/app/services/indexing/keyframe_multimodal_pipeline.py`; entrypoint chỉ
-điều phối, checkpoint, persist và validate, không copy lại thuật toán selector.
+| Stage | Pipeline làm gì | Artifact/checkpoint chính | Lệnh kiểm tra nhanh |
+|---|---|---|---|
+| 1. Shot detection | Đọc FPS/frame count và tìm shot boundary bằng TransNetV2 | `data/reports/offline/<video_id>/shots.json` | `Get-Content "data\reports\offline\$videoId\shots.json" -Raw \| ConvertFrom-Json \| Select-Object status, shot_count, detector_name` |
+| 2. Dense candidate generation | Sample theo thời gian, thêm shot anchor/boundary guard | `candidate_plan.jsonl`, `candidate_report.json` | `(Get-Content "data\reports\offline\$videoId\candidate_plan.jsonl" \| Measure-Object -Line).Lines` |
+| 3. Materialization | Decode toàn bộ candidate thành JPEG và giữ identity/order | `data/candidates/<video_id>.jsonl`, `data/dense_keyframes/<video_id>/` | `(Get-Content "data\candidates\$videoId.jsonl" \| Measure-Object -Line).Lines` |
+| 4. Dense features | Chạy SigLIP2, Florence-2 caption, PP-OCRv5 và YOLOE trên full candidate pool | `data/candidate_features/<video_id>/` | `Get-ChildItem "data\candidate_features\$videoId"` |
+| 5. Multimodal selection | Protected-event, gap repair, dedup và MMR để chọn keyframe | `selection_report.json`, `candidate_ledger.jsonl` | `Get-Content "data\reports\offline\$videoId\selection_report.json" -Raw \| ConvertFrom-Json \| Select-Object status, selected_count` |
+| 6. Canonical persistence | Ghi selected JPEG, metadata, caption/OCR/object và embedding | `data/keyframes/<video_id>/`, `data/metadata/keyframes_<video_id>.jsonl` | `(Get-Content "data\metadata\keyframes_$videoId.jsonl" \| Measure-Object -Line).Lines` |
+| 7. Validation/commit | Kiểm identity, count, checksum và chỉ ghi commit marker cuối cùng khi pass | `data/metadata/keyframes_<video_id>_extract_report.json` | `Get-Content "data\metadata\keyframes_${videoId}_extract_report.json" -Raw \| ConvertFrom-Json \| Select-Object status, dense_candidate_count, selected_count` |
 
-## Cách chạy query online
+File có mặt không tự động đồng nghĩa stage hợp lệ. Khi chạy lại với `--resume`,
+pipeline validate contract/checksum rồi mới log `[SKIP]`; checkpoint sai sẽ bị
+chạy lại.
 
-Sau khi phần offline đã tạo xong index và metadata trong `data/`, mở PowerShell tại
-thư mục gốc repository và chạy đúng lệnh sau:
+### 6.3. Build full dataset và publish corpus
+
+Sau khi smoke một video ổn, chạy toàn bộ thư mục:
 
 ```powershell
-.\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline --task auto --query "người đàn ông mặc áo đỏ đang mở cửa xe" --top-k 20
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.offline_pipeline `
+  --video-dir data\raw\video `
+  --video-glob *.mp4 `
+  --output-dir data `
+  --device auto `
+  --build-corpus `
+  --resume `
+  --verbose
 ```
 
-Trong đó:
+`--build-corpus` thực hiện và publish atomically:
 
-- `--query`: câu bạn muốn tìm hoặc câu hỏi cần trả lời.
-- `--top-k 20`: lấy tối đa 20 kết quả.
-- `--task auto`: để hệ thống tự chọn cách xử lý. Nếu chưa biết chọn gì, cứ giữ
-  nguyên `auto`.
+1. Selected-keyframe SigLIP2 FAISS cho coarse retrieval.
+2. Full dense-candidate SigLIP2 FAISS cho global rescue/CSES.
+3. BM25 index cho caption/OCR/object text.
+4. `neighbors_all.jsonl` và `segments_all.jsonl` từ canonical selected frames.
+5. BGE-M3 dense text index, trừ khi truyền `--skip-bge`.
+6. `offline_corpus_manifest.json` chứa checksum và `bundle_generation` của cả
+   bundle.
 
-Kết quả JSON được in ngay trong terminal. Muốn lưu kết quả vào file, thêm
-`--output data/reports/online_query.json` vào cùng command.
+Corpus mặc định fail closed: nếu một video lỗi thì global index không được build
+từ tập thiếu. `--allow-partial-corpus` chỉ nên dùng cho dev/debug vì nó chủ động
+loại video lỗi khỏi corpus. `--skip-bge` cũng chỉ nên dùng khi chấp nhận QA/TRAKE
+BGE online không có artifact để bật.
 
-Luồng chạy rất đơn giản:
+### 6.4. Profile ít VRAM hơn
 
-```text
-câu query -> OnlinePipeline -> đọc index đã có trong data/ -> trả kết quả
-```
-
-`OnlinePipeline` **không chạy lại phần offline**, không cắt video và không build
-lại index. Nó chỉ tìm kiếm trên artifact mà offline đã tạo trước đó.
-
-Nếu cần ép loại bài toán thay vì dùng `auto`, chọn task theo contract sau:
-
-| Task canonical | Tên thường gặp | Input phù hợp | Output chính | Giới hạn public |
-|---|---|---|---|---|
-| `kis` | KIS, KIST (Known Item Search Task) | Mô tả một cảnh/khoảnh khắc cần tìm | Ranked `candidates` là technical keyframe/segment; mỗi item có `video_id`, `keyframe_id`/`frame_id`, timestamp, score và metadata modality | Tối đa 200 |
-| `avs` | Ad-hoc Video Search | Mô tả có thể khớp nhiều cảnh | Cùng candidate schema với KIS, dùng profile AVS | Tối đa 200 |
-| `temporal` | Temporal evidence | Câu mô tả chuỗi dùng contract evidence/QA hiện hữu | `candidates`, `temporal_matches` và temporal trace; không phải submission TRAKE | Tối đa 200 |
-| `trake` | Temporal Retrieval and Alignment of Key Events | Context và đúng N event có thứ tự | Ranked `hypotheses`; mỗi item là một complete same-video sequence gồm đúng N original zero-based `frame_index` | Tối đa 100 |
-| `qa` | Grounded QA | Câu hỏi cần evidence và câu trả lời có citation | `evidence`, `answer`, eligibility/preflight và trace; answerer có thể disabled/abstain | Tối đa 5 evidence |
-| `auto` | Auto router | Query KIS/AVS/QA chưa biết profile | Giữ `requested_task="auto"`, trả `task` đã resolve | Theo task đã resolve |
-
-Tên task mà CLI/Python/API thực sự nhận là `kis`; tài liệu hoặc benchmark có thể
-gọi bài toán này là KIST, nhưng `--task kist` không phải alias hợp lệ. `auto` cũng
-không tự chọn TRAKE, vì vậy TRAKE luôn phải được chỉ định rõ.
-
-Ví dụ KIS/KIST bằng canonical task `kis`:
+Nếu OOM, giảm batch trước khi đổi model/quantization:
 
 ```powershell
-.\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline `
-  --task kis --top-k 20 `
-  --query "người đàn ông mặc áo đỏ đang mở cửa xe" `
-  --output data/reports/kis_query.json
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.offline_pipeline `
+  --video-dir data\raw\video `
+  --video-glob *.mp4 `
+  --output-dir data `
+  --device cuda `
+  --batch-size 4 `
+  --caption-batch-size 1 `
+  --ocr-batch-size 2 `
+  --object-batch-size 4 `
+  --bge-batch-size 4 `
+  --build-corpus `
+  --resume `
+  --verbose
 ```
 
-Ví dụ TRAKE với context và danh sách event:
+Caption backend canonical hiện chỉ hỗ trợ `--caption-quantization none`. Đừng
+truyền `4bit`/`8bit` chỉ vì CLI liệt kê choice; backend sẽ từ chối rõ ràng.
+
+### 6.5. Resume và rebuild
 
 ```powershell
-.\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline `
-  --task trake --top-k 100 `
-  --query "Bối cảnh: một người mở cửa xe. Sự kiện: 1. tay bắt đầu chạm tay nắm 2. cửa mở rộng nhất 3. người rời xe hoàn toàn" `
-  --output data/reports/trake_query.json
+# Resume là mặc định; ghi rõ để command tự mô tả
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.offline_pipeline `
+  --video-dir data\raw\video --output-dir data --build-corpus --resume
+
+# Recompute mọi stage và corpus dù checkpoint đang hợp lệ
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.offline_pipeline `
+  --video-dir data\raw\video --output-dir data --build-corpus --force
 ```
 
-Ví dụ QA chỉ truy hồi evidence, không load answer model (`QA_ANSWER_MODE=off` là
-mặc định):
+`--force` tốn tài nguyên lớn. Không cần xóa tay artifact trước; xóa lẻ dễ tạo
+bundle nửa cũ nửa mới và làm lineage khó audit.
+
+### 6.6. Xác nhận offline đã hoàn tất
+
+```powershell
+$requiredArtifacts = @(
+  "data\indexes\siglip2_so400m_patch16_384_flat_ip.faiss",
+  "data\metadata\siglip2_so400m_patch16_384_faiss_metadata.jsonl",
+  "data\metadata\siglip2_so400m_patch16_384_frame_map.json",
+  "data\metadata\siglip2_so400m_patch16_384_faiss_manifest.json",
+  "data\metadata\siglip2_so400m_patch16_384_index_report.json",
+  "data\indexes\siglip2_so400m_patch16_384_dense_flat_ip.faiss",
+  "data\metadata\siglip2_so400m_patch16_384_dense_faiss_metadata.jsonl",
+  "data\metadata\siglip2_so400m_patch16_384_dense_frame_map.json",
+  "data\metadata\siglip2_so400m_patch16_384_dense_faiss_manifest.json",
+  "data\metadata\siglip2_so400m_patch16_384_dense_index_report.json",
+  "data\indexes\retrieval_text_index.json",
+  "data\metadata\neighbors_all.jsonl",
+  "data\metadata\segments_all.jsonl",
+  "data\metadata\offline_corpus_manifest.json",
+  "data\reports\offline\corpus_report.json"
+)
+$requiredArtifacts | ForEach-Object {
+  [pscustomobject]@{ Exists = Test-Path $_; Path = $_ }
+}
+
+$manifest = Get-Content data\metadata\offline_corpus_manifest.json -Raw | ConvertFrom-Json
+$manifest | Select-Object status, bundle_generation, bge_enabled, video_ids
+
+$report = Get-Content data\reports\offline\corpus_report.json -Raw | ConvertFrom-Json
+$report | Select-Object status, video_count, dense_candidate_count, selected_keyframe_count
+```
+
+Nếu không dùng `--skip-bge`, kiểm tra thêm:
+
+```powershell
+Get-ChildItem data\indexes\bge_m3\
+Test-Path data\indexes\bge_m3\bge_m3_flat_ip.faiss
+Test-Path data\indexes\bge_m3\bge_m3_frame_map.json
+Test-Path data\indexes\bge_m3\bge_m3_manifest.json
+```
+
+Tín hiệu pass tối thiểu là mọi artifact bắt buộc tồn tại, `manifest.status` và
+`report.status` đều là `passed`, và `video_ids` đúng dataset mong đợi. Online
+loader sẽ kiểm lại checksum/generation; lệnh `Test-Path` chỉ là preflight, không
+thay thế validation của loader.
+
+## 7. Chạy online pipeline
+
+Entrypoint query canonical:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.online_pipeline --help
+```
+
+Mọi query đều in JSON ra stdout. Thêm `--output` để lưu cùng JSON vào file.
+
+### 7.1. Bật Qwen query expansion
+
+`configs/retrieval.yaml` và `.env.example` hiện bật expansion cho KIS/AVS. Để
+override trong terminal:
+
+```powershell
+$env:RETRIEVAL_QUERY_EXPANSION_ENABLED = "true"
+```
+
+Qwen expansion chạy với `kis`, `avs`, hoặc `auto` sau khi auto resolve thành
+KIS/AVS. Nó bị skip có chủ đích ở `temporal`, `qa` và `trake` vì các route này có
+parser/decomposition riêng. Nếu model/provider unavailable, xem
+`routing_trace.query_expansion` và `query_plan.expansion_plan`; đừng nhìn mỗi
+result rồi kết luận Qwen đã chạy.
+
+### 7.2. Bật context cho KIS/AVS
+
+Context mặc định tắt để artifact thiếu không block runtime. Muốn context thực sự
+được load và tham gia bounded rerank:
+
+```powershell
+$env:ONLINE_NEIGHBOR_CONTEXT_ENABLED = "true"
+$env:ONLINE_SEGMENT_CONTEXT_ENABLED = "true"
+```
+
+Sau đó thêm `--with-context` vào query. Chỉ thêm `--with-context` mà không bật
+hai biến trên sẽ tạo request context nhưng artifact index chưa được load; response
+sẽ báo fallback thay vì giả vờ đã score.
+
+### 7.3. Query `auto`
+
+Phù hợp khi caller chưa biết query là KIS, AVS, temporal hay QA:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.online_pipeline `
+  --task auto `
+  --query "sau khi bước vào phòng, người đàn ông ngồi xuống" `
+  --top-k 20 `
+  --debug `
+  --output data\reports\online_auto.json
+```
+
+Kiểm `requested_task`, `task` và `query_plan.profile_source` để biết route thật.
+Nếu cần TRAKE, phải truyền `--task trake` explicit.
+
+### 7.4. Query KIS
+
+KIS dùng cho một khoảnh khắc/instance khá cụ thể:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.online_pipeline `
+  --task kis `
+  --query "người đàn ông mặc áo xanh lấy chai nước từ tủ lạnh" `
+  --top-k 20 `
+  --with-context `
+  --debug `
+  --output data\reports\online_kis.json
+```
+
+Đường canonical KIS/AVS là selected multimodal retrieval + weighted RRF → dense
+global rescue → CSES → bounded context score → deterministic rerank/dedup/Top-K.
+Trong output, kiểm:
+
+- `routing_trace.coarse_to_dense.executed=true` và `mode="coarse_to_dense"` để
+  chứng minh dense path thật sự chạy.
+- `mode="selected_only_fallback"` nghĩa là chỉ sparse/selected path chạy.
+- `routing_trace.context_scoring` để biết neighbor/segment được request, available
+  và executed hay chưa.
+- `routing_trace.query_expansion.provider_call_count` để biết Qwen provider có
+  được gọi.
+
+### 7.5. Query AVS
+
+AVS dùng cho mô tả rộng, có thể khớp nhiều video:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.online_pipeline `
+  --task avs `
+  --query "các cảnh ngoài trời có nhiều người đang chơi thể thao" `
+  --top-k 50 `
+  --with-context `
+  --debug `
+  --output data\reports\online_avs.json
+```
+
+AVS và KIS dùng cùng coarse-to-dense engine nhưng query plan/profile khác nhau;
+đừng coi `avs` chỉ là alias đổi tên của `kis`.
+
+### 7.6. Query temporal
+
+Temporal giữ thứ tự event và dùng evidence engine riêng:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.online_pipeline `
+  --task temporal `
+  --query "một người mở cửa, sau đó bước vào phòng rồi ngồi xuống" `
+  --top-k 20 `
+  --debug `
+  --output data\reports\online_temporal.json
+```
+
+Generic Qwen expansion không chạy ở route này để tránh đổi thứ tự/ý nghĩa event.
+
+### 7.7. Query TRAKE
+
+TRAKE phù hợp khi cần đúng một sequence cùng video, mỗi event ánh xạ tới một
+original frame. Cấu trúc `Context` + danh sách `Events` giúp deterministic parser
+ít mơ hồ hơn:
+
+```powershell
+$env:RETRIEVAL_TRAKE_VIDEO_ROOT = "data\raw\video"
+
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.online_pipeline `
+  --task trake `
+  --query "Context: a high jump. Events: 1. the athlete first leaves the ground 2. the athlete reaches peak height 3. the athlete lands" `
+  --top-k 100 `
+  --debug `
+  --output data\reports\online_trake.json
+```
+
+TRAKE không gọi generic Qwen expansion. Pipeline parse event, retrieve theo từng
+event, gate video coverage, align K-best path, rồi decode một cửa sổ bounded quanh
+coarse frame và reuse SigLIP2 để refine. Nếu raw video không resolve được dưới
+`RETRIEVAL_TRAKE_VIDEO_ROOT`, response có thể giữ coarse fallback và ghi warning.
+
+Muốn bật BGE riêng cho TRAKE:
+
+```powershell
+$env:RETRIEVAL_TRAKE_BGE_DENSE_ENABLED = "true"
+$env:RETRIEVAL_TRAKE_BGE_RERANKER_ENABLED = "true"
+$env:RETRIEVAL_TRAKE_BGE_INDEX_ROOT = "data\indexes\bge_m3"
+```
+
+Các flag `RETRIEVAL_TRAKE_BGE_*` độc lập với `QA_BGE_*`.
+
+### 7.8. Query QA chỉ lấy evidence
+
+Đây là mode nhẹ và dễ debug nhất vì chưa load Qwen answer model:
 
 ```powershell
 $env:QA_ANSWER_MODE = "off"
-.\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline `
-  --task qa --top-k 5 `
+
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.online_pipeline `
+  --task qa `
   --query "Người phụ nữ mặc áo đỏ đang cầm vật gì?" `
-  --output data/reports/qa_query.json
+  --top-k 5 `
+  --debug `
+  --output data\reports\online_qa_evidence.json
 ```
 
-Đổi `QA_ANSWER_MODE` thành `optional` để thử sinh grounded answer nhưng vẫn giữ
-evidence khi model lỗi; dùng `required` khi caller muốn lỗi answer/model được nâng
-thành lỗi request. Cả ba mode vẫn fail closed thành `insufficient_evidence` khi
-evidence hoặc temporal chain không đủ điều kiện.
+### 7.9. Query QA có Qwen grounded answer
 
-Parser TRAKE là deterministic, không gọi LLM, giữ nguyên thứ tự/cardinality của
-numbered/bulleted events và bảo toàn các boundary terms tiếng Việt/Anh. Query là
-untrusted data; instruction-like text chỉ được xem như dữ liệu và được ghi warning.
+`optional` giữ evidence nếu answer model lỗi; `required` dùng khi answer/model là
+điều kiện bắt buộc của request.
 
-Tóm lại: query bình thường chỉ chạy module `online_pipeline` ở lệnh trên.
-`run_task_smoke` bên dưới chỉ dùng để kiểm tra hệ thống, không phải lệnh query
-thứ hai.
+```powershell
+$env:QA_ANSWER_MODE = "optional"
 
-### Dành cho code Python và API
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.online_pipeline `
+  --task qa `
+  --query "Người phụ nữ mặc áo đỏ đang cầm vật gì?" `
+  --top-k 5 `
+  --debug `
+  --output data\reports\online_qa_answer.json
+```
 
-Unified Python/API route, CSV export và smoke dùng `search_online()` cùng
-`OnlinePipeline`. Wrapper `search_trake()` và route `/retrieval/trake` gọi trực
-tiếp cùng cached `TrakePipeline`/corpus generation. Ví dụ gọi từ Python:
+Muốn QA dùng BGE-M3 artifact đã build offline:
+
+```powershell
+$env:QA_BGE_DENSE_ENABLED = "true"
+$env:QA_BGE_RERANKER_ENABLED = "true"
+$env:QA_BGE_INDEX_ROOT = "data\indexes\bge_m3"
+```
+
+QA BGE, QA answerer và KIS/AVS query expansion là ba feature độc lập. Bật một cái
+không tự bật hai cái còn lại.
+
+Caller có thể cấp expansion riêng cho QA bằng cách lặp `--expanded-query`:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m backend.app.pipelines.online_pipeline `
+  --task qa `
+  --query "Người phụ nữ đang cầm vật gì?" `
+  --expanded-query "vật thể trong tay người phụ nữ" `
+  --expanded-query "đồ vật được người phụ nữ cầm" `
+  --top-k 5
+```
+
+Đây là caller-owned QA expansion, không phải generic Qwen KIS/AVS expansion.
+
+## 8. Smoke test online trên artifact thật
+
+Smoke runner gọi lại cùng `search_online()`; nó không build submission. `all`
+chỉ gồm KIS, AVS, temporal và QA, **không gồm TRAKE**.
+
+```powershell
+.\.venv\Scripts\python.exe -B -m backend.app.services.retrieval.run_task_smoke `
+  --task all `
+  --top-k 5 `
+  --output data\reports\online_smoke.json
+```
+
+QA trong smoke runner là strict: để chứng minh full QA path, bật BGE dense,
+reranker và answerer bắt buộc trước:
+
+```powershell
+$env:QA_BGE_DENSE_ENABLED = "true"
+$env:QA_BGE_RERANKER_ENABLED = "true"
+$env:QA_BGE_INDEX_ROOT = "data\indexes\bge_m3"
+$env:QA_ANSWER_MODE = "required"
+
+.\.venv\Scripts\python.exe -B -m backend.app.services.retrieval.run_task_smoke `
+  --task qa `
+  --top-k 5 `
+  --output data\reports\qa_strict_smoke.json
+```
+
+TRAKE phải smoke bằng command `online_pipeline --task trake` ở trên.
+
+## 9. Gọi từ Python
 
 ```python
-from backend.app.services.retrieval.retrieval_manager import search_online, search_trake
+from backend.app.services.retrieval.retrieval_manager import search_online
 
 kis = search_online(
-    query="người đàn ông mặc áo đỏ đang mở cửa xe",
+    query="người đàn ông mở cửa xe",
     task="kis",
     top_k=20,
+    include_context=True,
+    debug=True,
 )
-print(kis["task"], kis["candidates"])
+print(kis["candidates"])
 
 trake = search_online(
-    query="Context: a runner. Events: 1. first touches the bar 2. reaches peak height",
+    query=(
+        "Context: a jump. Events: "
+        "1. first leaves the ground "
+        "2. reaches peak height "
+        "3. lands"
+    ),
     task="trake",
     top_k=100,
 )
 print(trake["hypotheses"])
 
-# Equivalent core TRAKE wrapper, without the OnlinePipeline wrapper fields.
-trake_core = search_trake(
-    "Context: a runner. Events: 1. first touches the bar 2. reaches peak height",
-    top_k=100,
-)
-
 qa = search_online(
-    query="Người phụ nữ mặc áo đỏ đang cầm vật gì?",
+    query="Người phụ nữ đang cầm vật gì?",
     task="qa",
     top_k=5,
 )
-print(qa["evidence"], qa["answer"])
+print(qa.get("answer"), qa.get("evidence"))
 ```
 
-Response TRAKE schema `1.0` là sequence-first; `candidates`, nếu có, chỉ là alias
-của các complete sequence và không phải danh sách event/frame đã flatten. Ví dụ
-dưới đây lược bớt một số nested retrieval fields để tập trung vào identity:
+`include_context=True` chỉ override request. Context artifact phải được load lúc
+factory dựng pipeline, nên vẫn cần hai biến `ONLINE_*_CONTEXT_ENABLED=true`.
 
-```json
-{
-  "schema_version": "1.0",
-  "query": "Context: a runner. Events: 1. first touches the bar 2. reaches peak height",
-  "requested_task": "trake",
-  "task": "trake",
-  "top_k": 100,
-  "event_plan": {
-    "original_query": "Context: a runner. Events: 1. first touches the bar 2. reaches peak height",
-    "context": "a runner",
-    "events": [
-      {"index": 0, "original_text": "first touches the bar", "boundary_type": "first_contact"},
-      {"index": 1, "original_text": "reaches peak height", "boundary_type": "peak"}
-    ],
-    "parser_source": "deterministic_list",
-    "confidence": 1.0,
-    "warnings": []
-  },
-  "hypotheses": [
-    {
-      "rank": 1,
-      "video_id": "L10_V010",
-      "frame_ids": [101, 203],
-      "score": 0.82,
-      "score_breakdown": {},
-      "path_id": "TRP-...",
-      "events": [
-        {"event_index": 0, "result": {"video_id": "L10_V010", "frame_id": "KF_A", "frame_index": 101}},
-        {"event_index": 1, "result": {"video_id": "L10_V010", "frame_id": "KF_B", "frame_index": 203}}
-      ],
-      "lineage": [
-        {"event_index": 0, "video_id": "L10_V010", "original_frame_index": 101, "internal_frame_id": "KF_A", "source": "local_refinement"},
-        {"event_index": 1, "video_id": "L10_V010", "original_frame_index": 203, "internal_frame_id": "KF_B", "source": "local_refinement"}
-      ],
-      "warnings": []
-    }
-  ],
-  "trace": {"refinement": {"scorer_available": true}},
-  "latency_ms": 12.3
-}
-```
+## 10. Xuất CSV submission
 
-`frame_ids` trong response này là original zero-based `frame_index`; internal
-`RetrievalResult.frame_id` chỉ xuất hiện trong lineage để audit và không được nộp.
-
-Neighbor/segment context là tùy chọn nâng cao và mặc định tắt. Các biến cấu hình
-tương ứng được liệt kê trong bảng môi trường ở phía trên.
-
-### Kiểm định cùng online pipeline bằng smoke
-
-`run_task_smoke` không phải cách query thứ hai. Đây chỉ là validator gọi lại
-`search_online()` để kiểm tra artifact, ảnh evidence và các model bắt buộc. Chỉ
-dùng lệnh này khi cần xác nhận môi trường chạy đúng; query bình thường dùng CLI ở
-trên. Chương trình không dừng lại để hỏi query trong terminal và tự dùng câu mặc
-định nếu không truyền:
-
-| Task | Tham số để đổi query | Query mặc định |
-|---|---|---|
-| KIS | `--kis-query` | `người phụ nữ mặc áo đỏ đang cầm điện thoại` |
-| AVS | `--avs-query` | Query AVS mặc định trong smoke runner |
-| Temporal | `--temporal-query` | `a person enters a room, then sits down` |
-| QA | `--qa-query` | `Người phụ nữ mặc áo đỏ đang cầm vật gì?` |
-
-Với task QA, đây là **strict smoke**, không phải sanity check tối giản: validator
-yêu cầu BGE-M3 dense retrieval, BGE cross-encoder và answer model thực sự được áp
-dụng. Vì vậy phải build `data/indexes/bge_m3/{bge_m3_flat_ip.faiss,
-bge_m3_frame_map.json,bge_m3_manifest.json}` từ canonical selected-keyframe hoặc
-segment metadata, rồi đặt các biến dưới đây trước khi chạy QA:
+CLI export hỗ trợ `kis`, `qa` và `trake`, giới hạn 1–100 row:
 
 ```powershell
-$env:QA_BGE_DENSE_ENABLED = "true"
-$env:QA_BGE_RERANKER_ENABLED = "true"
-$env:QA_BGE_INDEX_ROOT = "data/indexes/bge_m3"
-$env:QA_BGE_DEVICE = "cuda"
-```
-
-Không bỏ `--canonical-only` chỉ để smoke qua validation. Nếu build báo metadata
-không phải `selected_keyframe` hoặc canonical segment, hãy tạo lại canonical
-metadata trước. Có thể đặt các biến trong `.env` hoặc trong terminal đang chạy
-lệnh; giá trị trong terminal được ưu tiên.
-
-Chạy với query mặc định:
-
-```powershell
-python -m backend.app.services.retrieval.run_task_smoke --task kis --top-k 20
-$env:QA_ANSWER_MODE = "required"
-python -m backend.app.services.retrieval.run_task_smoke --task qa --top-k 5
-```
-
-Chạy với query tự chọn và ghi report để chẩn đoán:
-
-```powershell
-python -m backend.app.services.retrieval.run_task_smoke `
+# KIS
+.\.venv\Scripts\python.exe -B -m backend.app.services.submission.export_query `
   --task kis `
-  --kis-query "một người đàn ông mặc áo xanh đang cầm điện thoại" `
-  --top-k 20 `
-  --output data/reports/kis_smoke.json
+  --query "người mặc áo đỏ cầm điện thoại" `
+  --top-k 100 `
+  --output data\submissions\kis_result.csv
 
-$env:QA_ANSWER_MODE = "required"
-python -m backend.app.services.retrieval.run_task_smoke `
+# QA: chỉ export khi grounded answer/citation hợp lệ
+.\.venv\Scripts\python.exe -B -m backend.app.services.submission.export_query `
   --task qa `
-  --qa-query "Người phụ nữ đang cầm vật gì?" `
-  --top-k 5
-```
+  --query "Người phụ nữ đang cầm vật gì?" `
+  --top-k 5 `
+  --output data\submissions\qa_result.csv
 
-KIS, AVS và temporal không gọi Qwen answerer. Chỉ QA dùng `QA_ANSWER_MODE`;
-query expansion, BGE dense và BGE reranker có feature flag riêng.
-Các lỗi `bge_dense_not_enabled`, `bge_reranker_not_enabled`,
-`routing_bge_dense_not_applied` hoặc `routing_reranker_not_applied` nghĩa là strict
-smoke chưa chứng minh được BGE path, không đồng nghĩa visual retrieval không chạy.
-
-Hiện tại chưa có `FastAPI()` application factory, router mounting, health
-endpoint hoặc host/port chuẩn. `backend/app/api/retrieval.py` và `search.py` chỉ
-định nghĩa router/service contract; không chạy `uvicorn` cho đến khi bổ sung app
-entrypoint. Route online chính khi được mount là `/retrieval/online` hoặc
-`/search`; TRAKE còn có `POST /retrieval/trake`. Các route cũ và modality-only
-được giữ làm alias/diagnostic nhưng đều ủy quyền task public về cùng
-`OnlinePipeline` hoặc cached `TrakePipeline` cùng corpus generation.
-
-Contract đã triển khai trong router (nhưng chưa phục vụ HTTP) dùng các request sau:
-
-| Task | Route | JSON body |
-|---|---|---|
-| KIS/KIST | `POST /retrieval/online` | `{"query":"người đang đi xe đạp","task":"kis","top_k":20,"expanded_queries":[]}` |
-| TRAKE qua online wrapper | `POST /retrieval/online` | `{"query":"Context: a jump. Events: 1. first leaves ground 2. reaches peak","task":"trake","top_k":100,"expanded_queries":[]}` |
-| TRAKE core wrapper | `POST /retrieval/trake` | `{"query":"Context: a jump. Events: 1. first leaves ground 2. reaches peak","top_k":100}` |
-| QA | `POST /retrieval/qa` | `{"query":"Người phụ nữ đang cầm vật gì?","top_k":5,"task_mode":"qa","expanded_queries":[]}` |
-
-`POST /search` là wrapper tương đương dùng field `mode`, ví dụ KIS dùng
-`{"query":"...","mode":"kis","top_k":20}` và TRAKE dùng
-`{"query":"...","mode":"trake","top_k":100}`. Response HTTP được bọc bởi
-`{"success":true,"data":...,"message":null}`. KIS trả ranked frame candidates;
-TRAKE trả complete sequence hypotheses; QA trả answer status/citations và evidence
-bundle. Score chỉ dùng để xếp hạng trong cùng query/path, không phải xác suất đã
-hiệu chỉnh. Hiện không có host, port hay port-conflict policy.
-
-### Xuất CSV KIS, QA và TRAKE
-
-Router `backend/app/api/search.py` cung cấp contract `POST /search/export` để
-mount vào FastAPI application sau này:
-
-```json
-{"query":"người mặc áo đỏ cầm điện thoại","task":"kis","top_k":100}
-```
-
-Response là `text/csv; charset=utf-8` với `Content-Disposition: attachment`.
-KIS dùng header `video_id,frame_id`; QA dùng
-`video_id,frame_id,answer`. Ranking được giữ nguyên, cặp frame trùng bị loại theo
-lần xuất hiện đầu tiên và không tạo row giả. QA chỉ xuất khi grounded answer có
-`status=answered`, nội dung không rỗng và citation hợp lệ; abstain hoặc thiếu dẫn
-chứng trả lỗi rõ ràng. TRAKE dùng header provisional
-`video_id,frame_id_1,...,frame_id_N`, trong đó mỗi row là một complete sequence
-cùng video và có đúng N event. Dedupe TRAKE dùng toàn identity
-`(video_id, tuple(frame_ids))`, không loại hai sequence chỉ vì chúng dùng chung
-một frame. `top_k` của mọi submission chỉ nhận từ 1 đến 100.
-
-TRAKE export kiểm tra fail-closed từng lineage entry: `event_index` phải liên tục,
-`video_id` phải cùng sequence, `original_frame_index` phải là số nguyên không âm
-và đúng bằng `frame_ids` tương ứng, `source` phải có. Hypothesis thiếu hoặc lệch
-lineage bị bỏ; serializer không thay bằng internal frame ID, timestamp, filename
-hay FAISS row.
-
-CLI dùng chung serializer/service với API:
-
-```powershell
-python -m backend.app.services.submission.export_query `
-  --task kis --query "người mặc áo đỏ cầm điện thoại" --top-k 100 `
-  --output data/submissions/kis_result.csv
-
-python -m backend.app.services.submission.export_query `
+# TRAKE: mỗi row là một complete same-video sequence
+.\.venv\Scripts\python.exe -B -m backend.app.services.submission.export_query `
   --task trake `
-  --query "Context: a jump. Events: 1. first leaves ground 2. reaches peak" `
-  --top-k 100 --output data/submissions/trake_result.csv
+  --query "Context: a jump. Events: 1. first leaves ground 2. reaches peak 3. lands" `
+  --top-k 100 `
+  --output data\submissions\trake_result.csv
 ```
 
-Khi chưa có `data/sample_submission.csv` chính thức, header TRAKE ở trên là một
-assumption được cô lập trong serializer và `video_id` là stem không có `.mp4`.
-Mọi cột mang tên `frame_id` trong file nộp luôn lấy từ original `frame_index`;
-không dùng ordinal của keyframe, timestamp, tên file, internal frame ID hoặc
-FAISS row.
+Trong submission, `frame_id` phải là original zero-based `frame_index`, không
+phải thứ tự keyframe, timestamp, tên JPEG, internal frame ID hay FAISS row.
 
-### Đánh giá TRAKE
+## 11. HTTP/API status
 
-Pure evaluator nằm tại `backend/app/services/evaluation/trake_metrics.py`:
+Repo hiện có `APIRouter` contract tại `backend/app/api/retrieval.py` và
+`backend/app/api/search.py`, nhưng **chưa có** `FastAPI()` app factory, router
+mounting, health endpoint hoặc host/port chuẩn. Vì vậy README không đưa lệnh
+`uvicorn` giả vờ chạy được.
 
-```python
-from backend.app.services.evaluation.trake_metrics import trake_metrics_report
+Query production hiện nên đi qua CLI/Python ở trên. Khi app host được bổ sung,
+router online đã có contract `POST /retrieval/online` và `POST /search`; chi tiết
+body/response nằm tại [`docs/api_contract.md`](docs/api_contract.md).
 
-ground_truth = {
-    "video_id": "L10_V010",
-    "intervals": [[95, 105], [145, 155], [195, 205], [245, 255]],
-}
-report = trake_metrics_report(response["hypotheses"], ground_truth)
-```
+Frontend hiện cũng chỉ là placeholder, chưa có UI runnable.
 
-Sai `video_id` cho R-Score bằng 0. Đúng video thì mỗi event được hit khi submitted
-original frame nằm trong inclusive interval `[s_j,e_j]`, và R-Score là số hit/N.
-`R@k` là R-Score tốt nhất trong top-k với k thuộc `{1,5,20,50,100}`; Final Score
-là trung bình năm giá trị đó. Report còn có `video_at_1/5/20`, per-event hit rate
-và matched-event ratio. Evaluator từ chối event-count mismatch, interval đảo/
-âm, frame âm, duplicate whole hypothesis và hơn 100 hypothesis. Xem protocol đầy
-đủ tại [`docs/eval_protocol.md`](docs/eval_protocol.md).
+## 12. Test code
 
-Caption keyframe mặc định dùng `florence-community/Florence-2-base-ft` (~0.23B tham số),
-task token `<MORE_DETAILED_CAPTION>` và revision bất biến
-`0b03b6f15a4a211370fb204aee4e7dd48887ea37`. Đây là checkpoint đã chuyển đổi
-cho Florence-2 native trong Transformers và không cần thực thi remote code.
-Florence-2 sinh văn bản caption,
-không sinh JSON instruction-following; adapter giữ schema JSONL cũ với
-`structured_caption: null`. Quantization 4/8-bit chưa được kiểm thử cho checkpoint
-này và bị từ chối rõ ràng.
-
-Ví dụ sinh caption trên CPU và CUDA:
+Chạy toàn bộ test suite:
 
 ```powershell
-.\.venv\Scripts\python.exe backend\app\services\ingestion\run_caption.py `
-  --metadata-path data\metadata\keyframes_video7155.jsonl --device cpu --dtype float32
-
-.\.venv\Scripts\python.exe backend\app\services\ingestion\run_caption.py `
-  --metadata-path data\metadata\keyframes_video7155.jsonl --device cuda `
-  --dtype auto --batch-size 4
+.\.venv\Scripts\python.exe -B -m unittest discover -s backend/tests -v
 ```
 
-Để chuẩn bị máy chạy offline, tải đúng revision vào cache trên máy có mạng:
+Hoặc dùng pytest collector:
 
 ```powershell
-hf download florence-community/Florence-2-base-ft `
-  --revision 0b03b6f15a4a211370fb204aee4e7dd48887ea37 `
-  --cache-dir data/model_cache/caption
+.\.venv\Scripts\python.exe -B -m pytest -q
 ```
 
-Sau đó chuyển nguyên `data/model_cache/caption` sang máy đích và đặt
-`HF_HUB_OFFLINE=1`. Pipeline caption không thay đổi Qwen3.5 dùng cho grounded QA
-hoặc query expansion.
+Kiểm import/syntax:
 
-## Artifact và lineage
+```powershell
+.\.venv\Scripts\python.exe -B -m compileall -q backend src
+```
 
-| Nhóm | Vị trí mặc định/điển hình | Nội dung |
+Unit/integration test chủ yếu dùng fixture hoặc fake model. Nó chứng minh schema,
+ranking policy và artifact contract; nó không chứng minh model thật đạt chất
+lượng trên full dataset. Muốn claim E2E phải có log offline thật, committed
+manifest, online trace và đánh giá có ground truth.
+
+## 13. Artifact chính
+
+| Nhóm | Path mặc định | Vai trò |
 |---|---|---|
-| Frame/keyframe | `data/keyframes/` | JPEG và canonical candidate/frame identity |
-| Metadata | `data/metadata/` | keyframe, caption, OCR, objects, segments, neighbors |
-| Embedding/index | `data/embeddings/`, `data/indexes/` | SigLIP2 arrays/FAISS, BGE FAISS, maps/manifests |
-| Cache | `data/model_cache/`, `data/cache/` | Downloaded checkpoints và grounded-answer cache |
-| Submission/report | `data/submissions/`, `data/reports/` | CSV đã lưu và báo cáo lineage/runtime |
+| Video gốc | `data/raw/video/` | Nguồn offline và TRAKE local refinement |
+| Dense candidates | `data/candidates/`, `data/dense_keyframes/` | Full candidate pool trước selection |
+| Candidate features | `data/candidate_features/` | SigLIP2/caption/OCR/object theo video |
+| Selected keyframes | `data/keyframes/`, `data/metadata/keyframes_*.jsonl` | Canonical sparse frames |
+| Selected visual index | `data/indexes/siglip2_so400m_patch16_384_flat_ip.faiss` | Coarse visual retrieval |
+| Dense visual index | `data/indexes/siglip2_so400m_patch16_384_dense_flat_ip.faiss` | Global rescue và CSES |
+| Sparse text index | `data/indexes/retrieval_text_index.json` | BM25 caption/OCR/objects |
+| BGE-M3 | `data/indexes/bge_m3/` | Optional dense text cho QA/TRAKE |
+| Context | `data/metadata/neighbors_all.jsonl`, `segments_all.jsonl` | Bounded neighbor/segment evidence |
+| Corpus commit | `data/metadata/offline_corpus_manifest.json` | Checksum và bundle generation |
+| Reports | `data/reports/` | Stage, corpus và query trace |
+| Submission | `data/submissions/` | CSV được export chủ động |
 
-Không có transcript/ASR artifact trong contract hiện tại. Không ghép file từ các
-run chỉ dựa vào tên: loader kiểm tra dimension, normalization, row identity và
-manifest lineage; FPS/timestamp được giữ theo từng video. TRAKE chỉ nhận candidate
-có original `frame_index`; output giữ per-event lineage tới internal retrieval
-identity nhưng submission chỉ ghi original indexes.
+Không trộn index, frame map, manifest và report từ các lần build khác nhau. Online
+cache được pin theo `bundle_generation`; publish corpus mới sẽ tạo generation mới.
 
-## Test và trạng thái xác minh
+## 14. Troubleshooting
+
+### FFmpeg không được tìm thấy
 
 ```powershell
-python -m pytest -q
-python -m unittest discover -s backend/tests -v
-python -m unittest -v backend.tests.test_trake_query_parser backend.tests.test_trake_pipeline backend.tests.test_trake_submission backend.tests.test_trake_metrics
-python -m compileall -q backend src
+Get-Command ffmpeg
+Get-Command ffprobe
 ```
 
-Unit/integration tests dùng fixture/fake model để kiểm tra schema, deterministic
-ranking, failure policy và artifact contract. Chúng không thay thế một E2E run
-với checkpoint thật, FFmpeg, Paddle và video dataset thật.
+Cài FFmpeg, mở terminal mới rồi chạy lại hai lệnh. Đừng sửa code decode để che
+lỗi `PATH`.
 
-## Troubleshooting
+### CUDA/Paddle lỗi hoặc OOM
 
-- `ffmpeg`/`ffprobe` not found: cài FFmpeg và mở terminal mới để cập nhật `PATH`.
-- Paddle import hoặc CUDA lỗi: gỡ cả hai Paddle packages rồi cài lại đúng một
-  profile; kiểm tra `paddle.is_compiled_with_cuda()`.
-- CUDA OOM: giảm caption/BGE batch, chạy từng stage/process, rồi cân nhắc 4-bit.
-- Model download timeout: chuẩn bị `data/model_cache/`, pin revision và dùng
-  `QA_MODELS_LOCAL_ONLY=true` sau khi cache hoàn tất.
-- Authentication: code không yêu cầu application API key; nếu model hub yêu cầu
-  quyền truy cập, đăng nhập/cấp token qua cơ chế của Hugging Face, không commit token.
-- Artifact mismatch: không trộn index, frame map và manifest từ các run/model
-  revision khác nhau; rebuild các artifact phụ thuộc trong thư mục output mới.
-- Windows/PowerShell: dùng backtick ở cuối dòng và chạy từ repository root; path
-  có khoảng trắng phải được quote. Không có port conflict khi chưa có web app.
-- Dấu vết ASR cũ: không thêm field/weight để “sửa” artifact; rebuild bằng pipeline
-  hiện tại hoặc giữ artifact chỉ để audit, vì runtime scoring không cần ASR.
-- QA trả `insufficient_evidence`: đây là fail-closed khi evidence rỗng, temporal
-  chain không strict hoặc citation không hợp lệ; không tự bù bằng kiến thức ngoài.
-- TRAKE trả ít hoặc không có hypothesis: xem `trace.event_retrieval`,
-  `trace.video_gating` và warnings về missing original-frame lineage/full coverage;
-  không sửa bằng cách suy frame từ timestamp hoặc filename.
-- `local_refinement_video_unavailable` hoặc `local_refinement_failed_coarse_fallback`:
-  production đã inject shared-SigLIP2 scorer, nhưng vẫn giữ coarse canonical frame
-  nếu video không resolve được dưới canonical video root, decode lỗi hoặc local
-  scoring/refinement không hoàn tất.
+```powershell
+.\.venv\Scripts\python.exe -c "import torch, paddle; print(torch.cuda.is_available(), paddle.is_compiled_with_cuda())"
+```
 
-## Giới hạn hiện tại
+- Xác nhận chỉ có một Paddle profile.
+- Xác nhận wheel CUDA khớp driver.
+- Giảm từng batch size như profile mục 6.4.
+- Dùng `--device cpu` chỉ để debug vì full run sẽ chậm đáng kể.
 
-- Chưa có web application entrypoint, health endpoint và frontend triển khai.
-- Chưa có retry cho grounded answer generation; timeout/failure ở mode `required`
-  được nâng thành lỗi nhưng evidence vẫn được giữ để chẩn đoán.
-- BGE reranker revision mặc định `main` chưa reproducible tuyệt đối; dense revision
-  lấy immutable commit từ manifest.
-- Không có ASR nên câu hỏi chỉ xuất hiện trong lời nói có thể giảm recall; đây là
-  trade-off tài nguyên có chủ đích, không phải lỗi audio.
-- TRAKE parser/retrieval/alignment/ranking và shared-SigLIP2 local scorer đã được
-  wire, nhưng semantic-boundary accuracy chưa được chứng minh trên full corpus.
-  Boundary heuristic `first_*`/`peak` dùng chuỗi cosine similarity; đây không phải
-  pose/contact model hay VLM verification, nên đừng nâng claim thành event-boundary
-  recognition đã được adjudicate.
-- Header TRAKE vẫn provisional vì chưa có official `sample_submission.csv` trong
-  repository; đổi constant serializer khi format chính thức được cung cấp.
-- Backend hiện dùng được ở mức library/CLI nhưng **chưa production/E2E-certified**
-  cho đến khi chạy smoke thật trên máy có FFmpeg, Paddle, GPU/model cache và dataset.
+### Model download timeout hoặc máy offline
+
+- Chạy một lần có mạng để model vào `data/model_cache/`.
+- Chép nguyên cache sang máy đích, giữ đúng revision.
+- Sau đó mới dùng `--local-files-only`, `QA_MODELS_LOCAL_ONLY=true` hoặc
+  `RETRIEVAL_TRAKE_BGE_LOCAL_FILES_ONLY=true`.
+
+### KIS/AVS chỉ chạy selected-only
+
+Mở JSON output và xem:
+
+```text
+routing_trace.coarse_to_dense.mode
+routing_trace.coarse_to_dense.fallback_reason
+```
+
+`selected_only_fallback` thường do dense bundle thiếu. Bundle có mặt nhưng corrupt
+hoặc sai generation phải fail closed; không nên đổi config để nuốt lỗi checksum.
+
+### Qwen expansion không chạy
+
+Kiểm lần lượt:
+
+```powershell
+$env:RETRIEVAL_QUERY_EXPANSION_ENABLED
+Get-Content configs\retrieval.yaml | Select-String -Pattern "query_expansion|enabled"
+```
+
+Sau đó xem `routing_trace.query_expansion` trong response. `temporal`, `qa` và
+`trake` skip generic expansion là hành vi đúng; chỉ KIS/AVS mới gọi provider.
+
+### Context không góp điểm
+
+Xác nhận artifact và flag:
+
+```powershell
+Test-Path data\metadata\neighbors_all.jsonl
+Test-Path data\metadata\segments_all.jsonl
+$env:ONLINE_NEIGHBOR_CONTEXT_ENABLED
+$env:ONLINE_SEGMENT_CONTEXT_ENABLED
+```
+
+Rồi query lại với `--with-context --debug` và xem
+`routing_trace.context_scoring`.
+
+### QA trả `insufficient_evidence`
+
+Đây là fail-closed khi evidence, temporal chain hoặc citation chưa đủ; không nên
+bù câu trả lời bằng kiến thức ngoài video. Test evidence trước với
+`QA_ANSWER_MODE=off`, sau đó mới bật answerer.
+
+### TRAKE không refine được original frame
+
+Kiểm `RETRIEVAL_TRAKE_VIDEO_ROOT`, tên `<video_id>.mp4` và warning trong
+`trace.refinement`. Khi video/decode/local scoring unavailable, pipeline có thể
+giữ coarse frame thay vì bịa original-frame lineage.
+
+## 15. Giới hạn cần biết
+
+- Chưa có runnable FastAPI app hoặc frontend.
+- Không có ASR/audio/transcript retrieval.
+- BGE reranker revision `main` là dev default, chưa reproducible tuyệt đối; pin
+  commit hash trước benchmark chính thức.
+- First-run model download có thể rất lâu.
+- TRAKE local refinement đã được wire với shared SigLIP2, nhưng semantic-boundary
+  accuracy vẫn cần benchmark có nhãn trên full corpus.
+- Test pass không đồng nghĩa retrieval quality đã đạt yêu cầu cuộc thi.
+
+Các tài liệu sâu hơn:
+
+- [`docs/architecture.md`](docs/architecture.md): kiến trúc và boundary giữa các route.
+- [`docs/api_contract.md`](docs/api_contract.md): router contract hiện có.
+- [`docs/eval_protocol.md`](docs/eval_protocol.md): protocol đánh giá TRAKE.
+- [`docs/PIPELINE_AUDIT.md`](docs/PIPELINE_AUDIT.md): evidence/risk audit của pipeline.
+- [`data/README.md`](data/README.md): quy ước dữ liệu và `frame_id`.
