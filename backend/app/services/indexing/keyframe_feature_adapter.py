@@ -17,7 +17,8 @@ import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from difflib import SequenceMatcher
+from rapidfuzz.distance import Levenshtein
+from rapidfuzz import fuzz
 from numbers import Integral, Real
 from typing import Any
 
@@ -1220,9 +1221,17 @@ def _fuzzy_text_clusters(texts: set[str], threshold: float) -> dict[str, str]:
             return
         parent[max(left_root, right_root)] = min(left_root, right_root)
 
+    lengths = {text: len(text) for text in ordered}
     for index, left in enumerate(ordered):
+        left_len = lengths[left]
         for right in ordered[index + 1 :]:
-            if SequenceMatcher(None, left, right, autojunk=False).ratio() >= threshold:
+            right_len = lengths[right]
+            # Upper bound of SequenceMatcher.ratio() is 2*min(la,lb)/(la+lb).
+            # Skip pairs that mathematically cannot reach threshold -- lossless prune.
+            upper_bound = 2 * min(left_len, right_len) / max(1, left_len + right_len)
+            if upper_bound < threshold:
+                continue
+            if (fuzz.ratio(left, right) / 100.0) >= threshold:
                 union(left, right)
     members: dict[str, list[str]] = defaultdict(list)
     for text in ordered:
