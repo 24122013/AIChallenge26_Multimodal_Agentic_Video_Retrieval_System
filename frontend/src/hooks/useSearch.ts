@@ -63,7 +63,7 @@ export function useSearch(): UseSearchReturn {
                         top_k: payload.config.topK || queryParam.top_k || 20
                     };
     
-                    console.log(`📡 [Network] Sending request to /api/search/kist for mode [${queryParam.mode}]:`, requestBody);
+                    console.log(`📡 [Network] Sending request to /api/search for mode [${queryParam.mode}]:`, requestBody);
     
                     const res = await fetch(`${API_BASE}/search`, {
                         method: 'POST',

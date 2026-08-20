@@ -67,12 +67,12 @@ try:
             ]
         }
 
-    @video_router.get("/frame/{frame_id}")
-    def get_frame_image(frame_id: str):
+    @video_router.get("/frame/{video_id}/{frame_id}")
+    def get_frame_image(video_id: str, frame_id: str):
         """Serves the keyframe JPEG directly from the local disk config."""
         # Sanitize to prevent directory traversal
         safe_frame_id = os.path.basename(frame_id)
-        file_path = os.path.join(STREAM_CONFIG.RETRIEVAL_KEYFRAME_ROOT, f"{safe_frame_id}.jpg")
+        file_path = os.path.join(STREAM_CONFIG.RETRIEVAL_KEYFRAME_ROOT, video_id, f"{safe_frame_id}.jpg")
         
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="Frame image not found")

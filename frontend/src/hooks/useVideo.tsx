@@ -1,20 +1,40 @@
 import { useState, useCallback } from 'react';
 import type { VideoScene } from '../types';
-import { API_PROXY } from '../constants/proxy';
+
+export interface NeighborDetail {
+  frame_id: string;
+  delta_seconds: number;
+  url: string;
+}
+
+export interface NeighborResponse {
+  frame_id: string;
+  video_id: string;
+  timestamp: number;
+  target_url: string;
+  neighbors_before: NeighborDetail[];
+  neighbors_after: NeighborDetail[];
+}
 
 function useVideo(displayedResults: VideoScene[]) {
   const [activeVideo, setActiveVideo] = useState<VideoScene | null>(null);
-  const [neighborFrames, setNeighborFrames] = useState<{ time: number; label: string; isActive?: boolean }[]>([]);
+  const [neighborData, setNeighborData] = useState<NeighborResponse | null>(null);
   const [lastSelectedScene, setLastSelectedScene] = useState<VideoScene | null>(null);
 
-  const handleSelectResultVideo = useCallback((scene: VideoScene) => {
-      setActiveVideo({ ...scene, video_url: `${API_PROXY}/video/stream/${scene.video_id}` });
+  const handleSelectResultVideo = useCallback(async (scene: VideoScene) => {
+      setActiveVideo({ ...scene, video_url: `/api/video/stream/${scene.video_id}` });
       setLastSelectedScene(scene);
-      setNeighborFrames([
-        { time: Math.max(0, scene.timestamp - 2), label: '-2s Context' },
-        { time: scene.timestamp, label: 'Target Frame', isActive: true },
-        { time: scene.timestamp + 2, label: '+2s Context' },
-      ]);
+      setNeighborData(null);
+      
+      try {
+          const res = await fetch(`/api/video/frame_neighbor/${scene.frame_id}`);
+          if (res.ok) {
+              const data = (await res.json()) as NeighborResponse;
+              setNeighborData(data);
+          }
+      } catch (error) {
+          console.error("Failed to fetch neighbor frames:", error);
+      }
     }, []);
 
     const handleNextVideo = useCallback(() => {
@@ -33,7 +53,16 @@ function useVideo(displayedResults: VideoScene[]) {
       }
     }, [activeVideo, displayedResults, handleSelectResultVideo]);
 
-  return { activeVideo, setActiveVideo, neighborFrames, setNeighborFrames, lastSelectedScene, handleSelectResultVideo, handleNextVideo, handlePrevVideo };
+  return { 
+    activeVideo, 
+    setActiveVideo, 
+    neighborData, 
+    setNeighborData, 
+    lastSelectedScene, 
+    handleSelectResultVideo, 
+    handleNextVideo, 
+    handlePrevVideo 
+  };
 }
 
 export default useVideo;
