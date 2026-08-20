@@ -14,11 +14,10 @@ from backend.app.services.retrieval.query_terms import (
 
 @dataclass(frozen=True)
 class RerankWeights:
-    visual: float = 0.50
-    caption: float = 0.15
+    visual: float = 0.55
+    caption: float = 0.20
     ocr: float = 0.10
-    asr: float = 0.15
-    objects: float = 0.05
+    objects: float = 0.10
     temporal: float = 0.05
 
 
@@ -82,10 +81,6 @@ class HybridReranker:
             _unit(modality_scores.get("ocr", 0.0)),
             _metadata_match_score(query_tokens, _tokens(candidate.ocr_text)),
         )
-        asr = max(
-            _unit(modality_scores.get("asr", 0.0)),
-            _metadata_match_score(query_tokens, _tokens(candidate.asr_text)),
-        )
         objects = max(
             _unit(modality_scores.get("objects", 0.0)),
             _metadata_match_score(
@@ -98,7 +93,6 @@ class HybridReranker:
             weights.visual * visual
             + weights.caption * caption
             + weights.ocr * ocr
-            + weights.asr * asr
             + weights.objects * objects
             + weights.temporal * temporal
         )

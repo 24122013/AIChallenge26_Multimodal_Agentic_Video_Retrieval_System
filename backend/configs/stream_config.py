@@ -3,5 +3,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class StreamConfig:
-    # If local: SOURCE_VIDEO_URL in "data/raw/video/"
-    SOURCE_VIDEO_URL: str = os.getenv("SOURCE_VIDEO_URL", "./data/raw/video")
+    # Uses the canonical root from your .env
+    SOURCE_VIDEO_URL: str = os.getenv("RETRIEVAL_TRAKE_VIDEO_ROOT", "data/raw/video")
+    
+    # Standard output directory for canonical keyframes
+    RETRIEVAL_KEYFRAME_ROOT: str = os.getenv("RETRIEVAL_KEYFRAME_ROOT", "data/keyframes")

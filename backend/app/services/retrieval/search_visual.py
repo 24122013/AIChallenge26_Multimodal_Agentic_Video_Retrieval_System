@@ -5,6 +5,7 @@ vector dimension, normalization, and similarity contract.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from contextlib import nullcontext
@@ -45,6 +46,95 @@ class VisualSearchConfig:
     default_top_k: int = 20
     max_top_k: int = 200
     min_score: float | None = None
+
+
+@dataclass(frozen=True)
+class VisualBundleIntegrity:
+    generation: str
+    index_sha256: str
+    frame_map_sha256: str
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _bundle_generation(hashes: dict[str, str]) -> str:
+    payload = json.dumps(
+        hashes,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def validate_visual_bundle_integrity(
+    config: VisualSearchConfig,
+) -> VisualBundleIntegrity | None:
+    """Validate generation-bound artifacts when a canonical manifest provides them.
+
+    Older schema-1.2 manifests did not include bundle hashes, so they remain
+    readable.  The canonical offline publisher always emits this stronger
+    contract and therefore fails closed across interrupted multi-file updates.
+    """
+
+    if not config.manifest_path.is_file():
+        raise FileNotFoundError(f"FAISS manifest not found: {config.manifest_path}")
+    with config.manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"FAISS manifest must be an object: {config.manifest_path}")
+    declared = manifest.get("artifacts")
+    generation = manifest.get("bundle_generation")
+    if declared is None and generation is None:
+        # Snapshot legacy schema-1.2 artifacts too.  They lack a manifest-level
+        # generation, but pinning both hashes prevents a lazy index load from
+        # mixing a newly published index with the frame map loaded at startup.
+        if not config.index_path.is_file() or not config.frame_map_path.is_file():
+            raise FileNotFoundError("Legacy FAISS bundle is missing index or frame map")
+        index_sha256 = _sha256_file(config.index_path)
+        frame_map_sha256 = _sha256_file(config.frame_map_path)
+        return VisualBundleIntegrity(
+            generation="legacy-" + _bundle_generation(
+                {
+                    "index": index_sha256,
+                    "frame_map": frame_map_sha256,
+                }
+            ),
+            index_sha256=index_sha256,
+            frame_map_sha256=frame_map_sha256,
+        )
+    if not isinstance(declared, dict) or not isinstance(generation, str) or not generation:
+        raise ValueError("FAISS manifest has an incomplete bundle-integrity contract")
+    declared_hashes: dict[str, str] = {}
+    for label in ("index", "metadata", "frame_map", "report"):
+        item = declared.get(label)
+        if not isinstance(item, dict) or not isinstance(item.get("sha256"), str):
+            raise ValueError(f"FAISS manifest is missing the {label} checksum")
+        declared_hashes[label] = str(item["sha256"])
+    if _bundle_generation(declared_hashes) != generation:
+        raise ValueError("FAISS bundle generation does not match declared checksums")
+    for label, path in (
+        ("index", config.index_path),
+        ("frame_map", config.frame_map_path),
+    ):
+        item = declared[label]
+        if item.get("filename") != path.name:
+            raise ValueError(f"FAISS {label} filename does not match the manifest")
+        if not path.is_file() or _sha256_file(path) != declared_hashes[label]:
+            raise ValueError(
+                f"FAISS {label} does not belong to manifest generation {generation}"
+            )
+    return VisualBundleIntegrity(
+        generation=generation,
+        index_sha256=declared_hashes["index"],
+        frame_map_sha256=declared_hashes["frame_map"],
+    )
 
 
 @dataclass(frozen=True)
@@ -297,9 +387,15 @@ def _feature_tensor(output: Any, torch_module: Any):
 class FaissVectorSearcher:
     """Thin wrapper around a FAISS index."""
 
-    def __init__(self, index_path: Path, expected_dim: int | None = None) -> None:
+    def __init__(
+        self,
+        index_path: Path,
+        expected_dim: int | None = None,
+        expected_sha256: str | None = None,
+    ) -> None:
         self.index_path = index_path
         self.expected_dim = expected_dim
+        self.expected_sha256 = expected_sha256
         self._index = None
 
     def _load(self) -> None:
@@ -307,18 +403,29 @@ class FaissVectorSearcher:
             return
         if not self.index_path.exists():
             raise FileNotFoundError(f"FAISS index not found: {self.index_path}")
+        if (
+            self.expected_sha256 is not None
+            and _sha256_file(self.index_path) != self.expected_sha256
+        ):
+            raise ValueError("FAISS index changed after its manifest was validated")
         try:
             import faiss
         except ImportError as exc:  # pragma: no cover - depends on local environment.
             raise RuntimeError(
                 "faiss is required for visual search. Install project requirements first."
             ) from exc
-        self._index = faiss.read_index(self.index_path.as_posix())
-        if self.expected_dim is not None and int(self._index.d) != self.expected_dim:
+        loaded_index = faiss.read_index(self.index_path.as_posix())
+        if (
+            self.expected_sha256 is not None
+            and _sha256_file(self.index_path) != self.expected_sha256
+        ):
+            raise ValueError("FAISS index changed while it was being loaded")
+        if self.expected_dim is not None and int(loaded_index.d) != self.expected_dim:
             raise ValueError(
                 f"FAISS dimension does not match manifest: "
-                f"{int(self._index.d)} != {self.expected_dim}"
+                f"{int(loaded_index.d)} != {self.expected_dim}"
             )
+        self._index = loaded_index
 
     def search(self, vector: np.ndarray, top_k: int) -> tuple[np.ndarray, np.ndarray]:
         self._load()
@@ -338,7 +445,9 @@ class VisualSearchEngine:
     ) -> None:
         self.config = config
         self.encoder_contract: EncoderContract | None = None
+        bundle_integrity: VisualBundleIntegrity | None = None
         if encoder is None:
+            bundle_integrity = validate_visual_bundle_integrity(config)
             self.encoder_contract = load_encoder_contract(config.manifest_path)
             self.encoder = Siglip2TextEncoder(
                 contract=self.encoder_contract,
@@ -353,13 +462,37 @@ class VisualSearchEngine:
             expected_dim=(
                 self.encoder_contract.vector_dim if self.encoder_contract else None
             ),
+            expected_sha256=(
+                bundle_integrity.index_sha256 if bundle_integrity else None
+            ),
         )
         self.metadata_store = metadata_store or MetadataStore.from_frame_map(config.frame_map_path)
+        if bundle_integrity is not None:
+            verified_again = validate_visual_bundle_integrity(config)
+            if verified_again != bundle_integrity:
+                raise ValueError("FAISS bundle changed while visual search was loading")
 
     def search(self, query: str, top_k: int | None = None) -> VisualSearchResponse:
-        started_at = time.perf_counter()
         requested_top_k = top_k if top_k is not None else self.config.default_top_k
         bounded_top_k = max(1, min(int(requested_top_k), self.config.max_top_k))
+        return self._search_bounded(query, bounded_top_k)
+
+    def search_pool(self, query: str, top_k: int) -> VisualSearchResponse:
+        """Retrieve a validated internal candidate pool beyond the public cap.
+
+        Public visual responses remain limited by ``config.max_top_k``.  TRAKE
+        needs a wider pre-alignment pool and applies its own validated bound;
+        this explicit method avoids silently turning ``event_top_k=300`` into
+        200 while retaining a defensive service-level ceiling.
+        """
+
+        requested = int(top_k)
+        if not 1 <= requested <= 10_000:
+            raise ValueError("internal visual candidate pool must be between 1 and 10000")
+        return self._search_bounded(query, requested)
+
+    def _search_bounded(self, query: str, bounded_top_k: int) -> VisualSearchResponse:
+        started_at = time.perf_counter()
 
         query_vector = normalize_query_vector(self.encoder.encode(query))
         if (
@@ -435,7 +568,6 @@ def frame_record_to_result(
         thumbnail_path=record.thumbnail_path,
         caption=record.caption,
         ocr_text=record.ocr_text,
-        asr_text=record.asr_text,
         objects=list(record.objects),
         modality_scores={"visual": round(score, 6)},
         neighbors=[frame_record_to_neighbor(neighbor) for neighbor in neighbors or []],

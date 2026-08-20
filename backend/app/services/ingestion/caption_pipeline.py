@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
@@ -11,7 +12,6 @@ from backend.app.services.ingestion.common import (
     append_jsonl,
     chunks,
     choose_device,
-    existing_ids,
     identity,
     iter_progress,
     json_log,
@@ -20,6 +20,7 @@ from backend.app.services.ingestion.common import (
     read_jsonl,
     report,
     resolve_image_path,
+    resumable_ids,
     safe_infer,
     utc_now,
     verify_image,
@@ -28,84 +29,204 @@ from backend.app.services.ingestion.common import (
 )
 
 
-DEFAULT_MODEL_NAME = "Salesforce/blip-image-captioning-base"
+DEFAULT_MODEL_NAME = "florence-community/Florence-2-base-ft"
+DEFAULT_MODEL_REVISION = "0b03b6f15a4a211370fb204aee4e7dd48887ea37"
+DEFAULT_TASK_PROMPT = "<MORE_DETAILED_CAPTION>"
 
 
 class CaptionBackend(Protocol):
     model_name: str
     model_version: str
+    model_revision: str | None
 
-    def infer(self, paths: Sequence[Path]) -> Sequence[str]: ...
+    def infer(self, paths: Sequence[Path]) -> Sequence[Any]: ...
 
 
-class BlipCaptionBackend:
+@dataclass(frozen=True)
+class FlorenceCaptionOutput:
+    """A normalized Florence caption plus its original decoded generation."""
+
+    caption: str
+    raw_output: str
+
+
+class FlorenceCaptionBackend:
+    """Lazy local Florence-2 task-prompt image caption backend."""
+
     def __init__(
         self,
         *,
         model_name: str = DEFAULT_MODEL_NAME,
+        revision: str | None = DEFAULT_MODEL_REVISION,
         device: str = "cpu",
         cache_dir: Path | None = Path("data/model_cache/caption"),
-        max_new_tokens: int = 60,
+        max_new_tokens: int = 256,
+        dtype: str = "auto",
+        quantization: str = "none",
+        task_prompt: str = DEFAULT_TASK_PROMPT,
     ) -> None:
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be >= 1")
+        if dtype not in {"auto", "bfloat16", "float16", "float32"}:
+            raise ValueError("dtype must be auto, bfloat16, float16, or float32")
+        if quantization not in {"none", "8bit", "4bit"}:
+            raise ValueError("quantization must be none, 8bit, or 4bit")
+        if quantization != "none":
+            raise ValueError(
+                "Florence-2 4/8-bit quantization is not supported or tested by "
+                "this caption pipeline; use quantization='none'."
+            )
+        task_prompt = str(task_prompt).strip()
+        if not task_prompt:
+            raise ValueError("task_prompt must not be empty")
         self.model_name = model_name
         self.model_version = package_version("transformers")
+        self.requested_model_revision = revision
+        self.model_revision = revision
         self.device = device
         self.cache_dir = cache_dir
         self.max_new_tokens = max_new_tokens
+        self.dtype = dtype
+        self.quantization = quantization
+        self.task_prompt = task_prompt
         self._model: Any | None = None
         self._processor: Any | None = None
+        self._torch_dtype: Any | None = None
+
+    def _resolve_dtype(self, torch: Any) -> Any:
+        if self.dtype == "float32" or self.device == "cpu":
+            return torch.float32
+        if self.dtype == "float16":
+            return torch.float16
+        if self.dtype == "bfloat16":
+            if not torch.cuda.is_bf16_supported():
+                raise RuntimeError("bfloat16 was requested but this CUDA device does not support it")
+            return torch.bfloat16
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     def _load(self) -> None:
         if self._model is not None:
             return
         try:
             import torch
-            from transformers import BlipForConditionalGeneration, BlipProcessor
+            from transformers import AutoModelForImageTextToText, AutoProcessor
         except ImportError as exc:
             raise RuntimeError(
-                "Captioning requires torch, Pillow and transformers. "
-                "Install dependencies with: pip install -r requirements.txt"
+                "Florence-2 captioning requires torch and a Transformers release "
+                "with native Florence-2 support. Install requirements.txt."
             ) from exc
+
         kwargs: dict[str, Any] = {}
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             kwargs["cache_dir"] = str(self.cache_dir)
-        self._processor = BlipProcessor.from_pretrained(self.model_name, **kwargs)
-        dtype = torch.float16 if self.device == "cuda" else torch.float32
-        self._model = BlipForConditionalGeneration.from_pretrained(
-            self.model_name, torch_dtype=dtype, **kwargs
-        ).to(self.device)
+        if self.model_revision:
+            kwargs["revision"] = self.model_revision
+        # transformers>=5.2 has native Florence-2 support, so executing model-repo
+        # Python is unnecessary. Keep this identical for processor and model.
+        kwargs["trust_remote_code"] = False
+        self._processor = AutoProcessor.from_pretrained(self.model_name, **kwargs)
+        self._torch_dtype = self._resolve_dtype(torch)
+        model_kwargs = dict(kwargs)
+        model_kwargs["dtype"] = self._torch_dtype
+        self._model = AutoModelForImageTextToText.from_pretrained(
+            self.model_name,
+            **model_kwargs,
+        )
+        self._model = self._model.to(self.device)
         self._model.eval()
+        resolved = getattr(self._model.config, "_commit_hash", None)
+        if resolved:
+            self.model_revision = str(resolved)
 
-    def infer(self, paths: Sequence[Path]) -> Sequence[str]:
+    def infer(self, paths: Sequence[Path]) -> Sequence[FlorenceCaptionOutput]:
         self._load()
         import torch
 
         images: list[Image.Image] = []
         try:
             for path in paths:
-                images.append(Image.open(path).convert("RGB"))
-            # BLIP base is an image-captioning model, not an instruction-following
-            # model. Supplying a long text prompt makes the decoder reproduce that
-            # prompt instead of describing the image.
+                with Image.open(path) as source:
+                    image = source.convert("RGB")
+                images.append(image)
+            image_sizes = [image.size for image in images]
             inputs = self._processor(
+                text=[self.task_prompt] * len(images),
                 images=images,
                 return_tensors="pt",
                 padding=True,
             )
+            model_device = getattr(self._model, "device", torch.device(self.device))
             inputs = {
-                key: value.to(self.device) if hasattr(value, "to") else value
+                key: value.to(model_device) if hasattr(value, "to") else value
                 for key, value in inputs.items()
             }
-            if self.device == "cuda" and "pixel_values" in inputs:
-                inputs["pixel_values"] = inputs["pixel_values"].half()
+            for key, value in list(inputs.items()):
+                if (
+                    self.device == "cuda"
+                    and hasattr(value, "is_floating_point")
+                    and value.is_floating_point()
+                ):
+                    inputs[key] = value.to(dtype=self._torch_dtype)
             with torch.inference_mode():
-                tokens = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens)
-            values = self._processor.batch_decode(tokens, skip_special_tokens=True)
-            return [value.strip() for value in values]
+                tokens = self._model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,
+                    num_beams=3,
+                )
+            decoded = self._processor.batch_decode(
+                tokens,
+                skip_special_tokens=False,
+            )
+            if len(decoded) != len(images):
+                raise RuntimeError(
+                    f"Florence-2 decoded {len(decoded)} outputs for {len(images)} images."
+                )
+            outputs: list[FlorenceCaptionOutput] = []
+            for raw_output, image_size in zip(decoded, image_sizes, strict=True):
+                processed = self._processor.post_process_generation(
+                    raw_output,
+                    task=self.task_prompt,
+                    image_size=image_size,
+                )
+                if not isinstance(processed, dict) or self.task_prompt not in processed:
+                    raise ValueError(
+                        "Florence-2 post-processing did not return the configured "
+                        f"task key {self.task_prompt!r}."
+                    )
+                caption = " ".join(str(processed[self.task_prompt]).split()).strip()
+                if not caption:
+                    raise ValueError("Florence-2 returned an empty English caption")
+                outputs.append(
+                    FlorenceCaptionOutput(
+                        caption=caption,
+                        raw_output=str(raw_output).strip(),
+                    )
+                )
+            return outputs
         finally:
             for image in images:
                 image.close()
+
+
+def parse_caption_output(raw: Any) -> dict[str, Any]:
+    """Adapt Florence task output to the stable downstream caption schema."""
+    if isinstance(raw, FlorenceCaptionOutput):
+        caption = " ".join(raw.caption.split()).strip()
+        raw_output = raw.raw_output.strip()
+    else:
+        # A plain-string path keeps injected/test backends backward compatible.
+        caption = " ".join(str(raw).split()).strip()
+        raw_output = str(raw).strip()
+    if not caption:
+        raise ValueError("caption must not be empty")
+    return {
+        "caption": caption,
+        "structured_caption": None,
+        "caption_parse_status": "success",
+        "raw_caption_output": raw_output,
+    }
 
 
 def _segment_caption(captions: Sequence[str]) -> str:
@@ -126,11 +247,18 @@ def run_caption_file(
     output_path: Path | None = None,
     report_path: Path | None = None,
     device: str = "auto",
-    batch_size: int = 4,
+    batch_size: int = 2,
     overwrite: bool = False,
     include_segment_caption: bool = False,
     backend: CaptionBackend | None = None,
     model_name: str = DEFAULT_MODEL_NAME,
+    revision: str | None = DEFAULT_MODEL_REVISION,
+    max_new_tokens: int = 256,
+    dtype: str = "auto",
+    quantization: str = "none",
+    model_cache_dir: Path = Path("data/model_cache/caption"),
+    task_prompt: str = DEFAULT_TASK_PROMPT,
+    prompt: str | None = None,
 ) -> dict[str, Any]:
     if batch_size < 1:
         raise ValueError("batch_size must be >= 1")
@@ -140,10 +268,36 @@ def run_caption_file(
     output_path = output_path or output_dir / f"captions_{video_id}.jsonl"
     report_path = report_path or output_dir / f"captions_{video_id}_report.json"
     selected_device = choose_device(device)
-    backend = backend or BlipCaptionBackend(model_name=model_name, device=selected_device)
-    processed = set() if overwrite else existing_ids(output_path, "frame_id")
+    backend_was_supplied = backend is not None
+    if prompt is not None:
+        task_prompt = prompt
+    backend = backend or FlorenceCaptionBackend(
+        model_name=model_name,
+        revision=revision,
+        device=selected_device,
+        cache_dir=model_cache_dir,
+        max_new_tokens=max_new_tokens,
+        dtype=dtype,
+        quantization=quantization,
+        task_prompt=task_prompt,
+    )
+    requested_revision = getattr(backend, "requested_model_revision", None)
+    if requested_revision is None:
+        requested_revision = (
+            getattr(backend, "model_revision", None)
+            if backend_was_supplied
+            else revision
+        )
+    processed, stale = resumable_ids(
+        output_path,
+        "frame_id",
+        model_name=backend.model_name,
+        requested_model_revision=requested_revision,
+    )
+    if overwrite:
+        processed, stale = set(), True
     pending = [record for record in records if str(record.get("frame_id")) not in processed]
-    mode = "w" if overwrite else "a"
+    mode = "w" if stale else "a"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     success_count = error_count = 0
     generated: list[dict[str, Any]] = []
@@ -169,14 +323,20 @@ def run_caption_file(
                             pipeline="caption",
                             model_name=backend.model_name,
                             model_version=backend.model_version,
+                            model_revision=getattr(backend, "model_revision", None),
+                            requested_model_revision=requested_revision,
                             status="error",
                             run_at=run_at,
                             error=str(exc),
                         ),
                         "caption": "",
+                        "structured_caption": None,
+                        "caption_parse_status": "error",
+                        "raw_caption_output": "",
+                        "caption_language": "en",
                     }
                     error_count += 1
-            for position, record, (caption, error) in zip(
+            for position, record, (raw, error) in zip(
                 valid_positions,
                 valid_records,
                 safe_infer(valid_paths, backend.infer),
@@ -189,27 +349,58 @@ def run_caption_file(
                             pipeline="caption",
                             model_name=backend.model_name,
                             model_version=backend.model_version,
+                            model_revision=getattr(backend, "model_revision", None),
+                            requested_model_revision=requested_revision,
                             status="error",
                             run_at=run_at,
                             error=str(error),
                         ),
                         "caption": "",
+                        "structured_caption": None,
+                        "caption_parse_status": "error",
+                        "raw_caption_output": "",
+                        "caption_language": "en",
                     }
                     error_count += 1
                 else:
-                    value = {
-                        **identity(record),
-                        **processing_fields(
-                            pipeline="caption",
-                            model_name=backend.model_name,
-                            model_version=backend.model_version,
-                            status="success",
-                            run_at=run_at,
-                        ),
-                        "caption": str(caption).strip(),
-                        "caption_language": "en",
-                    }
-                    success_count += 1
+                    try:
+                        parsed = parse_caption_output(raw)
+                    except (TypeError, ValueError) as exc:
+                        value = {
+                            **identity(record),
+                            **processing_fields(
+                                pipeline="caption",
+                                model_name=backend.model_name,
+                                model_version=backend.model_version,
+                                model_revision=getattr(backend, "model_revision", None),
+                                requested_model_revision=requested_revision,
+                                status="error",
+                                run_at=run_at,
+                                error=str(exc),
+                            ),
+                            "caption": "",
+                            "structured_caption": None,
+                            "caption_parse_status": "error",
+                            "raw_caption_output": str(raw).strip(),
+                            "caption_language": "en",
+                        }
+                        error_count += 1
+                    else:
+                        value = {
+                            **identity(record),
+                            **processing_fields(
+                                pipeline="caption",
+                                model_name=backend.model_name,
+                                model_version=backend.model_version,
+                                model_revision=getattr(backend, "model_revision", None),
+                                requested_model_revision=requested_revision,
+                                status="success",
+                                run_at=run_at,
+                            ),
+                            **parsed,
+                            "caption_language": "en",
+                        }
+                        success_count += 1
                 batch_values[position] = value
             for position in range(len(batch)):
                 value = batch_values[position]
@@ -217,7 +408,6 @@ def run_caption_file(
                 generated.append(value)
 
     if include_segment_caption and generated:
-        # Rewrite only this video's separate caption artifact; source keyframe metadata is untouched.
         all_output = read_jsonl(output_path)
         grouped: dict[str, list[str]] = defaultdict(list)
         for value in all_output:
@@ -237,6 +427,7 @@ def run_caption_file(
         output_path=output_path,
         model_name=backend.model_name,
         model_version=backend.model_version,
+        model_revision=getattr(backend, "model_revision", None),
         device=selected_device,
         started_at=timer.started_at,
         elapsed=timer.elapsed,
@@ -245,8 +436,20 @@ def run_caption_file(
         skipped_count=len(records) - len(pending),
         error_count=error_count,
     )
-    result["batch_size"] = batch_size
-    result["segment_caption_enabled"] = include_segment_caption
+    result.update(
+        {
+            "requested_model_revision": requested_revision,
+            "resolved_model_revision": getattr(backend, "model_revision", None),
+            "model_cache_dir": str(getattr(backend, "cache_dir", model_cache_dir)),
+            "batch_size": batch_size,
+            "max_new_tokens": max_new_tokens,
+            "dtype": dtype,
+            "quantization": quantization,
+            "segment_caption_enabled": include_segment_caption,
+            "task_prompt": task_prompt,
+            "prompt": task_prompt,
+        }
+    )
     write_json(report_path, result)
     json_log("ingestion.caption", "completed", latency=timer.elapsed, **result)
     return result

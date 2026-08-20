@@ -1,6 +1,7 @@
 """Phase 3 temporal helpers for ordered multi-event video retrieval."""
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 
@@ -9,7 +10,7 @@ from backend.app.services.retrieval.query_terms import weighted_query_coverage
 
 
 _THEN_RE = re.compile(
-    r"\b(?:then|after that|next|followed by|sau đó|tiếp theo|rồi)\b",
+    r"\b(?:then|after that|next(?!\s+to\b)|followed by|sau đó|tiếp theo|rồi)\b",
     re.IGNORECASE,
 )
 _AFTER_RE = re.compile(r"\b(?:after|sau khi)\b", re.IGNORECASE)
@@ -28,6 +29,9 @@ class TemporalMatch:
     score: float
     start_time: float
     end_time: float
+    chain_id: str = ""
+    match_mode: str = "strict"
+    warnings: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -35,6 +39,9 @@ class TemporalMatch:
             "score": self.score,
             "start_time": self.start_time,
             "end_time": self.end_time,
+            "chain_id": self.chain_id,
+            "match_mode": self.match_mode,
+            "warnings": list(self.warnings),
             "events": [event.to_dict() for event in self.events],
         }
 
@@ -89,6 +96,8 @@ def match_ordered_events(
                 ),
                 start_time=result.timestamp,
                 end_time=result.timestamp,
+                chain_id=_chain_id([result]),
+                match_mode="strict",
             )
             for result in event_results[0][: max(0, int(top_k))]
         ]
@@ -103,6 +112,8 @@ def match_ordered_events(
         event_queries=event_queries,
         allow_equal_timestamp=False,
         allow_same_location=False,
+        match_mode="strict",
+        warnings=(),
     )
     if matches:
         return matches
@@ -118,6 +129,8 @@ def match_ordered_events(
         event_queries=event_queries,
         allow_equal_timestamp=False,
         allow_same_location=False,
+        match_mode="relaxed_gap",
+        warnings=("temporal_gap_relaxed",),
     )
     if matches:
         return matches
@@ -132,6 +145,8 @@ def match_ordered_events(
         event_queries=event_queries,
         allow_equal_timestamp=True,
         allow_same_location=True,
+        match_mode="sparse_compat",
+        warnings=("temporal_sparse_compatibility",),
     )
 
 
@@ -144,6 +159,8 @@ def _build_matches(
     event_queries: list[str] | None,
     allow_equal_timestamp: bool,
     allow_same_location: bool,
+    match_mode: str,
+    warnings: tuple[str, ...],
 ) -> list[TemporalMatch]:
     matches: list[TemporalMatch] = []
     beam_width = max(200, max(1, int(top_k)) * 50)
@@ -191,6 +208,8 @@ def _build_matches(
                         chain,
                         max_gap_seconds=scoring_gap_seconds,
                         event_queries=event_queries,
+                        match_mode=match_mode,
+                        warnings=warnings,
                     )
                 )
 
@@ -205,6 +224,9 @@ def _to_match(
     events: list[RetrievalResult],
     max_gap_seconds: float,
     event_queries: list[str] | None = None,
+    *,
+    match_mode: str = "strict",
+    warnings: tuple[str, ...] = (),
 ) -> TemporalMatch:
     duration = max(0.0, events[-1].timestamp - events[0].timestamp)
     qualities = [
@@ -229,7 +251,27 @@ def _to_match(
         score=round(max(0.0, sequence_score - gap_penalty), 6),
         start_time=events[0].timestamp,
         end_time=events[-1].timestamp,
+        chain_id=_chain_id(events),
+        match_mode=match_mode,
+        warnings=warnings,
     )
+
+
+def _chain_id(events: list[RetrievalResult]) -> str:
+    """Build a stable chain identifier from source frame lineage."""
+
+    digest = hashlib.sha256()
+    for event in events:
+        for value in (
+            event.video_id,
+            event.frame_id,
+            event.shot_id,
+            event.segment_id,
+            f"{float(event.timestamp):.6f}",
+        ):
+            digest.update(str(value or "").encode("utf-8"))
+            digest.update(b"\0")
+    return f"TC-{digest.hexdigest()[:16]}"
 
 
 def _event_quality(query: str, candidate: RetrievalResult) -> float:
@@ -241,7 +283,6 @@ def _event_quality(query: str, candidate: RetrievalResult) -> float:
     metadata_texts = [
         candidate.caption,
         candidate.ocr_text,
-        candidate.asr_text,
         " ".join(candidate.objects),
     ]
     populated = [text for text in metadata_texts if str(text).strip()]

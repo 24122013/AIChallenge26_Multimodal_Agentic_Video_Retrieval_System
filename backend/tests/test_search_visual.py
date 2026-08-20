@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ from backend.app.services.retrieval.search_visual import (
     VisualSearchEngine,
     load_encoder_contract,
     normalize_query_vector,
+    validate_visual_bundle_integrity,
 )
 
 
@@ -99,6 +101,79 @@ def siglip2_contract(vector_dim: int = 2) -> EncoderContract:
 
 
 class VisualSearchEngineTest(unittest.TestCase):
+    def test_bundle_integrity_accepts_one_generation_and_rejects_mixed_artifacts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            paths = {
+                "index": root / "visual.faiss",
+                "metadata": root / "visual_metadata.jsonl",
+                "frame_map": root / "frame_map.json",
+                "report": root / "report.json",
+            }
+            original = {
+                "index": b"INDEX-A",
+                "metadata": b'{"video_id":"V001"}\n',
+                "frame_map": b'{"0":{"video_id":"V001"}}',
+                "report": b'{"status":"passed"}',
+            }
+            for label, payload in original.items():
+                paths[label].write_bytes(payload)
+
+            hashes = {
+                label: hashlib.sha256(payload).hexdigest()
+                for label, payload in original.items()
+            }
+            generation = hashlib.sha256(
+                json.dumps(
+                    hashes,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifacts": {
+                            label: {
+                                "filename": path.name,
+                                "sha256": hashes[label],
+                            }
+                            for label, path in paths.items()
+                        },
+                        "bundle_generation": generation,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = VisualSearchConfig(
+                index_path=paths["index"],
+                frame_map_path=paths["frame_map"],
+                manifest_path=manifest_path,
+            )
+
+            verified = validate_visual_bundle_integrity(config)
+            self.assertIsNotNone(verified)
+            self.assertEqual(verified.generation, generation)
+
+            replacements = {
+                "index": b"INDEX-B",
+                # Same frame count and video set; only the bundle generation differs.
+                "frame_map": b'{"0":{"video_id":"V001","timestamp":1.0}}',
+            }
+            for label, replacement in replacements.items():
+                with self.subTest(swapped_artifact=label):
+                    paths[label].write_bytes(replacement)
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        rf"FAISS {label} does not belong to manifest generation",
+                    ):
+                        validate_visual_bundle_integrity(config)
+                    paths[label].write_bytes(original[label])
+
     def test_normalize_query_vector_returns_single_unit_vector(self) -> None:
         vector = normalize_query_vector(np.array([3.0, 4.0], dtype="float32"))
 

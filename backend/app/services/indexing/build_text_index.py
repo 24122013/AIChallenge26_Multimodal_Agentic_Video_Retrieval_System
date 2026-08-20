@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -15,7 +16,7 @@ except ModuleNotFoundError:
     from backend.app.services.retrieval.text_index import build_text_index
 
 
-_ARTIFACT_PREFIXES = ("captions_", "ocr_", "asr_", "objects_", "segments_")
+_ARTIFACT_PREFIXES = ("captions_", "ocr_", "objects_", "segments_")
 
 
 def load_records(path: str | Path) -> list[dict[str, Any]]:
@@ -42,10 +43,28 @@ def write_text_index(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = build_text_index(records)
-    output.write_text(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(
+                payload,
+                handle,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            temporary_path = Path(handle.name)
+        temporary_path.replace(output)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
     return {
         "output_path": output.as_posix(),
         "input_records": len(records),
@@ -122,7 +141,7 @@ def _load_file(source: Path) -> list[dict[str, Any]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build Retrieval Phase 2 caption/OCR/ASR/object text index."
+        description="Build Retrieval Phase 2 caption/OCR/object text index."
     )
     parser.add_argument(
         "--metadata",

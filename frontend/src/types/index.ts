@@ -95,7 +95,7 @@ export interface SearchPayload {
 export interface SearchLog {
     id: string;
     query: string;
-    payload: SearchPayload; // TODO: Include config modification for Payload (e.g., topK)
+    payload: SearchPayload;
     resultsCount: number;
     latency: number;
     submissionsCount: number;

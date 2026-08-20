@@ -43,7 +43,6 @@ def synthetic_records(
     captions: list[dict[str, Any]] = []
     ocr: list[dict[str, Any]] = []
     objects: list[dict[str, Any]] = []
-    asr: list[dict[str, Any]] = []
     for video_offset in range(video_count):
         video_id = f"SYNTH_V{video_offset:03d}"
         for frame_offset in range(frames_per_video):
@@ -108,28 +107,11 @@ def synthetic_records(
                     ],
                 }
             )
-        duration = frames_per_video * keyframe_interval_seconds
-        chunk_start = 0.0
-        chunk_index = 0
-        while chunk_start < duration:
-            asr.append(
-                {
-                    "video_id": video_id,
-                    "transcript_segment_id": f"ASR_{video_id}_{chunk_index:06d}",
-                    "status": "success",
-                    "start": chunk_start,
-                    "end": min(duration, chunk_start + 4.0),
-                    "text": f"synthetic transcript chunk {chunk_index % 13}",
-                }
-            )
-            chunk_start += 3.5
-            chunk_index += 1
     return {
         "keyframes": keyframes,
         "captions": captions,
         "ocr": ocr,
         "objects": objects,
-        "asr": asr,
     }
 
 
@@ -261,7 +243,7 @@ def run_benchmark(
         root = Path(temporary_dir)
         paths = {
             name: root / f"{name}.jsonl"
-            for name in ("keyframes", "captions", "ocr", "objects", "asr")
+            for name in ("keyframes", "captions", "ocr", "objects")
         }
         for name, path in paths.items():
             write_jsonl(path, records[name])
@@ -285,7 +267,6 @@ def run_benchmark(
                     segment_path,
                     captions_path=paths["captions"],
                     ocr_path=paths["ocr"],
-                    asr_path=paths["asr"],
                     objects_path=paths["objects"],
                 )
             )
@@ -328,7 +309,6 @@ def run_benchmark(
                 "caption_count": len(records["captions"]),
                 "ocr_record_count": len(records["ocr"]),
                 "object_record_count": len(records["objects"]),
-                "asr_chunk_count": len(records["asr"]),
                 "fps": fps,
                 "keyframe_interval_seconds": keyframe_interval_seconds,
                 "frames_per_shot": frames_per_shot,
@@ -384,7 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("reports/index_size_latency_benchmark.json"),
+        default=Path("data/reports/index_size_latency_benchmark.json"),
     )
     parser.add_argument("--videos", type=int, default=4)
     parser.add_argument("--frames-per-video", type=int, default=250)

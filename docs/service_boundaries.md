@@ -72,7 +72,6 @@ backend/app/models/*
 ```text
 caption
 ocr
-asr
 objects
 metadata
 ```

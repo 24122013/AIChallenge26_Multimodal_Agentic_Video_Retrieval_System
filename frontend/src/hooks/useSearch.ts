@@ -65,7 +65,7 @@ export function useSearch(): UseSearchReturn {
     
                     console.log(`📡 [Network] Sending request to /api/search/kist for mode [${queryParam.mode}]:`, requestBody);
     
-                    const res = await fetch(`${API_BASE}/search/kist`, {
+                    const res = await fetch(`${API_BASE}/search`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(requestBody),

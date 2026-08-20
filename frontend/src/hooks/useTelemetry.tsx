@@ -1,11 +1,12 @@
 import { useCallback, useState } from 'react';
 import type { SearchLog, TelemetryDetails } from '../types';
+import { API_PROXY } from '../constants/proxy';
 
 export type SendTelemetryFn = (
     eventType: 'query' | 'click_result' | 'submit_result',
     details: TelemetryDetails,
     latencyMs?: number
-  ) => Promise<void>;
+) => Promise<void>;
 
 export const useTelemetry = () => {
     // Telemetry Session State Log Dashboard
@@ -18,7 +19,7 @@ export const useTelemetry = () => {
         latencyMs: number = 0
     ) => {
         try {
-            await fetch('/api/telemetry/log', {
+            await fetch(`${API_PROXY}/telemetry/log`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',

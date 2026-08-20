@@ -42,6 +42,23 @@ def make_records(video_id: str, count: int, contract: dict) -> list[dict]:
             "timestamp": float(offset),
             "keyframe_path": f"data/keyframes/{video_id}/{offset:06d}.jpg",
             "embedding_index": offset,
+            "candidate_index": offset + 1,
+            "candidate_id": f"CANDIDATE_{video_id}_{offset:09d}",
+            "candidate_reasons": ["shot_boundary_start"],
+            "keyframe_strategy": "dense_coverage",
+            "selection_phase": "protected",
+            "selection_rank": offset + 1,
+            "selection_reasons": ["protected_event_cover"],
+            "covered_event_ids": [f"__shot__:{offset}"],
+            "selection_score": 0.91,
+            "protected": True,
+            "coverage_added": False,
+            "importance_score": 0.81,
+            "semantic_novelty": 0.64,
+            "component_scores": {"ocr": 0.9},
+            "available_modalities": ["ocr"],
+            "protected_event_ids": [f"__shot__:{offset}"],
+            "selection_provenance": {"strategy": "multimodal_coverage"},
             **contract,
         }
         for offset in range(count)
@@ -160,6 +177,39 @@ class FaissContractValidationTest(unittest.TestCase):
                     record["model_name"] == contract["model_name"]
                     and record["model_revision"] == contract["model_revision"]
                     and record["vector_dim"] == contract["vector_dim"]
+                    for record in result["frame_map"].values()
+                )
+            )
+            self.assertEqual(
+                [
+                    record["candidate_id"]
+                    for record in result["frame_map"].values()
+                ],
+                [
+                    "CANDIDATE_L01_V001_000000000",
+                    "CANDIDATE_L01_V001_000000001",
+                    "CANDIDATE_L01_V001_000000002",
+                ],
+            )
+            self.assertTrue(
+                all(
+                    record["selection_phase"] == "protected"
+                    and record["protected"] is True
+                    for record in result["frame_map"].values()
+                )
+            )
+            self.assertEqual(
+                [
+                    record["candidate_index"]
+                    for record in result["frame_map"].values()
+                ],
+                [1, 2, 3],
+            )
+            self.assertTrue(
+                all(
+                    record["importance_score"] == 0.81
+                    and record["semantic_novelty"] == 0.64
+                    and record["component_scores"] == {"ocr": 0.9}
                     for record in result["frame_map"].values()
                 )
             )

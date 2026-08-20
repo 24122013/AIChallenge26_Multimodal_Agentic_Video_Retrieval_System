@@ -15,7 +15,6 @@ const METHOD_COLORS: Record<string, string> = {
   score: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-400',
 };
 
-// ─── SIMPLE CUSTOM HOOK FOR DRAG & DROP ───
 function useDraggableResults(initialResults: VideoScene[]) {
   const [orderedIds, setOrderedIds] = useState<string[]>([]);
   const [draggedId, setDraggedId] = useState<string | null>(null);
@@ -153,7 +152,7 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
 
                 <select
                   value={interactionFilter}
-                  onChange={e => setInteractionFilter(e.target.value as any)}
+                  onChange={e => setInteractionFilter(e.target.value as 'all' | 'clicked' | 'unclicked')}
                   className="text-sm px-3 py-1.5 rounded-lg bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-sm"
                 >
                   <option value="all">All Status</option>

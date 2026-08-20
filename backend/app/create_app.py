@@ -23,7 +23,7 @@ def create_application():
     # Include Routers safely
     # ===========================
     # Search router
-    from backend.app.api.search import search_router
+    from backend.app.api.search import router as search_router
     if search_router is not None:
         application.include_router(search_router)
         print("[INFO] Search router has been loaded.\n")

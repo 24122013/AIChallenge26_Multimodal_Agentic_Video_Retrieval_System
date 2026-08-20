@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from backend.app.services.indexing.build_text_index import (
     load_records,
@@ -11,6 +13,7 @@ from backend.app.services.indexing.build_text_index import (
 )
 from backend.app.services.retrieval.retrieval_config import (
     RetrievalConfigError,
+    TrakeConfig,
     load_retrieval_runtime_config,
 )
 from backend.app.services.retrieval.query_terms import (
@@ -75,17 +78,15 @@ class Phase2RetrievalTest(unittest.TestCase):
             "start_time": 1.2,
             "captions_aggregated": "a person cooking in a kitchen",
             "ocr": [{"text": "BẾP VIỆT"}],
-            "asr": [{"text": "hôm nay chúng ta nấu phở"}],
             "objects": [{"label": "person"}, {"class_name": "bowl"}],
         }
 
         self.assertIn("cooking", text_for_modality(record, "caption"))
         self.assertEqual(text_for_modality(record, "ocr"), "BẾP VIỆT")
-        self.assertIn("nấu phở", text_for_modality(record, "asr"))
         self.assertEqual(text_for_modality(record, "objects"), "person bowl")
 
         payload = build_text_index([record])
-        for modality in ("caption", "ocr", "asr", "objects"):
+        for modality in ("caption", "ocr", "objects"):
             self.assertEqual(
                 payload["modalities"][modality]["stats"]["doc_count"],
                 1,
@@ -100,7 +101,6 @@ class Phase2RetrievalTest(unittest.TestCase):
                 "timestamp": 2.0,
                 "caption": "a person cooking noodles in a kitchen",
                 "ocr_text": "BẾP VIỆT",
-                "asr_text": "hôm nay chúng ta nấu phở",
                 "objects": [{"class_name": "person"}, {"class_name": "bowl"}],
             },
             {
@@ -110,7 +110,6 @@ class Phase2RetrievalTest(unittest.TestCase):
                 "timestamp": 8.0,
                 "caption": "orange clouds at sunset",
                 "ocr_text": "HTV",
-                "asr_text": "dự báo thời tiết",
                 "objects": ["cloud"],
             },
         ]
@@ -121,13 +120,11 @@ class Phase2RetrievalTest(unittest.TestCase):
 
             caption = searcher.search_results("person cooking", "caption", 5)
             ocr = searcher.search_results("BẾP VIỆT", "ocr", 5)
-            asr = searcher.search_results("nấu phở", "asr", 5)
             objects = searcher.search_results("bowl", "objects", 5)
 
             self.assertEqual(caption[0].frame_id, "F001")
             self.assertIn("caption", caption[0].modality_scores)
             self.assertEqual(ocr[0].frame_id, "F001")
-            self.assertEqual(asr[0].asr_text, "hôm nay chúng ta nấu phở")
             self.assertEqual(objects[0].objects, ["person", "bowl"])
 
     def test_text_search_prefers_complete_action_over_partial_overlap(
@@ -182,7 +179,7 @@ class Phase2RetrievalTest(unittest.TestCase):
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["segment_id"], "S1")
 
-    def test_runtime_config_loads_asr_weight_and_text_path(self) -> None:
+    def test_runtime_config_loads_caption_weight_and_text_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "retrieval.yaml"
             path.write_text(
@@ -190,7 +187,7 @@ class Phase2RetrievalTest(unittest.TestCase):
                     [
                         "weights:",
                         "  visual: 0.4",
-                        "  asr: 0.3",
+                        "  caption: 0.3",
                         "text_index:",
                         "  path: custom/index.json",
                         "  default_top_k: 7",
@@ -202,7 +199,7 @@ class Phase2RetrievalTest(unittest.TestCase):
             config = load_retrieval_runtime_config(path)
 
             self.assertEqual(config.rerank.weights.visual, 0.4)
-            self.assertEqual(config.rerank.weights.asr, 0.3)
+            self.assertEqual(config.rerank.weights.caption, 0.3)
             self.assertEqual(config.text_index.path, Path("custom/index.json"))
             self.assertEqual(config.text_index.default_top_k, 7)
 
@@ -346,6 +343,78 @@ class Phase2RetrievalTest(unittest.TestCase):
                 config.text_index.path,
                 Path("data/index # current.json"),
             )
+
+    def test_runtime_config_loads_and_validates_trake_section_and_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "retrieval.yaml"
+            path.write_text(
+                "\n".join(
+                    [
+                        "trake:",
+                        "  event_top_k: 321",
+                        "  top_videos: 25",
+                        "  max_candidates_per_event_per_video: 19",
+                        "  max_candidates_per_shot: 3",
+                        "  score_normalization: percentile",
+                        "  context_weight: 0.2",
+                        "  coverage_weight: 0.5",
+                        "  event_support_weight: 0.3",
+                        "  alignment_method: dp",
+                        "  beam_width: 150",
+                        "  k_best_paths_per_video: 8",
+                        "  gap_penalty: linear",
+                        "  gap_lambda: 0.01",
+                        "  refinement_enabled: false",
+                        "  refinement_top_paths: 12",
+                        "  window_before_frames: 0",
+                        "  window_after_frames: 30",
+                        "  dense_stride_frames: 2",
+                        "  local_hypotheses_per_event: 2",
+                        "  max_answers: 75",
+                        "  ranking_cutoffs: [1, 5, 20, 50, 100]",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "RETRIEVAL_TRAKE_TOP_VIDEOS": "27",
+                    "RETRIEVAL_TRAKE_RANKING_CUTOFFS": "1,10,100",
+                },
+                clear=False,
+            ):
+                config = load_retrieval_runtime_config(path).trake
+
+        self.assertEqual(config.event_top_k, 321)
+        self.assertEqual(config.top_videos, 27)
+        self.assertEqual(config.score_normalization, "percentile")
+        self.assertEqual(config.alignment_method, "dp")
+        self.assertEqual(config.gap_penalty, "linear")
+        self.assertFalse(config.refinement_enabled)
+        self.assertEqual(config.window_before_frames, 0)
+        self.assertEqual(config.max_answers, 75)
+        self.assertEqual(config.ranking_cutoffs, (1, 10, 100))
+
+    def test_trake_config_rejects_public_answer_and_cutoff_bounds(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_answers"):
+            TrakeConfig(max_answers=101)
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            TrakeConfig(ranking_cutoffs=(1, 20, 5))
+        with self.assertRaisesRegex(ValueError, "event_top_k"):
+            TrakeConfig(event_top_k=10_001)
+
+        self.assert_invalid_config(
+            "trake:\n  score_normalization: raw",
+            line_number=2,
+            message="trake.score_normalization",
+        )
+        self.assert_invalid_config(
+            "trake:\n  max_answers: 101",
+            line_number=2,
+            message="trake.max_answers",
+        )
 
 
 if __name__ == "__main__":

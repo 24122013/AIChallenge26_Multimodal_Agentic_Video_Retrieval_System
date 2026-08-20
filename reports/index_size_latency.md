@@ -1,5 +1,9 @@
 # Báo cáo index size và latency
 
+> **Historical report:** tài liệu này ghi lại benchmark của kiến trúc cũ có ASR.
+> Runtime hiện tại không có ASR/transcript; không dùng schema/lệnh ASR bên dưới
+> làm hướng dẫn vận hành. Xem `docs/PIPELINE_AUDIT.md` và README gốc.
+
 ## Phạm vi và giả định
 
 Báo cáo này chỉ đánh giá tầng build index và metadata. Không thay đổi query
@@ -136,7 +140,7 @@ Lệnh:
 
 ```powershell
 .\.venv\Scripts\python.exe -m reports.benchmark_indexing_metadata `
-  --output reports/index_size_latency_benchmark.json `
+  --output data/reports/index_size_latency_benchmark.json `
   --videos 4 `
   --frames-per-video 250 `
   --runs 3 `
@@ -174,7 +178,7 @@ cùng capability: phần artifact mới compact nhỏ hơn 76,03%. Không có FA
 artifact thật nên **tổng kích thước vector index trước/sau là N/A**; vector index
 không đổi.
 
-Raw result: `reports/index_size_latency_benchmark.json`.
+Raw result: `data/reports/index_size_latency_benchmark.json`.
 
 ## Trade-off
 

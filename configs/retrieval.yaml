@@ -7,11 +7,10 @@ hybrid:
   max_gap_seconds: 180.0
 
 weights:
-  visual: 0.50
-  caption: 0.15
+  visual: 0.55
+  caption: 0.20
   ocr: 0.10
-  asr: 0.15
-  objects: 0.05
+  objects: 0.10
   temporal: 0.05
 
 dedupe:
@@ -21,3 +20,51 @@ text_index:
   path: data/indexes/retrieval_text_index.json
   default_top_k: 20
   max_top_k: 200
+
+query_expansion:
+  enabled: true
+  max_paraphrases: 2
+  original_weight: 1.0
+  paraphrase_weight: 0.6
+  max_expansion_contribution: 1.0
+  max_query_chars: 512
+  hard_paraphrase_limit: 8
+  model_name: Qwen/Qwen3.5-9B
+  model_revision: c202236
+  timeout_seconds: 120.0
+  max_new_tokens: 384
+  dtype: auto
+  quantization: 4bit
+
+trake:
+  # BGE-M3 is independently opt-in for TRAKE; QA flags never enable it here.
+  bge_dense_enabled: false
+  bge_dense_top_k: 300
+  bge_reranker_enabled: false
+  bge_reranker_top_k: 150
+  retrieval_fusion: rrf
+  rrf_k: 60
+  hybrid_rrf_weight: 1.0
+  bge_rrf_weight: 1.0
+  bge_required: false
+  event_top_k: 300
+  top_videos: 30
+  max_candidates_per_event_per_video: 20
+  max_candidates_per_shot: 2
+  score_normalization: rank
+  context_weight: 0.10
+  coverage_weight: 0.45
+  event_support_weight: 0.45
+  alignment_method: beam
+  beam_width: 200
+  k_best_paths_per_video: 10
+  gap_penalty: log
+  gap_lambda: 0.02
+  refinement_enabled: true
+  refinement_top_paths: 20
+  window_before_frames: 60
+  window_after_frames: 60
+  dense_stride_frames: 1
+  local_hypotheses_per_event: 3
+  max_answers: 100
+  ranking_cutoffs: [1, 5, 20, 50, 100]

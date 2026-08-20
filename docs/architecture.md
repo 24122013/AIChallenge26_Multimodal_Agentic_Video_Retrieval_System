@@ -11,6 +11,7 @@ Hệ thống phải hỗ trợ:
 * OCR Retrieval
 * Object Retrieval
 * Temporal Retrieval
+* TRAKE ordered-sequence retrieval
 * Agentic Retrieval
 
 Người dùng nhập truy vấn tự nhiên.
@@ -21,7 +22,7 @@ Hệ thống sẽ:
 2. Chọn chiến lược tìm kiếm phù hợp.
 3. Truy xuất dữ liệu từ nhiều nguồn.
 4. Hợp nhất kết quả.
-5. Trả về candidate tốt nhất.
+5. Trả về ranked candidates hoặc ranked TRAKE sequence hypotheses.
 
 ---
 
@@ -43,7 +44,8 @@ Retrieval Layer
     ├── Caption Search
     ├── OCR Search
     ├── Object Search
-    └── Temporal Search
+    ├── Temporal Evidence Search
+    └── TRAKE Sequence Pipeline
     │
     ▼
 Index Layer
@@ -76,7 +78,6 @@ Metadata Extraction
     │
     ├── Caption
     ├── OCR
-    ├── ASR
     └── Objects
     │
     ▼
@@ -94,6 +95,12 @@ Output:
 * Embeddings
 * Search Index
 
+Offline keyframes là **technical keyframes**: sparse frames được chọn để lập chỉ
+mục và luôn giữ original zero-based `frame_index`. TRAKE tìm **semantic
+keyframes** thỏa criterion của từng event. Semantic frame có thể được refinement
+trong một local window quanh technical keyframe; kiến trúc không xây dense-frame
+index cho toàn corpus.
+
 ---
 
 # 4. Online Pipeline
@@ -101,26 +108,25 @@ Output:
 Online Pipeline chạy khi người dùng gửi truy vấn.
 
 ```text
-User Query
+User Query + explicit task
     │
     ▼
-Query Understanding
+OnlinePipeline
+    ├── KIS / AVS / temporal / QA
+    │     └── shared planning, retrieval, evidence and reranking
+    └── TRAKE
+          └── event parser -> per-event retrieval -> video gating
+              -> K-best frame alignment -> optional local refinement
+              -> diverse ranked sequence hypotheses
     │
     ▼
-Retrieval Strategy Selection
-    │
-    ▼
-Search Execution
-    │
-    ▼
-Result Fusion
-    │
-    ▼
-Re-ranking
-    │
-    ▼
-Response
+Task-specific response
 ```
+
+`temporal` is the existing QA/evidence-oriented task. `trake` is a separate
+sequence-first task; it is selected explicitly and is not inferred by `auto`.
+Both reuse canonical retrieval artifacts, but they keep different response
+semantics.
 
 ---
 
@@ -134,7 +140,6 @@ Nhiệm vụ:
 
 * Caption Generation
 * OCR Extraction
-* ASR Extraction
 * Object Detection
 
 Output:
@@ -167,10 +172,12 @@ Nhiệm vụ:
 * Object Retrieval
 * Hybrid Retrieval
 * Temporal Retrieval
+* TRAKE Event Retrieval / Video Gating / Alignment / Ranking
 
 Output:
 
-Candidate Results.
+Candidate Results, or same-video ordered TRAKE hypotheses with explicit original
+frame lineage.
 
 ---
 
@@ -250,10 +257,20 @@ Query
  │
  ├── Object Search
  │
- └── Temporal Search
+ ├── Temporal Evidence Search
+ │
+ └── TRAKE (explicit task)
           │
-          ▼
-     Candidate Pool
+          ├── Conservative deterministic event parser
+          ├── Hybrid retrieval once per ordered event
+          ├── Per-event rank normalization + shot diversity
+          ├── Coverage-first candidate-video gating
+          ├── Beam/DP K-best alignment on original frame_index
+          ├── Bounded local refinement or canonical-frame fallback
+          └── Sequence validation, NMS and top-100 diversity
+           │
+           ▼
+      Candidate Pool
           │
           ▼
       Re-ranking
@@ -263,6 +280,23 @@ Query
 ```
 
 Mỗi search engine có thể phát triển độc lập.
+
+TRAKE is orchestrated by `backend/app/services/trake/pipeline.py` and is cached
+with the same corpus generation as the hybrid engine. Every complete hypothesis
+contains exactly N non-negative original frame indexes from one video. Timestamp,
+internal `frame_id`, filename and FAISS row are never converted into a submission
+frame. Missing original-frame lineage is rejected before alignment/ranking.
+
+Alignment has no hard maximum event gap. The configurable `none|linear|log` gap
+penalty is soft; duplicate locations receive an additional soft penalty. Global
+ranking preserves the best raw hypothesis, exact-deduplicates the whole sequence,
+applies near-sequence NMS and distributes a first pass across videos/coarse paths.
+
+Local refinement is an injectable interface over canonical video files. The
+default cached runtime has no semantic `LocalFrameScorer`, so it returns coarse
+canonical frames with a warning. Boundary-aware first-transition/first-leave/
+peak selection is exercised only when a scorer is injected. There is no active
+pose/contact model or VLM verification branch.
 
 ---
 
@@ -316,7 +350,6 @@ Lưu:
 
 * captions
 * OCR
-* ASR
 * objects
 
 ---
@@ -367,6 +400,21 @@ Các metric chính:
 * Human Solve Time
 * Success Rate
 
+## TRAKE
+
+For a prediction with the wrong `video_id`, R-Score is `0`. For the correct
+video and N ordered events:
+
+```text
+R-Score = (1 / N) * sum_j I(frame_id_j in [s_j, e_j])
+```
+
+Intervals are inclusive and `frame_id_j` means original zero-based
+`frame_index`. `R@k` is the best R-Score among the first k hypotheses for
+`k = 1, 5, 20, 50, 100`; Final Score is their arithmetic mean. Diagnostic
+reports also track `Video@1/@5/@20`, per-event hit rate and matched-event ratio.
+Pure validation/metrics live in `backend/app/services/evaluation/trake_metrics.py`.
+
 ---
 
 # 11. Team Responsibilities
@@ -398,8 +446,6 @@ Indexing
 Caption
 
 OCR
-
-ASR
 
 Metadata
 

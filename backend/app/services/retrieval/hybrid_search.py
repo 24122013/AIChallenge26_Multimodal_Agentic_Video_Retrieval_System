@@ -67,12 +67,50 @@ class HybridSearchEngine:
         query: str,
         top_k: int | None = None,
     ) -> VisualSearchResponse:
-        started_at = time.perf_counter()
         bounded_top_k = self._top_k(top_k)
-        visual_response = self.visual_engine.search(
+        return self._search_pool(
             query,
-            top_k=self.config.stage1_top_k,
+            output_top_k=bounded_top_k,
+            visual_top_k=self.config.stage1_top_k,
+            text_top_k=self.config.text_stage1_top_k,
+            merge_pool_size=self.config.rerank_pool_size,
+            allow_wide_visual=False,
         )
+
+    def search_pool(self, query: str, top_k: int) -> VisualSearchResponse:
+        """Return a wider, task-internal pool through the canonical stack."""
+
+        requested = int(top_k)
+        if not 1 <= requested <= 10_000:
+            raise ValueError("internal hybrid candidate pool must be between 1 and 10000")
+        return self._search_pool(
+            query,
+            output_top_k=requested,
+            visual_top_k=max(self.config.stage1_top_k, requested),
+            text_top_k=max(self.config.text_stage1_top_k, requested),
+            merge_pool_size=max(self.config.rerank_pool_size, requested),
+            allow_wide_visual=True,
+        )
+
+    def _search_pool(
+        self,
+        query: str,
+        *,
+        output_top_k: int,
+        visual_top_k: int,
+        text_top_k: int,
+        merge_pool_size: int,
+        allow_wide_visual: bool,
+    ) -> VisualSearchResponse:
+        started_at = time.perf_counter()
+        wide_search = getattr(self.visual_engine, "search_pool", None)
+        if allow_wide_visual and callable(wide_search):
+            visual_response = wide_search(query, top_k=visual_top_k)
+        else:
+            visual_response = self.visual_engine.search(
+                query,
+                top_k=visual_top_k,
+            )
         candidate_groups: list[list[RetrievalResult]] = [
             visual_response.results
         ]
@@ -80,23 +118,23 @@ class HybridSearchEngine:
             candidate_groups.append(
                 engine.search_results(
                     query,
-                    top_k=self.config.text_stage1_top_k,
+                    top_k=text_top_k,
                 )
             )
 
         merged_pool = merge_candidates(
             candidate_groups,
-            top_k=self.config.rerank_pool_size,
+            top_k=merge_pool_size,
             dedupe_same_shot=False,
         )
         results = self.reranker.rerank(
             query=query,
             candidates=merged_pool,
-            top_k=bounded_top_k,
+            top_k=output_top_k,
         )
         return VisualSearchResponse(
             query=query,
-            top_k=bounded_top_k,
+            top_k=output_top_k,
             latency_ms=round((time.perf_counter() - started_at) * 1000, 3),
             results=results,
         )

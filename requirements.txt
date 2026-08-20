@@ -1,18 +1,33 @@
-numpy>=1.26
-opencv-python>=4.9.0
-open-clip-torch>=2.24.0
-faiss-cpu>=1.8.0
-pillow>=10.0.0
-PyYAML>=6.0
-torch>=2.2.0
-torchvision>=0.17.0
-transformers>=4.53.0
-transnetv2-pytorch>=1.0.5
-ffmpeg-python>=0.2.0
-tqdm>=4.66.0
-fastapi>=0.111.0
-uvicorn[standard]>=0.30.0
-pydantic>=2.7.0
-easyocr>=1.7.2
-ultralytics>=8.3.0
-faster-whisper>=1.1.0
+# Canonical Python dependencies for backend runtime, scripts, and tests.
+# Install exactly one compatible PyTorch profile and exactly one PaddlePaddle
+# profile first; see README.md. They are intentionally absent here so pip cannot
+# replace CPU/CUDA wheels with a conflicting build.
+
+# Shared numeric, image, retrieval, and configuration runtime.
+numpy>=1.26,<3
+opencv-python>=4.9,<5
+pillow>=10,<13
+PyYAML>=6,<7
+python-dotenv>=1,<2
+faiss-cpu>=1.8,<2
+tqdm>=4.66,<5
+
+# GPU/model-specific runtime (also supports CPU inference where the library does).
+open-clip-torch>=2.24,<4
+transformers>=5.2,<6
+accelerate>=1.2,<2
+bitsandbytes>=0.45,<1; platform_system != "Darwin"
+transnetv2-pytorch>=1.0.5,<2
+paddleocr>=3.3,<4
+ultralytics>=8.4,<9
+
+# Backend router modules. The repository currently has no FastAPI application
+# entrypoint, but these packages keep the implemented APIRouter modules importable.
+fastapi>=0.111,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.7,<3
+
+# Development, test, and report scripts. Tests remain unittest-compatible and
+# are also collected by pytest for the documented repository-level command.
+pytest>=8,<10
+python-docx>=1.1,<2

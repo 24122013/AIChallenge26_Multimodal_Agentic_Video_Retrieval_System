@@ -57,8 +57,26 @@ class FrameRecord:
     # text indexes can still provide them as independent candidate sources.
     caption: str = ""
     ocr_text: str = ""
-    asr_text: str = ""
     objects: list[str] = field(default_factory=list)
+
+    # Phase 4 keyframe-selection provenance propagated from the FAISS frame map.
+    candidate_id: str = ""
+    candidate_index: int | None = None
+    candidate_reasons: list[str] = field(default_factory=list)
+    keyframe_strategy: str = ""
+    selection_phase: str = ""
+    selection_rank: int | None = None
+    selection_reasons: list[str] = field(default_factory=list)
+    covered_event_ids: list[str] = field(default_factory=list)
+    selection_score: float | None = None
+    protected: bool = False
+    coverage_added: bool = False
+    importance_score: float | None = None
+    semantic_novelty: float | None = None
+    component_scores: dict[str, float] = field(default_factory=dict)
+    available_modalities: list[str] = field(default_factory=list)
+    protected_event_ids: list[str] = field(default_factory=list)
+    selection_provenance: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.thumbnail_path:
@@ -92,12 +110,24 @@ class FrameRecord:
             ),
             caption=str(data.get("caption") or data.get("segment_caption") or ""),
             ocr_text=str(data.get("ocr_text") or _joined_text(data.get("ocr"))),
-            asr_text=str(
-                data.get("asr_text")
-                or data.get("transcript_text")
-                or _joined_text(data.get("asr"))
-            ),
             objects=_object_labels(data.get("objects") or data.get("object_classes")),
+            candidate_id=str(data.get("candidate_id") or ""),
+            candidate_index=_optional_int(data.get("candidate_index")),
+            candidate_reasons=_string_list(data.get("candidate_reasons")),
+            keyframe_strategy=str(data.get("keyframe_strategy") or ""),
+            selection_phase=str(data.get("selection_phase") or ""),
+            selection_rank=_optional_int(data.get("selection_rank")),
+            selection_reasons=_string_list(data.get("selection_reasons")),
+            covered_event_ids=_string_list(data.get("covered_event_ids")),
+            selection_score=_optional_float(data.get("selection_score")),
+            protected=_bool_value(data.get("protected")),
+            coverage_added=_bool_value(data.get("coverage_added")),
+            importance_score=_optional_float(data.get("importance_score")),
+            semantic_novelty=_optional_float(data.get("semantic_novelty")),
+            component_scores=_float_mapping(data.get("component_scores")),
+            available_modalities=_string_list(data.get("available_modalities")),
+            protected_event_ids=_string_list(data.get("protected_event_ids")),
+            selection_provenance=_object_mapping(data.get("selection_provenance")),
         )
 
     def to_dict(self) -> dict:
@@ -123,8 +153,24 @@ class FrameRecord:
             "vector_dim": self.vector_dim,
             "caption": self.caption,
             "ocr_text": self.ocr_text,
-            "asr_text": self.asr_text,
             "objects": list(self.objects),
+            "candidate_id": self.candidate_id,
+            "candidate_index": self.candidate_index,
+            "candidate_reasons": list(self.candidate_reasons),
+            "keyframe_strategy": self.keyframe_strategy,
+            "selection_phase": self.selection_phase,
+            "selection_rank": self.selection_rank,
+            "selection_reasons": list(self.selection_reasons),
+            "covered_event_ids": list(self.covered_event_ids),
+            "selection_score": self.selection_score,
+            "protected": self.protected,
+            "coverage_added": self.coverage_added,
+            "importance_score": self.importance_score,
+            "semantic_novelty": self.semantic_novelty,
+            "component_scores": dict(self.component_scores),
+            "available_modalities": list(self.available_modalities),
+            "protected_event_ids": list(self.protected_event_ids),
+            "selection_provenance": dict(self.selection_provenance),
         }
 
 
@@ -140,6 +186,38 @@ def _optional_int(value: object) -> int | None:
     return int(value)
 
 
+def _string_list(value: object) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, (list, tuple)):
+        return [str(value)]
+    return [str(item) for item in value if item is not None and str(item)]
+
+
+def _float_mapping(value: object) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, float] = {}
+    for key, raw_score in value.items():
+        try:
+            result[str(key)] = float(raw_score)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _object_mapping(value: object) -> dict[str, object]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _bool_value(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes"}
+    return bool(value)
+
+
 def _joined_text(value: object) -> str:
     if not value:
         return ""
@@ -150,7 +228,7 @@ def _joined_text(value: object) -> str:
     parts: list[str] = []
     for item in value:
         if isinstance(item, dict):
-            text = item.get("text") or item.get("transcript_text") or item.get("ocr_text")
+            text = item.get("text") or item.get("ocr_text")
             if text:
                 parts.append(str(text))
         elif item:

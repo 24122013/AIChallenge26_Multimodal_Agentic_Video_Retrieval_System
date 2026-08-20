@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react';
 import type { VideoScene } from '../types';
+import { API_PROXY } from '../constants/proxy';
 
 function useVideo(displayedResults: VideoScene[]) {
   const [activeVideo, setActiveVideo] = useState<VideoScene | null>(null);
@@ -7,7 +8,7 @@ function useVideo(displayedResults: VideoScene[]) {
   const [lastSelectedScene, setLastSelectedScene] = useState<VideoScene | null>(null);
 
   const handleSelectResultVideo = useCallback((scene: VideoScene) => {
-      setActiveVideo({ ...scene, video_url: `/api/video/stream/${scene.video_id}` });
+      setActiveVideo({ ...scene, video_url: `${API_PROXY}/video/stream/${scene.video_id}` });
       setLastSelectedScene(scene);
       setNeighborFrames([
         { time: Math.max(0, scene.timestamp - 2), label: '-2s Context' },

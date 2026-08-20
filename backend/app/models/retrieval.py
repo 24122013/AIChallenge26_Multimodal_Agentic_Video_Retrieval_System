@@ -42,7 +42,6 @@ class RetrievalResult:
     timestamp_confidence: float = 0.0
     caption: str = ""
     ocr_text: str = ""
-    asr_text: str = ""
     objects: list[str] = field(default_factory=list)
     modality_scores: dict[str, float] = field(default_factory=dict)
     neighbors: list[NeighborFrame] = field(default_factory=list)
@@ -64,66 +63,15 @@ class VisualSearchResponse:
     top_k: int
     latency_ms: float
     results: list[RetrievalResult]
+    trace: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "query": self.query,
             "top_k": self.top_k,
             "latency_ms": self.latency_ms,
             "results": [result.to_dict() for result in self.results],
         }
-    
-    @classmethod
-    def from_dict(cls, data: dict) -> VisualSearchResponse:
-        return cls(
-            query = data.get("query"),
-            top_k = data.get("top_k"),
-            latency_ms = data.get("latency_ms"),
-            results = data.get("results"),
-        )
-    
-@dataclass(frozen=True)
-class QASearchResponse:
-    question: str
-    answer_target: str
-    retrieval_queries: list[str]
-    top_k: int
-    answer_mode: str
-    evidence_count: int
-    results: list[RetrievalResult]
-
-    def to_dict(self) -> dict:
-        return {
-            "question": self.question,
-            "answer_target": self.answer_target,
-            "retrieval_queries": self.retrieval_queries,
-            "top_k": self.top_k,
-            "answer_mode": self.answer_mode,
-            "evidence_count": self.evidence_count,
-            "results": [result.to_dict() for result in self.results],
-        }
-    
-    @classmethod
-    def from_dict(cls, data: dict) -> QASearchResponse:
-        return cls(
-            question=data.get("question"),
-            answer_target=data.get("answer_target"),
-            retrieval_queries=data.get("retrieval_queries"),
-            top_k=data.get("top_k"),
-            answer_mode=data.get("answer_mode"),
-            evidence_count=data.get("evidence_count"),
-            results=data.get("results"),
-        )
-
-@dataclass(frozen=True)
-class APIResponse(Generic[T]):
-    data: T
-    success: bool = True
-    message: str | None = None
-
-    def to_dict(self) -> dict:
-        return {
-            "success": self.success,
-            "message": self.message,
-            "data": self.data,
-        }
+        if self.trace:
+            payload["trace"] = self.trace
+        return payload

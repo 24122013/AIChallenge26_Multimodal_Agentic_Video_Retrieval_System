@@ -228,6 +228,11 @@ def validate_embedding_source(
 
     source_contract: dict | None = None
     for offset, record in enumerate(records):
+        if str(record.get("video_id") or "") != video_id:
+            raise ValueError(
+                f"video_id mismatch in {metadata_path} record {offset}: "
+                f"expected {video_id!r}, got {record.get('video_id')!r}"
+            )
         if record.get("embedding_index") != offset:
             raise ValueError(
                 f"embedding_index mismatch in {metadata_path} record {offset}: "
@@ -295,7 +300,7 @@ def validate_global_contract(
 
 
 def frame_map_record(record: dict) -> dict:
-    return {
+    value = {
         "frame_id": record.get("frame_id"),
         "video_id": record.get("video_id"),
         "shot_id": record.get("shot_id", ""),
@@ -318,6 +323,28 @@ def frame_map_record(record: dict) -> dict:
         "model_revision": record.get("model_revision"),
         "vector_dim": record.get("vector_dim"),
     }
+    for field in (
+        "candidate_index",
+        "candidate_id",
+        "candidate_reasons",
+        "keyframe_strategy",
+        "selection_phase",
+        "selection_rank",
+        "selection_reasons",
+        "covered_event_ids",
+        "selection_score",
+        "protected",
+        "coverage_added",
+        "importance_score",
+        "semantic_novelty",
+        "component_scores",
+        "available_modalities",
+        "protected_event_ids",
+        "selection_provenance",
+    ):
+        if field in record:
+            value[field] = record[field]
+    return value
 
 
 def build_faiss_artifacts(

@@ -4,17 +4,17 @@
 __pycache__/
 *.py[cod]
 .env
-data/raw/video/
-data/raw/*.zip
-data/**/*.jpg
-data/**/*.jpeg
-data/**/*.png
-data/embeddings/
-data/indexes/
-data/model_cache/
-data/smoke/
-data/keyframes/*
-!data/keyframes/.gitkeep
-data/keyframes_*/
-data/metadata/*
-!data/metadata/.gitkeep
+
+# Ultralytics may materialize these official YOLOE assets in the process cwd.
+# The ingestion backend uses data/model_cache, but keep old/new library
+# versions from invalidating immutable-run Git fingerprints.
+/yoloe-*.pt
+/mobileclip*.ts
+
+# Local datasets and generated runtime artifacts. Keep only documentation and
+# directory placeholders under version control; this also covers new offline
+# workspaces such as candidates/, candidate_features/, and dense_keyframes/.
+/data/**
+!/data/**/
+!/data/README.md
+!/data/**/.gitkeep

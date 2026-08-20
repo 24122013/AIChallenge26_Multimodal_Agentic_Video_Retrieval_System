@@ -8,13 +8,22 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import load_dotenv
 from yaml.nodes import MappingNode, Node, ScalarNode
 
 from backend.app.services.retrieval.hybrid_search import HybridSearchConfig
 from backend.app.services.retrieval.rerank import RerankConfig, RerankWeights
+from backend.app.services.agent.query_expansion import QueryExpansionConfig
 
 
 DEFAULT_RETRIEVAL_CONFIG_PATH = Path("configs/retrieval.yaml")
+DEFAULT_ENV_PATH = Path(__file__).resolve().parents[4] / ".env"
+
+
+def load_project_env() -> bool:
+    """Load the repository-local .env without overriding process variables."""
+
+    return load_dotenv(DEFAULT_ENV_PATH, override=False)
 
 _CONFIG_SCHEMA = {
     "hybrid": {
@@ -29,7 +38,6 @@ _CONFIG_SCHEMA = {
         "visual": "non-negative number",
         "caption": "non-negative number",
         "ocr": "non-negative number",
-        "asr": "non-negative number",
         "objects": "non-negative number",
         "temporal": "non-negative number",
     },
@@ -41,11 +49,78 @@ _CONFIG_SCHEMA = {
         "default_top_k": "positive integer",
         "max_top_k": "positive integer",
     },
+    "query_expansion": {
+        "enabled": "boolean",
+        "max_paraphrases": "non-negative integer",
+        "original_weight": "non-negative number",
+        "paraphrase_weight": "non-negative number",
+        "max_expansion_contribution": "positive number",
+        "max_query_chars": "positive integer",
+        "hard_paraphrase_limit": "positive integer",
+        "model_name": "non-empty string",
+        "model_revision": "non-empty string",
+        "timeout_seconds": "positive number",
+        "max_new_tokens": "positive integer",
+        "dtype": "non-empty string",
+        "quantization": "non-empty string",
+    },
+    "trake": {
+        "bge_dense_enabled": "boolean",
+        "bge_dense_top_k": "positive integer",
+        "bge_reranker_enabled": "boolean",
+        "bge_reranker_top_k": "positive integer",
+        "retrieval_fusion": "rrf string",
+        "rrf_k": "positive integer",
+        "hybrid_rrf_weight": "non-negative number",
+        "bge_rrf_weight": "non-negative number",
+        "bge_required": "boolean",
+        "event_top_k": "positive integer",
+        "top_videos": "positive integer",
+        "max_candidates_per_event_per_video": "positive integer",
+        "max_candidates_per_shot": "positive integer",
+        "score_normalization": "rank or percentile string",
+        "context_weight": "non-negative number",
+        "coverage_weight": "non-negative number",
+        "event_support_weight": "non-negative number",
+        "alignment_method": "beam or dp string",
+        "beam_width": "positive integer",
+        "k_best_paths_per_video": "positive integer",
+        "gap_penalty": "none, linear, or log string",
+        "gap_lambda": "non-negative number",
+        "refinement_enabled": "boolean",
+        "refinement_top_paths": "positive integer",
+        "window_before_frames": "non-negative integer",
+        "window_after_frames": "non-negative integer",
+        "dense_stride_frames": "positive integer",
+        "local_hypotheses_per_event": "positive integer",
+        "max_answers": "integer from 1 to 100",
+        "ranking_cutoffs": "strictly increasing cutoff list up to 100",
+    },
 }
 
 
 class RetrievalConfigError(ValueError):
     """Raised for invalid YAML syntax or an invalid Retrieval config schema."""
+
+
+def _validate_positive_int(name: str, value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"trake.{name} must be a positive integer")
+
+
+def _validate_non_negative_int(name: str, value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"trake.{name} must be a non-negative integer")
+
+
+def _validate_non_negative_number(name: str, value: Any) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(f"trake.{name} must be a non-negative finite number")
 
 
 @dataclass(frozen=True)
@@ -56,10 +131,153 @@ class TextIndexConfig:
 
 
 @dataclass(frozen=True)
+class TrakeConfig:
+    """Validated runtime controls for public TRAKE sequence retrieval."""
+
+    bge_dense_enabled: bool = False
+    bge_dense_top_k: int = 300
+    bge_reranker_enabled: bool = False
+    bge_reranker_top_k: int = 150
+    retrieval_fusion: str = "rrf"
+    rrf_k: int = 60
+    hybrid_rrf_weight: float = 1.0
+    bge_rrf_weight: float = 1.0
+    bge_required: bool = False
+    event_top_k: int = 300
+    top_videos: int = 30
+    max_candidates_per_event_per_video: int = 20
+    max_candidates_per_shot: int = 2
+    score_normalization: str = "rank"
+    context_weight: float = 0.10
+    coverage_weight: float = 0.45
+    event_support_weight: float = 0.45
+    alignment_method: str = "beam"
+    beam_width: int = 200
+    k_best_paths_per_video: int = 10
+    gap_penalty: str = "log"
+    gap_lambda: float = 0.02
+    refinement_enabled: bool = True
+    refinement_top_paths: int = 20
+    window_before_frames: int = 60
+    window_after_frames: int = 60
+    dense_stride_frames: int = 1
+    local_hypotheses_per_event: int = 3
+    max_answers: int = 100
+    ranking_cutoffs: tuple[int, ...] = (1, 5, 20, 50, 100)
+
+    def __post_init__(self) -> None:
+        positive_fields = (
+            "bge_dense_top_k",
+            "bge_reranker_top_k",
+            "rrf_k",
+            "event_top_k",
+            "top_videos",
+            "max_candidates_per_event_per_video",
+            "max_candidates_per_shot",
+            "beam_width",
+            "k_best_paths_per_video",
+            "refinement_top_paths",
+            "dense_stride_frames",
+            "local_hypotheses_per_event",
+            "max_answers",
+        )
+        for name in positive_fields:
+            _validate_positive_int(name, getattr(self, name))
+        for name in ("bge_dense_top_k", "bge_reranker_top_k", "event_top_k"):
+            if getattr(self, name) > 10_000:
+                raise ValueError(f"trake.{name} must not exceed 10000")
+        for name in ("window_before_frames", "window_after_frames"):
+            _validate_non_negative_int(name, getattr(self, name))
+        if self.max_answers > 100:
+            raise ValueError("trake.max_answers must be between 1 and 100")
+
+        for name in (
+            "context_weight",
+            "coverage_weight",
+            "event_support_weight",
+            "gap_lambda",
+            "hybrid_rrf_weight",
+            "bge_rrf_weight",
+        ):
+            _validate_non_negative_number(name, getattr(self, name))
+        if self.context_weight + self.coverage_weight + self.event_support_weight <= 0:
+            raise ValueError("trake video scoring weights must include a positive value")
+        if self.hybrid_rrf_weight + self.bge_rrf_weight <= 0:
+            raise ValueError("trake RRF weights must include a positive value")
+        if self.hybrid_rrf_weight <= 0 and not self.bge_dense_enabled:
+            raise ValueError(
+                "trake.hybrid_rrf_weight must be positive when BGE dense is disabled"
+            )
+        if self.bge_dense_enabled and self.bge_rrf_weight <= 0:
+            raise ValueError(
+                "trake.bge_rrf_weight must be positive when BGE dense is enabled"
+            )
+
+        retrieval_fusion = str(self.retrieval_fusion).casefold().strip()
+        if retrieval_fusion != "rrf":
+            raise ValueError("trake.retrieval_fusion must be rrf")
+        object.__setattr__(self, "retrieval_fusion", retrieval_fusion)
+
+        score_normalization = str(self.score_normalization).casefold().strip()
+        if score_normalization not in {"rank", "percentile"}:
+            raise ValueError(
+                "trake.score_normalization must be one of: rank, percentile"
+            )
+        object.__setattr__(self, "score_normalization", score_normalization)
+
+        alignment_method = str(self.alignment_method).casefold().strip()
+        if alignment_method not in {"beam", "dp"}:
+            raise ValueError("trake.alignment_method must be one of: beam, dp")
+        object.__setattr__(self, "alignment_method", alignment_method)
+
+        gap_penalty = str(self.gap_penalty).casefold().strip()
+        if gap_penalty not in {"none", "linear", "log"}:
+            raise ValueError("trake.gap_penalty must be one of: none, linear, log")
+        object.__setattr__(self, "gap_penalty", gap_penalty)
+
+        for name in (
+            "bge_dense_enabled",
+            "bge_reranker_enabled",
+            "bge_required",
+            "refinement_enabled",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"trake.{name} must be a boolean")
+        if self.bge_required and not (
+            self.bge_dense_enabled or self.bge_reranker_enabled
+        ):
+            raise ValueError(
+                "trake.bge_required requires bge_dense_enabled or "
+                "bge_reranker_enabled"
+            )
+        if isinstance(self.ranking_cutoffs, (str, bytes)):
+            raise ValueError("trake.ranking_cutoffs must be a positive integer list")
+        try:
+            cutoffs = tuple(self.ranking_cutoffs)
+        except TypeError as exc:
+            raise ValueError(
+                "trake.ranking_cutoffs must be a positive integer list"
+            ) from exc
+        if not cutoffs:
+            raise ValueError("trake.ranking_cutoffs must not be empty")
+        for cutoff in cutoffs:
+            _validate_positive_int("ranking_cutoffs item", cutoff)
+            if cutoff > 100:
+                raise ValueError("trake.ranking_cutoffs values must not exceed 100")
+        if tuple(sorted(set(cutoffs))) != cutoffs:
+            raise ValueError(
+                "trake.ranking_cutoffs must be unique and strictly increasing"
+            )
+        object.__setattr__(self, "ranking_cutoffs", cutoffs)
+
+
+@dataclass(frozen=True)
 class RetrievalRuntimeConfig:
     hybrid: HybridSearchConfig = HybridSearchConfig()
     rerank: RerankConfig = RerankConfig()
     text_index: TextIndexConfig = TextIndexConfig()
+    query_expansion: QueryExpansionConfig = QueryExpansionConfig()
+    trake: TrakeConfig = TrakeConfig()
 
 
 def load_retrieval_runtime_config(
@@ -75,6 +293,8 @@ def load_retrieval_runtime_config(
     weights_raw = _section(raw, "weights")
     dedupe_raw = _section(raw, "dedupe")
     text_raw = _section(raw, "text_index")
+    expansion_raw = _section(raw, "query_expansion")
+    trake_raw = _section(raw, "trake")
 
     hybrid = HybridSearchConfig(
         stage1_top_k=_int_env(
@@ -124,11 +344,6 @@ def load_retrieval_runtime_config(
             weights_raw.get("ocr"),
             RerankWeights.ocr,
         ),
-        asr=_float_env(
-            "RETRIEVAL_WEIGHT_ASR",
-            weights_raw.get("asr"),
-            RerankWeights.asr,
-        ),
         objects=_float_env(
             "RETRIEVAL_WEIGHT_OBJECTS",
             weights_raw.get("objects"),
@@ -157,6 +372,225 @@ def load_retrieval_runtime_config(
             TextIndexConfig.max_top_k,
         ),
     )
+    query_expansion = QueryExpansionConfig(
+        enabled=_bool_env(
+            "RETRIEVAL_QUERY_EXPANSION_ENABLED",
+            expansion_raw.get("enabled"),
+            QueryExpansionConfig.enabled,
+        ),
+        max_paraphrases=_non_negative_int_env(
+            "RETRIEVAL_QUERY_EXPANSION_MAX_PARAPHRASES",
+            expansion_raw.get("max_paraphrases"),
+            QueryExpansionConfig.max_paraphrases,
+        ),
+        original_weight=_float_env(
+            "RETRIEVAL_QUERY_EXPANSION_ORIGINAL_WEIGHT",
+            expansion_raw.get("original_weight"),
+            QueryExpansionConfig.original_weight,
+        ),
+        paraphrase_weight=_float_env(
+            "RETRIEVAL_QUERY_EXPANSION_PARAPHRASE_WEIGHT",
+            expansion_raw.get("paraphrase_weight"),
+            QueryExpansionConfig.paraphrase_weight,
+        ),
+        max_expansion_contribution=_float_env(
+            "RETRIEVAL_QUERY_EXPANSION_MAX_CONTRIBUTION",
+            expansion_raw.get("max_expansion_contribution"),
+            QueryExpansionConfig.max_expansion_contribution,
+        ),
+        max_query_chars=_int_env(
+            "RETRIEVAL_QUERY_EXPANSION_MAX_QUERY_CHARS",
+            expansion_raw.get("max_query_chars"),
+            QueryExpansionConfig.max_query_chars,
+        ),
+        hard_paraphrase_limit=_int_env(
+            "RETRIEVAL_QUERY_EXPANSION_HARD_LIMIT",
+            expansion_raw.get("hard_paraphrase_limit"),
+            QueryExpansionConfig.hard_paraphrase_limit,
+        ),
+        model_name=str(
+            os.getenv("RETRIEVAL_QUERY_EXPANSION_MODEL_NAME")
+            or expansion_raw.get("model_name")
+            or QueryExpansionConfig.model_name
+        ),
+        model_revision=str(
+            os.getenv("RETRIEVAL_QUERY_EXPANSION_MODEL_REVISION")
+            or expansion_raw.get("model_revision")
+            or QueryExpansionConfig.model_revision
+        ),
+        timeout_seconds=_float_env(
+            "RETRIEVAL_QUERY_EXPANSION_TIMEOUT_SECONDS",
+            expansion_raw.get("timeout_seconds"),
+            QueryExpansionConfig.timeout_seconds,
+        ),
+        max_new_tokens=_int_env(
+            "RETRIEVAL_QUERY_EXPANSION_MAX_NEW_TOKENS",
+            expansion_raw.get("max_new_tokens"),
+            QueryExpansionConfig.max_new_tokens,
+        ),
+        dtype=str(
+            os.getenv("RETRIEVAL_QUERY_EXPANSION_DTYPE")
+            or expansion_raw.get("dtype")
+            or QueryExpansionConfig.dtype
+        ),
+        quantization=str(
+            os.getenv("RETRIEVAL_QUERY_EXPANSION_QUANTIZATION")
+            or expansion_raw.get("quantization")
+            or QueryExpansionConfig.quantization
+        ),
+    )
+    trake = TrakeConfig(
+        bge_dense_enabled=_bool_env(
+            "RETRIEVAL_TRAKE_BGE_DENSE_ENABLED",
+            trake_raw.get("bge_dense_enabled"),
+            TrakeConfig.bge_dense_enabled,
+        ),
+        bge_dense_top_k=_int_env(
+            "RETRIEVAL_TRAKE_BGE_DENSE_TOP_K",
+            trake_raw.get("bge_dense_top_k"),
+            TrakeConfig.bge_dense_top_k,
+        ),
+        bge_reranker_enabled=_bool_env(
+            "RETRIEVAL_TRAKE_BGE_RERANKER_ENABLED",
+            trake_raw.get("bge_reranker_enabled"),
+            TrakeConfig.bge_reranker_enabled,
+        ),
+        bge_reranker_top_k=_int_env(
+            "RETRIEVAL_TRAKE_BGE_RERANKER_TOP_K",
+            trake_raw.get("bge_reranker_top_k"),
+            TrakeConfig.bge_reranker_top_k,
+        ),
+        retrieval_fusion=_string_env(
+            "RETRIEVAL_TRAKE_RETRIEVAL_FUSION",
+            trake_raw.get("retrieval_fusion"),
+            TrakeConfig.retrieval_fusion,
+        ),
+        rrf_k=_int_env(
+            "RETRIEVAL_TRAKE_RRF_K",
+            trake_raw.get("rrf_k"),
+            TrakeConfig.rrf_k,
+        ),
+        hybrid_rrf_weight=_float_env(
+            "RETRIEVAL_TRAKE_HYBRID_RRF_WEIGHT",
+            trake_raw.get("hybrid_rrf_weight"),
+            TrakeConfig.hybrid_rrf_weight,
+        ),
+        bge_rrf_weight=_float_env(
+            "RETRIEVAL_TRAKE_BGE_RRF_WEIGHT",
+            trake_raw.get("bge_rrf_weight"),
+            TrakeConfig.bge_rrf_weight,
+        ),
+        bge_required=_bool_env(
+            "RETRIEVAL_TRAKE_BGE_REQUIRED",
+            trake_raw.get("bge_required"),
+            TrakeConfig.bge_required,
+        ),
+        event_top_k=_int_env(
+            "RETRIEVAL_TRAKE_EVENT_TOP_K",
+            trake_raw.get("event_top_k"),
+            TrakeConfig.event_top_k,
+        ),
+        top_videos=_int_env(
+            "RETRIEVAL_TRAKE_TOP_VIDEOS",
+            trake_raw.get("top_videos"),
+            TrakeConfig.top_videos,
+        ),
+        max_candidates_per_event_per_video=_int_env(
+            "RETRIEVAL_TRAKE_MAX_CANDIDATES_PER_EVENT_PER_VIDEO",
+            trake_raw.get("max_candidates_per_event_per_video"),
+            TrakeConfig.max_candidates_per_event_per_video,
+        ),
+        max_candidates_per_shot=_int_env(
+            "RETRIEVAL_TRAKE_MAX_CANDIDATES_PER_SHOT",
+            trake_raw.get("max_candidates_per_shot"),
+            TrakeConfig.max_candidates_per_shot,
+        ),
+        score_normalization=_string_env(
+            "RETRIEVAL_TRAKE_SCORE_NORMALIZATION",
+            trake_raw.get("score_normalization"),
+            TrakeConfig.score_normalization,
+        ),
+        context_weight=_float_env(
+            "RETRIEVAL_TRAKE_CONTEXT_WEIGHT",
+            trake_raw.get("context_weight"),
+            TrakeConfig.context_weight,
+        ),
+        coverage_weight=_float_env(
+            "RETRIEVAL_TRAKE_COVERAGE_WEIGHT",
+            trake_raw.get("coverage_weight"),
+            TrakeConfig.coverage_weight,
+        ),
+        event_support_weight=_float_env(
+            "RETRIEVAL_TRAKE_EVENT_SUPPORT_WEIGHT",
+            trake_raw.get("event_support_weight"),
+            TrakeConfig.event_support_weight,
+        ),
+        alignment_method=_string_env(
+            "RETRIEVAL_TRAKE_ALIGNMENT_METHOD",
+            trake_raw.get("alignment_method"),
+            TrakeConfig.alignment_method,
+        ),
+        beam_width=_int_env(
+            "RETRIEVAL_TRAKE_BEAM_WIDTH",
+            trake_raw.get("beam_width"),
+            TrakeConfig.beam_width,
+        ),
+        k_best_paths_per_video=_int_env(
+            "RETRIEVAL_TRAKE_K_BEST_PATHS_PER_VIDEO",
+            trake_raw.get("k_best_paths_per_video"),
+            TrakeConfig.k_best_paths_per_video,
+        ),
+        gap_penalty=_string_env(
+            "RETRIEVAL_TRAKE_GAP_PENALTY",
+            trake_raw.get("gap_penalty"),
+            TrakeConfig.gap_penalty,
+        ),
+        gap_lambda=_float_env(
+            "RETRIEVAL_TRAKE_GAP_LAMBDA",
+            trake_raw.get("gap_lambda"),
+            TrakeConfig.gap_lambda,
+        ),
+        refinement_enabled=_bool_env(
+            "RETRIEVAL_TRAKE_REFINEMENT_ENABLED",
+            trake_raw.get("refinement_enabled"),
+            TrakeConfig.refinement_enabled,
+        ),
+        refinement_top_paths=_int_env(
+            "RETRIEVAL_TRAKE_REFINEMENT_TOP_PATHS",
+            trake_raw.get("refinement_top_paths"),
+            TrakeConfig.refinement_top_paths,
+        ),
+        window_before_frames=_non_negative_int_env(
+            "RETRIEVAL_TRAKE_WINDOW_BEFORE_FRAMES",
+            trake_raw.get("window_before_frames"),
+            TrakeConfig.window_before_frames,
+        ),
+        window_after_frames=_non_negative_int_env(
+            "RETRIEVAL_TRAKE_WINDOW_AFTER_FRAMES",
+            trake_raw.get("window_after_frames"),
+            TrakeConfig.window_after_frames,
+        ),
+        dense_stride_frames=_int_env(
+            "RETRIEVAL_TRAKE_DENSE_STRIDE_FRAMES",
+            trake_raw.get("dense_stride_frames"),
+            TrakeConfig.dense_stride_frames,
+        ),
+        local_hypotheses_per_event=_int_env(
+            "RETRIEVAL_TRAKE_LOCAL_HYPOTHESES_PER_EVENT",
+            trake_raw.get("local_hypotheses_per_event"),
+            TrakeConfig.local_hypotheses_per_event,
+        ),
+        max_answers=_int_env(
+            "RETRIEVAL_TRAKE_MAX_ANSWERS",
+            trake_raw.get("max_answers"),
+            TrakeConfig.max_answers,
+        ),
+        ranking_cutoffs=_int_tuple_env(
+            "RETRIEVAL_TRAKE_RANKING_CUTOFFS",
+            trake_raw.get("ranking_cutoffs"),
+            TrakeConfig.ranking_cutoffs,
+        ),
+    )
     return RetrievalRuntimeConfig(
         hybrid=hybrid,
         rerank=RerankConfig(
@@ -168,6 +602,8 @@ def load_retrieval_runtime_config(
             ),
         ),
         text_index=text_index,
+        query_expansion=query_expansion,
+        trake=trake,
     )
 
 
@@ -338,6 +774,8 @@ def _matches_expected_type(value: Any, expected: str) -> bool:
     )
     if expected == "positive integer":
         return not isinstance(value, bool) and isinstance(value, int) and value > 0
+    if expected == "non-negative integer":
+        return not isinstance(value, bool) and isinstance(value, int) and value >= 0
     if expected == "positive number":
         return is_number and value > 0
     if expected == "non-negative number":
@@ -346,6 +784,50 @@ def _matches_expected_type(value: Any, expected: str) -> bool:
         return isinstance(value, bool)
     if expected == "non-empty string":
         return isinstance(value, str) and bool(value.strip())
+    if expected == "rrf string":
+        return isinstance(value, str) and value.casefold().strip() == "rrf"
+    if expected == "positive integer list":
+        return (
+            isinstance(value, list)
+            and bool(value)
+            and all(
+                not isinstance(item, bool)
+                and isinstance(item, int)
+                and item > 0
+                for item in value
+            )
+        )
+    if expected == "rank or percentile string":
+        return isinstance(value, str) and value.casefold().strip() in {
+            "rank",
+            "percentile",
+        }
+    if expected == "beam or dp string":
+        return isinstance(value, str) and value.casefold().strip() in {"beam", "dp"}
+    if expected == "none, linear, or log string":
+        return isinstance(value, str) and value.casefold().strip() in {
+            "none",
+            "linear",
+            "log",
+        }
+    if expected == "integer from 1 to 100":
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and 1 <= value <= 100
+        )
+    if expected == "strictly increasing cutoff list up to 100":
+        return (
+            isinstance(value, list)
+            and bool(value)
+            and all(
+                not isinstance(item, bool)
+                and isinstance(item, int)
+                and 1 <= item <= 100
+                for item in value
+            )
+            and value == sorted(set(value))
+        )
     raise AssertionError(f"Unknown retrieval config schema rule: {expected}")
 
 
@@ -380,6 +862,14 @@ def _float_env(name: str, value: Any, default: float) -> float:
     return float(raw if raw is not None else value if value is not None else default)
 
 
+def _non_negative_int_env(name: str, value: Any, default: int) -> int:
+    raw = os.getenv(name)
+    result = int(raw if raw is not None else value if value is not None else default)
+    if result < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return result
+
+
 def _bool_env(name: str, value: Any, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -390,3 +880,36 @@ def _bool_env(name: str, value: Any, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean value, got {raw!r}")
+
+
+def _string_env(name: str, value: Any, default: str) -> str:
+    raw = os.getenv(name)
+    result = str(raw if raw is not None else value if value is not None else default)
+    if not result.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return result
+
+
+def _int_tuple_env(
+    name: str,
+    value: Any,
+    default: tuple[int, ...],
+) -> tuple[int, ...]:
+    raw = os.getenv(name)
+    if raw is not None:
+        pieces = [piece.strip() for piece in raw.strip().strip("[]").split(",")]
+        if not pieces or any(not piece for piece in pieces):
+            raise ValueError(f"{name} must be a comma-separated integer list")
+        try:
+            return tuple(int(piece) for piece in pieces)
+        except ValueError as exc:
+            raise ValueError(
+                f"{name} must be a comma-separated integer list"
+            ) from exc
+    selected = default if value is None else value
+    if isinstance(selected, (str, bytes)):
+        raise ValueError(f"{name} must be an integer list")
+    try:
+        return tuple(selected)
+    except TypeError as exc:
+        raise ValueError(f"{name} must be an integer list") from exc
