@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import weakref
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, TypeVar, cast
@@ -20,6 +20,10 @@ from backend.app.services.agent.query_expansion import (
     build_production_query_expansion_provider,
 )
 from backend.app.services.retrieval.hybrid_search import HybridSearchEngine
+from backend.app.services.retrieval.dense_candidate_index import (
+    DenseCandidateIndexConfig,
+    FaissDenseCandidateIndex,
+)
 from backend.app.services.retrieval.online_context import (
     DEFAULT_NEIGHBOR_PATH,
     DEFAULT_SEGMENT_PATH,
@@ -549,6 +553,34 @@ def load_visual_search_config() -> VisualSearchConfig:
     )
 
 
+def load_dense_candidate_index_config() -> DenseCandidateIndexConfig:
+    """Resolve the full dense-candidate bundle independently of selected FAISS."""
+
+    defaults = DenseCandidateIndexConfig()
+    return DenseCandidateIndexConfig(
+        index_path=_path_from_env(
+            "RETRIEVAL_DENSE_INDEX_PATH",
+            defaults.index_path,
+        ),
+        metadata_path=_path_from_env(
+            "RETRIEVAL_DENSE_METADATA_PATH",
+            defaults.metadata_path,
+        ),
+        frame_map_path=_path_from_env(
+            "RETRIEVAL_DENSE_FRAME_MAP_PATH",
+            defaults.frame_map_path,
+        ),
+        manifest_path=_path_from_env(
+            "RETRIEVAL_DENSE_MANIFEST_PATH",
+            defaults.manifest_path,
+        ),
+        report_path=_path_from_env(
+            "RETRIEVAL_DENSE_REPORT_PATH",
+            defaults.report_path,
+        ),
+    )
+
+
 @lru_cache(maxsize=1)
 def get_runtime_config() -> RetrievalRuntimeConfig:
     return load_retrieval_runtime_config()
@@ -611,6 +643,92 @@ def get_visual_search_engine(
         str(before.get("bundle_generation")) if before is not None else None
     )
     return engine
+
+
+@_corpus_generation_cached
+def get_dense_candidate_index(
+    corpus_key: _CorpusCacheKey,
+) -> FaissDenseCandidateIndex:
+    """Load and cache the production corpus-wide dense SigLIP2 index."""
+
+    config = load_dense_candidate_index_config()
+    roles = (
+        "dense_index",
+        "dense_metadata",
+        "dense_frame_map",
+        "dense_manifest",
+        "dense_report",
+    )
+    overrides = {
+        "dense_index": config.index_path,
+        "dense_metadata": config.metadata_path,
+        "dense_frame_map": config.frame_map_path,
+        "dense_manifest": config.manifest_path,
+        "dense_report": config.report_path,
+    }
+    # A committed pre-dense corpus is a supported "missing bundle" case for
+    # ``online.dense_missing_behavior=fallback_sparse``.  A partially declared
+    # dense bundle is instead an invalid committed generation and must fail
+    # closed rather than disguise corruption as a legacy fallback.
+    base_manifest = _validate_expected_corpus(corpus_key)
+    if base_manifest is not None:
+        declared = base_manifest.get("artifacts")
+        if not isinstance(declared, Mapping):
+            raise ValueError("Offline corpus manifest has no artifact declarations")
+        declared_dense_roles = tuple(role for role in roles if role in declared)
+        if not declared_dense_roles:
+            raise FileNotFoundError(
+                "Committed corpus does not contain a dense-candidate bundle"
+            )
+        if len(declared_dense_roles) != len(roles):
+            raise ValueError("Committed corpus dense-candidate bundle is incomplete")
+    before = _validate_expected_corpus(
+        corpus_key,
+        required_roles=roles,
+        artifact_overrides=overrides,
+    )
+    dense = FaissDenseCandidateIndex(config)
+    visual = get_visual_search_engine()
+    selected_contract = getattr(visual, "encoder_contract", None)
+    if selected_contract is not None:
+        selected = asdict(selected_contract)
+        dense_contract = dict(dense.encoder_contract)
+        comparable = (
+            "model_family",
+            "model_name",
+            "model_revision",
+            "processor_name",
+            "vector_dim",
+            "normalized",
+            "similarity",
+            "output_dtype",
+        )
+        if any(selected.get(name) != dense_contract.get(name) for name in comparable):
+            raise ValueError(
+                "Dense and selected-keyframe indexes use different encoder contracts"
+            )
+    after = _validate_expected_corpus(
+        corpus_key,
+        required_roles=roles,
+        artifact_overrides=overrides,
+    )
+    if before != after:
+        raise ValueError("Offline corpus changed while dense retrieval was loading")
+    dense.corpus_generation = (
+        str(before.get("bundle_generation")) if before is not None else None
+    )
+    return dense
+
+
+def _get_online_dense_index_for_generation(
+    corpus_key: _CorpusCacheKey,
+) -> FaissDenseCandidateIndex:
+    """Resolve lazily without ever mixing selected and dense generations."""
+
+    dense = get_dense_candidate_index()
+    if getattr(dense, "corpus_generation", None) != corpus_key.bundle_generation:
+        raise ValueError("Cached dense retrieval belongs to another corpus generation")
+    return dense
 
 
 def _text_engine_kwargs(corpus_key: _CorpusCacheKey) -> dict:
@@ -755,10 +873,10 @@ def get_online_context_index(
     frame_map_path = load_visual_search_config().frame_map_path
     required_roles: list[str] = []
     overrides: dict[str, Path] = {}
-    if neighbors_enabled:
+    if neighbors_enabled and neighbor_path.is_file():
         required_roles.append("neighbor_metadata")
         overrides["neighbor_metadata"] = neighbor_path
-    if segments_enabled:
+    if segments_enabled and segment_path.is_file():
         required_roles.append("segment_metadata")
         overrides["segment_metadata"] = segment_path
     before = _validate_expected_corpus(
@@ -770,8 +888,13 @@ def get_online_context_index(
         neighbor_path=neighbor_path,
         segment_path=segment_path,
         frame_map_path=frame_map_path,
-        require_neighbors=neighbors_enabled,
-        require_segments=segments_enabled,
+        load_neighbors=neighbors_enabled,
+        load_segments=segments_enabled,
+        # Context is optional for KIS/AVS. A missing enabled artifact disables
+        # only that evidence source; a present but corrupt/uncommitted artifact
+        # still fails validation above or while parsing here.
+        require_neighbors=False,
+        require_segments=False,
     )
     after = _validate_expected_corpus(
         corpus_key,
@@ -1250,6 +1373,16 @@ def get_trake_pipeline(
         != corpus_key.bundle_generation
     ):
         raise ValueError("Cached TRAKE retrieval belongs to another corpus generation")
+    local_scorer = None
+    if runtime.trake.refinement_enabled:
+        # Reuse the already cached SigLIP2 encoder/model.  This is bounded
+        # local raw-frame scoring, not the corpus-wide dense rescue index and
+        # not a VLM/cross-encoder reranker.
+        from backend.app.services.trake.temporal_refinement import (
+            Siglip2LocalFrameScorer,
+        )
+
+        local_scorer = Siglip2LocalFrameScorer(retrieval_engine.visual_engine.encoder)
     pipeline = TrakePipeline(
         retrieval_engine=retrieval_engine,
         dense_event_engine=dense_event_engine,
@@ -1259,6 +1392,7 @@ def get_trake_pipeline(
             dense_event_engine=dense_event_engine,
             event_reranker=event_reranker,
         ),
+        local_scorer=local_scorer,
         config=runtime.trake,
     )
     if dense_event_engine is not None:
@@ -1318,6 +1452,10 @@ def get_online_pipeline(
         ),
         trake_pipeline=_LazyTrakeSearchPipeline(corpus_key.bundle_generation),
         context_index=context_index,
+        # Resolution is lazy so missing dense artifacts cannot block QA or
+        # TRAKE.  The loader itself is generation-aware and globally cached;
+        # normal KIS/AVS requests never rebuild or reload it per request.
+        dense_index_loader=lambda: _get_online_dense_index_for_generation(corpus_key),
         config=OnlinePipelineConfig(
             include_neighbors=neighbors_enabled,
             include_segments=segments_enabled,
@@ -1405,6 +1543,7 @@ def clear_retrieval_caches() -> None:
         get_qa_search_pipeline,
         get_qa_evidence_search_engine,
         get_online_context_index,
+        get_dense_candidate_index,
         get_hybrid_search_engine,
         get_object_search_engine,
         get_ocr_search_engine,
@@ -1530,6 +1669,7 @@ def search_online(
     *,
     expanded_queries: tuple[str, ...] | list[str] | None = None,
     include_context: bool | None = None,
+    debug: bool | None = None,
 ) -> dict[str, Any]:
     """Run one query through the canonical online orchestration layer."""
 
@@ -1539,4 +1679,5 @@ def search_online(
         top_k=top_k,
         expanded_queries=expanded_queries or (),
         include_context=include_context,
+        debug=debug,
     )

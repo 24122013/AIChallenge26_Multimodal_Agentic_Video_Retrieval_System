@@ -490,6 +490,7 @@ class _EmptyDenseIndex:
     records: list[dict[str, object]] = []
     vectors = np.empty((0, 2), dtype=np.float32)
     rows_by_clip: dict[tuple[str, str], list[int]] = {}
+    row_by_frame: dict[tuple[str, str], int] = {}
 
     def search(self, _query, _top_k):
         return []

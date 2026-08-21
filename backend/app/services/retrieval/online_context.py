@@ -47,6 +47,8 @@ class OnlineContextIndex:
         self._neighbors: dict[tuple[str, str], dict[str, Any]] = {}
         self._segments: dict[tuple[str, str], dict[str, Any]] = {}
         self._segment_by_frame: dict[tuple[str, str], str] = {}
+        self._segment_frame_ids: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._segment_frame_positions: dict[tuple[str, str, str], int] = {}
 
         for raw in neighbor_records:
             record = dict(raw)
@@ -70,10 +72,15 @@ class OnlineContextIndex:
             keyframe_ids = record.get("keyframe_ids") or ()
             if not isinstance(keyframe_ids, (list, tuple)):
                 raise ValueError(f"segment keyframe_ids must be a list: {key}")
-            for raw_frame_id in keyframe_ids:
-                frame_id = str(raw_frame_id).strip()
-                if not frame_id:
-                    continue
+            ordered_frame_ids = tuple(
+                str(raw_frame_id).strip()
+                for raw_frame_id in keyframe_ids
+                if str(raw_frame_id).strip()
+            )
+            if len(set(ordered_frame_ids)) != len(ordered_frame_ids):
+                raise ValueError(f"segment keyframe_ids must be unique: {key}")
+            self._segment_frame_ids[key] = ordered_frame_ids
+            for position, frame_id in enumerate(ordered_frame_ids):
                 frame_key = (video_id, frame_id)
                 existing = self._segment_by_frame.get(frame_key)
                 if existing is not None and existing != segment_id:
@@ -81,6 +88,7 @@ class OnlineContextIndex:
                         f"Canonical frame belongs to multiple segments: {frame_key}"
                     )
                 self._segment_by_frame[frame_key] = segment_id
+                self._segment_frame_positions[(video_id, segment_id, frame_id)] = position
 
     @classmethod
     def from_artifacts(
@@ -89,6 +97,8 @@ class OnlineContextIndex:
         neighbor_path: str | Path = DEFAULT_NEIGHBOR_PATH,
         segment_path: str | Path = DEFAULT_SEGMENT_PATH,
         frame_map_path: str | Path | None = None,
+        load_neighbors: bool = True,
+        load_segments: bool = True,
         require_neighbors: bool = True,
         require_segments: bool = True,
     ) -> "OnlineContextIndex":
@@ -97,15 +107,23 @@ class OnlineContextIndex:
         resolved_neighbors = Path(neighbor_path)
         resolved_segments = Path(segment_path)
         resolved_frame_map = Path(frame_map_path) if frame_map_path is not None else None
-        neighbor_records = _load_jsonl(
-            resolved_neighbors,
-            required=require_neighbors,
-            label="neighbor",
+        neighbor_records = (
+            _load_jsonl(
+                resolved_neighbors,
+                required=require_neighbors,
+                label="neighbor",
+            )
+            if load_neighbors
+            else []
         )
-        segment_records = _load_jsonl(
-            resolved_segments,
-            required=require_segments,
-            label="segment",
+        segment_records = (
+            _load_jsonl(
+                resolved_segments,
+                required=require_segments,
+                label="segment",
+            )
+            if load_segments
+            else []
         )
         metadata_store = None
         if resolved_frame_map is not None and resolved_frame_map.is_file():
@@ -127,8 +145,19 @@ class OnlineContextIndex:
         timestamp: float,
         segment_id: str = "",
         existing_neighbors: Iterable[Mapping[str, Any]] = (),
+        max_neighbors_each_side: int | None = None,
     ) -> ContextLookup:
         """Resolve canonical neighbors and segment context for a candidate."""
+
+        if (
+            max_neighbors_each_side is not None
+            and (
+                isinstance(max_neighbors_each_side, bool)
+                or not isinstance(max_neighbors_each_side, int)
+                or max_neighbors_each_side <= 0
+            )
+        ):
+            raise ValueError("max_neighbors_each_side must be a positive integer")
 
         key = (str(video_id), str(frame_id))
         canonical_segment_id = self._segment_by_frame.get(key, "")
@@ -142,6 +171,7 @@ class OnlineContextIndex:
                 video_id=key[0],
                 center_timestamp=float(timestamp),
                 record=record,
+                max_each_side=max_neighbors_each_side,
             )
             sources.append("neighbors_all")
         neighbors = _dedupe_neighbors(neighbors)
@@ -167,19 +197,73 @@ class OnlineContextIndex:
             "frame_map_path": str(self.frame_map_path) if self.frame_map_path else None,
         }
 
+    def segment_frame_window(
+        self,
+        *,
+        video_id: str,
+        segment_id: str,
+        center_frame_id: str,
+        center_timestamp: float,
+        limit: int,
+    ) -> tuple[str, ...]:
+        """Return a bounded canonical frame window without scanning a segment."""
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("segment frame limit must be a positive integer")
+        key = (str(video_id), str(segment_id))
+        frame_ids = self._segment_frame_ids.get(key, ())
+        if not frame_ids:
+            return ()
+        position = self._segment_frame_positions.get(
+            (key[0], key[1], str(center_frame_id)),
+        )
+        if position is None:
+            segment = self._segments[key]
+            start = float(segment.get("start_time") or 0.0)
+            end = float(segment.get("end_time") or start)
+            if end > start:
+                ratio = min(1.0, max(0.0, (float(center_timestamp) - start) / (end - start)))
+                position = int(round(ratio * (len(frame_ids) - 1)))
+            else:
+                position = len(frame_ids) // 2
+        lower = max(0, position - limit)
+        upper = min(len(frame_ids), position + limit + 1)
+        nearby_positions = sorted(
+            range(lower, upper),
+            key=lambda item: (abs(item - position), item),
+        )
+        center_identity = str(center_frame_id)
+        return tuple(
+            frame_ids[item]
+            for item in nearby_positions
+            if frame_ids[item] != center_identity
+        )[:limit]
+
     def _canonical_neighbors(
         self,
         *,
         video_id: str,
         center_timestamp: float,
         record: Mapping[str, Any],
+        max_each_side: int | None,
     ) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
         for field, direction in (
             ("neighbors_before", "before"),
             ("neighbors_after", "after"),
         ):
-            for reference in record.get(field) or ():
+            references = list(record.get(field) or ())
+            if max_each_side is not None:
+                # The canonical builder emits each side in timestamp order.
+                # The closest preceding values are the tail; the closest
+                # following values are the head.  Slice before hydration so
+                # query-time work stays bounded even for crowded windows.
+                references = (
+                    references[-max_each_side:]
+                    if direction == "before"
+                    else references[:max_each_side]
+                )
+            for reference in references:
                 frame_id = str(reference.get("frame_id") or "")
                 delta = float(reference.get("delta_seconds") or 0.0)
                 payload: dict[str, Any]

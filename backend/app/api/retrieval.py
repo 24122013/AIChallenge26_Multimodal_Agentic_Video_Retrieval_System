@@ -28,6 +28,21 @@ except ImportError:  # pragma: no cover
     Field = None
 
 
+def _online_request_options(
+    *,
+    include_context: bool | None,
+    debug: bool | None,
+) -> dict[str, bool]:
+    """Return only explicit request overrides, preserving runtime defaults."""
+
+    options: dict[str, bool] = {}
+    if include_context is not None:
+        options["include_context"] = include_context
+    if debug is not None:
+        options["debug"] = debug
+    return options
+
+
 if APIRouter is not None:
     router = APIRouter(prefix="/retrieval", tags=["retrieval"])
 
@@ -46,6 +61,8 @@ if APIRouter is not None:
         task: str = "auto"
         top_k: int = Field(default=20, ge=1, le=200)
         expanded_queries: list[str] = Field(default_factory=list, max_length=20)
+        include_context: bool | None = None
+        debug: bool | None = None
 
     class TrakeSearchBody(BaseModel):
         query: str
@@ -59,6 +76,10 @@ if APIRouter is not None:
                 task=body.task,
                 top_k=body.top_k,
                 expanded_queries=body.expanded_queries,
+                **_online_request_options(
+                    include_context=body.include_context,
+                    debug=body.debug,
+                ),
             )
         )
 

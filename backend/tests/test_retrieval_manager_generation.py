@@ -73,6 +73,33 @@ class RetrievalManagerGenerationCacheTest(unittest.TestCase):
         )
         return generation
 
+    def _publish_with_context(
+        self,
+        revision: str,
+        *,
+        neighbor_payload: str,
+    ) -> tuple[str, Path]:
+        self._publish(revision)
+        neighbor_path = self.metadata / "neighbors_all.jsonl"
+        neighbor_path.write_text(neighbor_payload, encoding="utf-8")
+        manifest = json.loads(self.corpus_manifest.read_text(encoding="utf-8"))
+        digest = _sha256(neighbor_path)
+        manifest["artifacts"]["neighbor_metadata"] = {
+            "path": neighbor_path.relative_to(self.root).as_posix(),
+            "sha256": digest,
+        }
+        hashes = {
+            role: str(item["sha256"])
+            for role, item in manifest["artifacts"].items()
+        }
+        generation = retrieval_manager._generation(hashes)
+        manifest["bundle_generation"] = generation
+        self.corpus_manifest.write_text(
+            json.dumps(manifest, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return generation, neighbor_path
+
     def test_visual_factory_refreshes_after_committed_generation_changes(self) -> None:
         generation_1 = self._publish("g1")
         constructed: list[SimpleNamespace] = []
@@ -211,6 +238,190 @@ class RetrievalManagerGenerationCacheTest(unittest.TestCase):
         self.assertIsNone(first.corpus_generation)
         factory.assert_called_once()
 
+    def test_legacy_committed_corpus_reports_dense_bundle_as_missing(self) -> None:
+        self._publish("legacy-without-dense")
+
+        with (
+            mock.patch.dict(os.environ, self.environment, clear=False),
+            self.assertRaisesRegex(FileNotFoundError, "dense-candidate bundle"),
+        ):
+            retrieval_manager.get_dense_candidate_index()
+
+    def test_online_dense_loader_rejects_cross_generation_mix(self) -> None:
+        corpus_key = retrieval_manager._CorpusCacheKey(
+            manifest_path=str(self.corpus_manifest),
+            bundle_generation="expected-generation",
+            manifest_contract_sha256="expected-contract",
+        )
+        wrong = SimpleNamespace(corpus_generation="other-generation")
+
+        with (
+            mock.patch.object(
+                retrieval_manager,
+                "get_dense_candidate_index",
+                return_value=wrong,
+            ),
+            self.assertRaisesRegex(ValueError, "another corpus generation"),
+        ):
+            retrieval_manager._get_online_dense_index_for_generation(corpus_key)
+
+    def test_missing_optional_context_does_not_block_lazy_qa_or_trake(self) -> None:
+        generation = self._publish("without-context")
+        missing_neighbors = self.metadata / "missing-neighbors.jsonl"
+        missing_segments = self.metadata / "missing-segments.jsonl"
+        missing_frame_map = self.metadata / "missing-frame-map.json"
+        environment = {
+            **self.environment,
+            "ONLINE_NEIGHBOR_CONTEXT_ENABLED": "true",
+            "ONLINE_SEGMENT_CONTEXT_ENABLED": "true",
+            "ONLINE_NEIGHBOR_PATH": str(missing_neighbors),
+            "ONLINE_SEGMENT_PATH": str(missing_segments),
+        }
+        runtime = SimpleNamespace(
+            query_expansion=SimpleNamespace(enabled=False),
+            hybrid=SimpleNamespace(max_top_k=200),
+        )
+        qa = SimpleNamespace(
+            corpus_generation=generation,
+            search=mock.Mock(return_value={"task": "qa"}),
+        )
+        trake = SimpleNamespace(
+            corpus_generation=generation,
+            search=mock.Mock(return_value={"task": "trake"}),
+        )
+
+        with (
+            mock.patch.dict(os.environ, environment, clear=False),
+            mock.patch.object(
+                retrieval_manager,
+                "load_visual_search_config",
+                return_value=SimpleNamespace(frame_map_path=missing_frame_map),
+            ),
+            mock.patch.object(
+                retrieval_manager,
+                "get_runtime_config",
+                return_value=runtime,
+            ),
+            mock.patch.object(
+                retrieval_manager,
+                "get_hybrid_search_engine",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                retrieval_manager,
+                "get_qa_search_pipeline",
+                return_value=qa,
+            ),
+            mock.patch.object(
+                retrieval_manager,
+                "get_trake_pipeline",
+                return_value=trake,
+            ),
+        ):
+            corpus_key = retrieval_manager._current_corpus_cache_key()
+            pipeline = retrieval_manager.get_online_pipeline.__wrapped__(corpus_key)
+            context_summary = pipeline.context_index.summary()
+            self.assertEqual(context_summary["neighbor_record_count"], 0)
+            self.assertEqual(context_summary["segment_record_count"], 0)
+            self.assertEqual(
+                pipeline.qa_pipeline.search("question", top_k=1),
+                {"task": "qa"},
+            )
+            self.assertEqual(
+                pipeline.trake_pipeline.search("event", top_k=1),
+                {"task": "trake"},
+            )
+
+        qa.search.assert_called_once()
+        trake.search.assert_called_once()
+
+    def test_committed_but_corrupt_context_fails_closed(self) -> None:
+        _generation, neighbor_path = self._publish_with_context(
+            "corrupt-context",
+            neighbor_payload="{not-json}\n",
+        )
+        missing_frame_map = self.metadata / "missing-frame-map.json"
+        environment = {
+            **self.environment,
+            "ONLINE_NEIGHBOR_CONTEXT_ENABLED": "true",
+            "ONLINE_SEGMENT_CONTEXT_ENABLED": "false",
+            "ONLINE_NEIGHBOR_PATH": str(neighbor_path),
+        }
+
+        with (
+            mock.patch.dict(os.environ, environment, clear=False),
+            mock.patch.object(
+                retrieval_manager,
+                "load_visual_search_config",
+                return_value=SimpleNamespace(frame_map_path=missing_frame_map),
+            ),
+            self.assertRaisesRegex(ValueError, "Invalid JSON"),
+        ):
+            retrieval_manager.get_online_context_index()
+
+    def test_context_cache_refreshes_after_committed_generation_changes(self) -> None:
+        generation_1, neighbor_path = self._publish_with_context(
+            "context-g1",
+            neighbor_payload=(
+                json.dumps(
+                    {
+                        "video_id": "V1",
+                        "frame_id": "F1",
+                        "neighbors_before": [],
+                        "neighbors_after": [],
+                    }
+                )
+                + "\n"
+            ),
+        )
+        missing_frame_map = self.metadata / "missing-frame-map.json"
+        environment = {
+            **self.environment,
+            "ONLINE_NEIGHBOR_CONTEXT_ENABLED": "true",
+            "ONLINE_SEGMENT_CONTEXT_ENABLED": "false",
+            "ONLINE_NEIGHBOR_PATH": str(neighbor_path),
+        }
+
+        with (
+            mock.patch.dict(os.environ, environment, clear=False),
+            mock.patch.object(
+                retrieval_manager,
+                "load_visual_search_config",
+                return_value=SimpleNamespace(frame_map_path=missing_frame_map),
+            ),
+        ):
+            first = retrieval_manager.get_online_context_index()
+            generation_2, _ = self._publish_with_context(
+                "context-g2",
+                neighbor_payload=(
+                    json.dumps(
+                        {
+                            "video_id": "V1",
+                            "frame_id": "F2",
+                            "neighbors_before": [],
+                            "neighbors_after": [],
+                        }
+                    )
+                    + "\n"
+                ),
+            )
+            second = retrieval_manager.get_online_context_index()
+
+        self.assertNotEqual(generation_1, generation_2)
+        self.assertIsNot(first, second)
+        self.assertEqual(
+            first.lookup(video_id="V1", frame_id="F1", timestamp=0.0).sources,
+            ("neighbors_all",),
+        )
+        self.assertEqual(
+            second.lookup(video_id="V1", frame_id="F1", timestamp=0.0).sources,
+            (),
+        )
+        self.assertEqual(
+            second.lookup(video_id="V1", frame_id="F2", timestamp=0.0).sources,
+            ("neighbors_all",),
+        )
+
     def test_trake_factory_is_cached_per_committed_corpus_generation(self) -> None:
         generation_1 = self._publish("g1")
         current_generation = generation_1
@@ -224,20 +435,31 @@ class RetrievalManagerGenerationCacheTest(unittest.TestCase):
                 dense_event_engine=None,
                 event_reranker=None,
                 bge_contract=None,
+                local_scorer=None,
                 config,
             ) -> None:
                 self.retrieval_engine = retrieval_engine
                 self.dense_event_engine = dense_event_engine
                 self.event_reranker = event_reranker
                 self.bge_contract = bge_contract
+                self.local_scorer = local_scorer
                 self.config = config
                 constructed.append(self)
 
         fake_module = types.ModuleType("backend.app.services.trake.pipeline")
+        fake_module.TRAKE_SCHEMA_VERSION = "1.0"
         fake_module.TrakePipeline = FakeTrakePipeline
 
         def retrieval_engine() -> SimpleNamespace:
-            return SimpleNamespace(corpus_generation=current_generation)
+            return SimpleNamespace(
+                corpus_generation=current_generation,
+                visual_engine=SimpleNamespace(
+                    encoder=SimpleNamespace(
+                        encode=mock.Mock(),
+                        encode_images=mock.Mock(),
+                    )
+                ),
+            )
 
         with (
             mock.patch.dict(os.environ, self.environment, clear=False),
@@ -260,6 +482,8 @@ class RetrievalManagerGenerationCacheTest(unittest.TestCase):
         self.assertIsNot(first, second)
         self.assertEqual(first.corpus_generation, generation_1)
         self.assertEqual(second.corpus_generation, current_generation)
+        self.assertIsNotNone(first.local_scorer)
+        self.assertIsNotNone(second.local_scorer)
         self.assertEqual(len(constructed), 2)
 
 

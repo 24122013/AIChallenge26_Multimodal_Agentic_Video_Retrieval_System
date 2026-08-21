@@ -107,6 +107,15 @@ from backend.app.services.retrieval.bge_dense import (
     build_bge_m3_index,
     validate_bge_m3_artifacts,
 )
+from backend.app.services.retrieval.dense_candidate_index import (
+    DENSE_ARTIFACT_ROLE,
+    DENSE_FRAME_MAP_NAME,
+    DENSE_INDEX_NAME,
+    DENSE_MANIFEST_NAME,
+    DENSE_MANIFEST_SCHEMA_VERSION,
+    DENSE_METADATA_NAME,
+    DENSE_REPORT_NAME,
+)
 from backend.app.services.retrieval.text_index import (
     MODALITIES as TEXT_MODALITIES,
     build_text_index as build_text_index_payload,
@@ -443,6 +452,14 @@ class VideoArtifacts:
         return (
             self.paths.selected_embeddings,
             self.paths.selected_embedding_metadata,
+            self.video_id,
+        )
+
+    @property
+    def dense_visual_source(self) -> tuple[Path, Path, str]:
+        return (
+            self.paths.dense_embeddings,
+            self.paths.dense_embedding_metadata,
             self.video_id,
         )
 
@@ -2423,6 +2440,12 @@ def _validate_selected_bundle(
     )
 
     artifact_hashes = {
+        "dense_embeddings": _sha256_file(paths.dense_embeddings),
+        "dense_embedding_metadata": _sha256_file(paths.dense_embedding_metadata),
+        "dense_captions": _sha256_file(paths.dense_captions),
+        "dense_ocr": _sha256_file(paths.dense_ocr),
+        "dense_objects": _sha256_file(paths.dense_objects),
+        "candidate_ledger": _sha256_file(paths.candidate_ledger),
         "selected_metadata": _sha256_file(paths.selected_metadata),
         "selected_images": _images_sha256(records),
         "selected_embeddings": _sha256_file(paths.selected_embeddings),
@@ -2797,6 +2820,11 @@ class CorpusPaths:
     visual_frame_map: Path
     visual_manifest: Path
     visual_report: Path
+    dense_index: Path
+    dense_metadata: Path
+    dense_frame_map: Path
+    dense_manifest: Path
+    dense_report: Path
     text_index: Path
     neighbor_metadata: Path
     segment_metadata: Path
@@ -2815,6 +2843,11 @@ class CorpusPaths:
             visual_frame_map=metadata / f"{ARTIFACT_TAG}_frame_map.json",
             visual_manifest=metadata / f"{ARTIFACT_TAG}_faiss_manifest.json",
             visual_report=metadata / f"{ARTIFACT_TAG}_index_report.json",
+            dense_index=root / "indexes" / DENSE_INDEX_NAME,
+            dense_metadata=metadata / DENSE_METADATA_NAME,
+            dense_frame_map=metadata / DENSE_FRAME_MAP_NAME,
+            dense_manifest=metadata / DENSE_MANIFEST_NAME,
+            dense_report=metadata / DENSE_REPORT_NAME,
             text_index=root / "indexes" / "retrieval_text_index.json",
             neighbor_metadata=metadata / "neighbors_all.jsonl",
             segment_metadata=metadata / "segments_all.jsonl",
@@ -2832,12 +2865,24 @@ def _corpus_source_contract(
     sources: list[dict[str, object]] = []
     for artifact in sorted(videos, key=lambda item: item.video_id):
         completion = _read_json(artifact.paths.completion_report)
+        dense_inputs = {
+            "embeddings": artifact.paths.dense_embeddings,
+            "embedding_metadata": artifact.paths.dense_embedding_metadata,
+            "captions": artifact.paths.dense_captions,
+            "ocr": artifact.paths.dense_ocr,
+            "objects": artifact.paths.dense_objects,
+            "candidate_ledger": artifact.paths.candidate_ledger,
+        }
         sources.append(
             {
                 "video_id": artifact.video_id,
                 "completion_report_sha256": _sha256_file(artifact.paths.completion_report),
                 "artifact_hashes": completion.get("artifact_hashes"),
                 "selected_count": artifact.selected_count,
+                "dense_candidate_count": artifact.dense_candidate_count,
+                "dense_input_hashes": {
+                    label: _sha256_file(path) for label, path in dense_inputs.items()
+                },
             }
         )
     contract = {
@@ -3164,6 +3209,436 @@ def _build_visual_corpus_index(
             os.replace(staged_path, final)
 
     result = _validate_visual_corpus_index(paths, videos=videos)
+    _write_corpus_stage_state(
+        paths,
+        source_contract=source_contract,
+        stage=stage,
+        detail={"artifact_hashes": _artifact_hash_map(artifact_paths), **result},
+    )
+    return result
+
+
+def _dense_object_labels(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    labels: list[str] = []
+    for item in value:
+        label = ""
+        if isinstance(item, str):
+            label = item.strip()
+        elif isinstance(item, Mapping):
+            for key in ("class_name", "label", "name", "class"):
+                raw = item.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    label = raw.strip()
+                    break
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _dense_enriched_source_records(
+    video: VideoArtifacts,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Join already-computed dense modalities without running inference."""
+
+    vectors, embedding_records, _, _ = validate_embedding_source(
+        video.paths.dense_embeddings,
+        video.paths.dense_embedding_metadata,
+        video.video_id,
+    )
+    if len(embedding_records) != video.dense_candidate_count:
+        raise ValueError(
+            f"dense candidate count mismatch for {video.video_id}: "
+            f"{len(embedding_records)} != {video.dense_candidate_count}"
+        )
+    expected_ids = _candidate_ids(embedding_records)
+    expected_id_set = set(expected_ids)
+
+    captions = _read_jsonl(video.paths.dense_captions)
+    ocr = _read_jsonl(video.paths.dense_ocr)
+    objects = _read_jsonl(video.paths.dense_objects)
+    for label, records, required in (
+        ("dense caption", captions, "caption"),
+        ("dense OCR", ocr, None),
+        ("dense object", objects, None),
+    ):
+        _validate_modality_records(
+            label=label,
+            records=records,
+            expected_candidates=embedding_records,
+            video_id=video.video_id,
+            required_nonempty_field=required,
+        )
+    ledger = _read_jsonl(video.paths.candidate_ledger)
+    if set(_candidate_ids(ledger)) != expected_id_set or len(ledger) != len(expected_ids):
+        raise ValueError(f"candidate ledger does not align with dense pool: {video.video_id}")
+    if any(str(record.get("video_id") or "") != video.video_id for record in ledger):
+        raise ValueError(f"candidate ledger has wrong video_id: {video.video_id}")
+
+    caption_by_id = {str(record["candidate_id"]): record for record in captions}
+    ocr_by_id = {str(record["candidate_id"]): record for record in ocr}
+    objects_by_id = {str(record["candidate_id"]): record for record in objects}
+    ledger_by_id = {str(record["candidate_id"]): record for record in ledger}
+    enriched: list[dict[str, Any]] = []
+    for record in embedding_records:
+        candidate_id = str(record["candidate_id"])
+        candidate_ledger = ledger_by_id[candidate_id]
+        protected_event_ids = candidate_ledger.get("feature_protected_event_ids", [])
+        if not isinstance(protected_event_ids, list) or any(
+            not isinstance(value, str) for value in protected_event_ids
+        ):
+            raise ValueError(
+                f"candidate ledger has invalid protected events: {candidate_id}"
+            )
+        caption = str(caption_by_id[candidate_id].get("caption") or "").strip()
+        if not caption:
+            raise ValueError(f"dense caption evidence is empty: {candidate_id}")
+        value = dict(record)
+        value.update(
+            {
+                "artifact_role": "dense_candidate",
+                "caption": caption,
+                "ocr_text": str(ocr_by_id[candidate_id].get("ocr_text") or ""),
+                "objects": _dense_object_labels(
+                    objects_by_id[candidate_id].get("objects")
+                ),
+                "protected_event_ids": list(dict.fromkeys(protected_event_ids)),
+                "protected": bool(protected_event_ids),
+                "importance_score": candidate_ledger.get("importance_score"),
+                "semantic_novelty": candidate_ledger.get("semantic_novelty"),
+                "component_scores": dict(
+                    candidate_ledger.get("component_scores")
+                    if isinstance(candidate_ledger.get("component_scores"), Mapping)
+                    else {}
+                ),
+                "available_modalities": list(
+                    candidate_ledger.get("available_modalities")
+                    if isinstance(candidate_ledger.get("available_modalities"), list)
+                    else []
+                ),
+                "offline_selected": bool(candidate_ledger.get("selected")),
+                "selection_rank": candidate_ledger.get("selection_rank"),
+                "selection_phase": candidate_ledger.get("selection_phase"),
+                "selection_reasons": list(
+                    candidate_ledger.get("selection_reasons")
+                    if isinstance(candidate_ledger.get("selection_reasons"), list)
+                    else []
+                ),
+            }
+        )
+        enriched.append(value)
+    return vectors, enriched
+
+
+def _expected_dense_index_records(
+    videos: Sequence[VideoArtifacts],
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    records: list[dict[str, Any]] = []
+    vector_batches: list[np.ndarray] = []
+    for video in sorted(videos, key=lambda item: item.video_id):
+        vectors, source_records = _dense_enriched_source_records(video)
+        vector_batches.append(vectors)
+        for record in source_records:
+            indexed = dict(record)
+            indexed["faiss_index"] = len(records)
+            records.append(indexed)
+    if not vector_batches:
+        raise ValueError("dense corpus requires at least one embedding source")
+    expected_vectors = np.ascontiguousarray(
+        np.concatenate(vector_batches, axis=0),
+        dtype=np.float32,
+    )
+    norms = np.linalg.norm(expected_vectors, axis=1, keepdims=True)
+    if np.any(norms <= 0) or not np.isfinite(norms).all():
+        raise ValueError("dense corpus contains an invalid vector")
+    expected_vectors = np.ascontiguousarray(expected_vectors / norms, dtype=np.float32)
+    return records, expected_vectors
+
+
+def _validate_dense_bundle_manifest(
+    manifest: Mapping[str, Any],
+    paths: CorpusPaths,
+) -> str:
+    if manifest.get("schema_version") != DENSE_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("dense manifest has an unsupported schema version")
+    if manifest.get("artifact_role") != DENSE_ARTIFACT_ROLE:
+        raise ValueError("dense manifest has the wrong artifact role")
+    declared = manifest.get("artifacts")
+    if not isinstance(declared, dict):
+        raise ValueError("dense manifest is missing bundle artifact checksums")
+    actual_hashes: dict[str, str] = {}
+    for label, path in (
+        ("index", paths.dense_index),
+        ("metadata", paths.dense_metadata),
+        ("frame_map", paths.dense_frame_map),
+        ("report", paths.dense_report),
+    ):
+        item = declared.get(label)
+        if not isinstance(item, dict) or item.get("filename") != path.name:
+            raise ValueError(f"dense manifest has invalid {label} artifact lineage")
+        actual_sha256 = _sha256_file(path)
+        if item.get("sha256") != actual_sha256:
+            raise ValueError(f"dense {label} checksum does not match manifest")
+        actual_hashes[label] = actual_sha256
+    generation = _sha256_value(actual_hashes)
+    if manifest.get("bundle_generation") != generation:
+        raise ValueError("dense bundle generation does not match artifact checksums")
+    return generation
+
+
+def _validate_dense_corpus_index(
+    paths: CorpusPaths,
+    *,
+    videos: Sequence[VideoArtifacts],
+) -> dict[str, Any]:
+    for path in (
+        paths.dense_index,
+        paths.dense_metadata,
+        paths.dense_frame_map,
+        paths.dense_manifest,
+        paths.dense_report,
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing dense index artifact: {path}")
+    faiss = require_faiss()
+    index = faiss.read_index(paths.dense_index.as_posix())
+    if type(index).__name__ != "IndexFlatIP":
+        raise ValueError("dense FAISS index must be IndexFlatIP")
+    expected_records, expected_vectors = _expected_dense_index_records(videos)
+    expected_count = len(expected_records)
+    if int(index.ntotal) != expected_count or int(index.d) != expected_vectors.shape[1]:
+        raise ValueError("dense FAISS count or dimension mismatch")
+    reconstructed = np.empty_like(expected_vectors)
+    index.reconstruct_n(0, expected_count, reconstructed)
+    if not np.allclose(reconstructed, expected_vectors, atol=1e-6, rtol=1e-6):
+        raise ValueError("dense FAISS vectors do not match full candidate embeddings")
+
+    indexed_records = _read_jsonl(paths.dense_metadata)
+    if [_sha256_value(record) for record in indexed_records] != [
+        _sha256_value(record) for record in expected_records
+    ]:
+        raise ValueError("dense index metadata does not match enriched dense candidates")
+    raw_frame_map = _read_json(paths.dense_frame_map)
+    expected_frame_map = {
+        str(row): frame_map_record(record)
+        for row, record in enumerate(expected_records)
+    }
+    if raw_frame_map != expected_frame_map:
+        raise ValueError("dense frame map does not match dense metadata order")
+    frame_report, _ = validate_frame_map(
+        {int(key): value for key, value in raw_frame_map.items()},
+        int(index.ntotal),
+        fix=False,
+    )
+    if frame_report.get("status") != "passed":
+        raise ValueError(f"dense frame-map validation failed: {frame_report.get('errors')}")
+
+    report = _read_json(paths.dense_report)
+    manifest = _read_json(paths.dense_manifest)
+    if report.get("status") != "passed":
+        raise ValueError("dense index build report is not passed")
+    if (
+        manifest.get("vector_count") != expected_count
+        or manifest.get("metadata_record_count") != expected_count
+        or report.get("vector_count") != expected_count
+        or report.get("metadata_record_count") != expected_count
+    ):
+        raise ValueError("dense index manifest/report count mismatch")
+    clip_keys = {
+        (
+            str(record.get("video_id") or ""),
+            str(record.get("segment_id") or record.get("shot_id") or ""),
+        )
+        for record in expected_records
+    }
+    if any(not video_id or not clip_id for video_id, clip_id in clip_keys):
+        raise ValueError("dense candidate metadata has an empty clip identity")
+    if manifest.get("clip_count") != len(clip_keys):
+        raise ValueError("dense index manifest clip count mismatch")
+    generation = _validate_dense_bundle_manifest(manifest, paths)
+    return {
+        "status": "passed",
+        "vector_count": expected_count,
+        "clip_count": len(clip_keys),
+        "video_ids": sorted({key[0] for key in clip_keys}),
+        "frame_map": frame_report,
+        "bundle_generation": generation,
+        "enriched_fields": [
+            "caption",
+            "ocr_text",
+            "objects",
+            "protected_event_ids",
+        ],
+    }
+
+
+def _build_dense_corpus_index(
+    paths: CorpusPaths,
+    videos: Sequence[VideoArtifacts],
+    source_contract: Mapping[str, Any],
+    config: OfflinePipelineConfig,
+) -> dict[str, Any]:
+    stage = "dense_candidate_faiss"
+    artifact_paths = (
+        paths.dense_index,
+        paths.dense_metadata,
+        paths.dense_frame_map,
+        paths.dense_manifest,
+        paths.dense_report,
+    )
+    state = _corpus_stage_state(paths, source_contract, stage)
+    if config.resume and not config.force and state is not None:
+        try:
+            result = _validate_dense_corpus_index(paths, videos=videos)
+            if not _hash_map_matches(state.get("artifact_hashes"), artifact_paths):
+                raise ValueError("dense index artifact checksum changed")
+        except CHECKPOINT_INVALID_ERRORS as exc:
+            LOGGER.info("[RUN] corpus :: dense candidate FAISS | checkpoint invalid: %s", exc)
+        else:
+            LOGGER.info(
+                "[SKIP] corpus :: dense candidate FAISS | vectors=%d",
+                result["vector_count"],
+            )
+            return result
+    else:
+        LOGGER.info("[RUN] corpus :: dense candidate FAISS")
+
+    sources = [
+        video.dense_visual_source for video in sorted(videos, key=lambda item: item.video_id)
+    ]
+    for embeddings_path, metadata_path, video_id in sources:
+        validate_embedding_source(embeddings_path, metadata_path, video_id)
+    expected_records, _ = _expected_dense_index_records(videos)
+
+    staging_parent = config.output_dir / "reports" / "offline" / ".staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=staging_parent) as temporary_dir:
+        root = Path(temporary_dir)
+        staged = {
+            "index": root / paths.dense_index.name,
+            "metadata": root / paths.dense_metadata.name,
+            "frame_map": root / paths.dense_frame_map.name,
+            "manifest": root / paths.dense_manifest.name,
+            "report": root / paths.dense_report.name,
+        }
+        built = build_faiss_artifacts(
+            sources=sources,
+            index_path=staged["index"],
+            index_metadata_path=staged["metadata"],
+            frame_map_path=staged["frame_map"],
+            manifest_path=staged["manifest"],
+            report_path=staged["report"],
+            metric="ip",
+            normalize_for_index=True,
+        )
+        built_ids = [str(record.get("candidate_id") or "") for record in built["index_records"]]
+        expected_ids = [str(record["candidate_id"]) for record in expected_records]
+        if built_ids != expected_ids:
+            raise CorpusIndexError("dense FAISS row order changed during enrichment")
+        _atomic_write_jsonl(staged["metadata"], expected_records)
+        dense_frame_map = {
+            str(row): frame_map_record(record)
+            for row, record in enumerate(expected_records)
+        }
+        _atomic_write_json(staged["frame_map"], dense_frame_map)
+        frame_report, _ = validate_frame_map(
+            {int(key): value for key, value in dense_frame_map.items()},
+            int(built["index"].ntotal),
+            fix=False,
+        )
+        if frame_report.get("status") != "passed":
+            raise CorpusIndexError("staged dense frame map failed validation")
+
+        clip_keys = {
+            (
+                str(record.get("video_id") or ""),
+                str(record.get("segment_id") or record.get("shot_id") or ""),
+            )
+            for record in expected_records
+        }
+        report = _read_json(staged["report"])
+        report.update(
+            {
+                "artifact_role": DENSE_ARTIFACT_ROLE,
+                "metadata_record_count": len(expected_records),
+                "clip_count": len(clip_keys),
+                "enriched_fields": [
+                    "caption",
+                    "ocr_text",
+                    "objects",
+                    "protected_event_ids",
+                ],
+                "manifest_path": paths.dense_manifest.as_posix(),
+                "index_path": paths.dense_index.as_posix(),
+                "metadata_path": paths.dense_metadata.as_posix(),
+                "frame_map_path": paths.dense_frame_map.as_posix(),
+            }
+        )
+        _atomic_write_json(staged["report"], report)
+        bundle_hashes = {
+            label: _sha256_file(staged[label])
+            for label in ("index", "metadata", "frame_map", "report")
+        }
+        manifest = _read_json(staged["manifest"])
+        manifest.update(
+            {
+                "artifact_role": DENSE_ARTIFACT_ROLE,
+                "source_kind": "full_dense_candidates",
+                "clip_count": len(clip_keys),
+                "index_path": paths.dense_index.as_posix(),
+                "index_metadata_path": paths.dense_metadata.as_posix(),
+                "frame_map_path": paths.dense_frame_map.as_posix(),
+                "report_path": paths.dense_report.as_posix(),
+                "bundle_generation": _sha256_value(bundle_hashes),
+                "enrichment": {
+                    "inference_performed": False,
+                    "join_key": "candidate_id",
+                    "fields": [
+                        "caption",
+                        "ocr_text",
+                        "objects",
+                        "protected_event_ids",
+                    ],
+                },
+                "artifacts": {
+                    label: {
+                        "filename": final_path.name,
+                        "sha256": bundle_hashes[label],
+                    }
+                    for label, final_path in (
+                        ("index", paths.dense_index),
+                        ("metadata", paths.dense_metadata),
+                        ("frame_map", paths.dense_frame_map),
+                        ("report", paths.dense_report),
+                    )
+                },
+            }
+        )
+        _atomic_write_json(staged["manifest"], manifest)
+
+        paths.dense_manifest.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(
+            paths.dense_manifest,
+            {
+                "schema_version": DENSE_MANIFEST_SCHEMA_VERSION,
+                "artifact_role": DENSE_ARTIFACT_ROLE,
+                "publication_status": "publishing",
+                "bundle_generation": "publishing",
+                "artifacts": {},
+            },
+        )
+        for final, staged_path in (
+            (paths.dense_index, staged["index"]),
+            (paths.dense_metadata, staged["metadata"]),
+            (paths.dense_frame_map, staged["frame_map"]),
+            (paths.dense_report, staged["report"]),
+            (paths.dense_manifest, staged["manifest"]),
+        ):
+            final.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged_path, final)
+
+    result = _validate_dense_corpus_index(paths, videos=videos)
     _write_corpus_stage_state(
         paths,
         source_contract=source_contract,
@@ -3679,6 +4154,11 @@ def _corpus_bundle_artifacts(
         "visual_frame_map": paths.visual_frame_map,
         "visual_manifest": paths.visual_manifest,
         "visual_report": paths.visual_report,
+        "dense_index": paths.dense_index,
+        "dense_metadata": paths.dense_metadata,
+        "dense_frame_map": paths.dense_frame_map,
+        "dense_manifest": paths.dense_manifest,
+        "dense_report": paths.dense_report,
         "text_index": paths.text_index,
         "neighbor_metadata": paths.neighbor_metadata,
         "segment_metadata": paths.segment_metadata,
@@ -3742,6 +4222,54 @@ def _rebase_staged_visual_bundle(
         }
     )
     _atomic_write_json(staged.visual_manifest, manifest)
+
+
+def _rebase_staged_dense_bundle(
+    staged: CorpusPaths,
+    final: CorpusPaths,
+) -> None:
+    report = _read_json(staged.dense_report)
+    report.update(
+        {
+            "manifest_path": final.dense_manifest.as_posix(),
+            "index_path": final.dense_index.as_posix(),
+            "metadata_path": final.dense_metadata.as_posix(),
+            "frame_map_path": final.dense_frame_map.as_posix(),
+        }
+    )
+    _atomic_write_json(staged.dense_report, report)
+    hashes = {
+        label: _sha256_file(path)
+        for label, path in (
+            ("index", staged.dense_index),
+            ("metadata", staged.dense_metadata),
+            ("frame_map", staged.dense_frame_map),
+            ("report", staged.dense_report),
+        )
+    }
+    manifest = _read_json(staged.dense_manifest)
+    manifest.update(
+        {
+            "index_path": final.dense_index.as_posix(),
+            "index_metadata_path": final.dense_metadata.as_posix(),
+            "frame_map_path": final.dense_frame_map.as_posix(),
+            "report_path": final.dense_report.as_posix(),
+            "bundle_generation": _sha256_value(hashes),
+            "artifacts": {
+                label: {
+                    "filename": final_path.name,
+                    "sha256": hashes[label],
+                }
+                for label, final_path in (
+                    ("index", final.dense_index),
+                    ("metadata", final.dense_metadata),
+                    ("frame_map", final.dense_frame_map),
+                    ("report", final.dense_report),
+                )
+            },
+        }
+    )
+    _atomic_write_json(staged.dense_manifest, manifest)
 
 
 def _corpus_bundle_manifest_payload(
@@ -3843,20 +4371,30 @@ def _publish_staged_corpus_bundle(
             "artifacts": {},
         },
     )
+    _atomic_write_json(
+        final.dense_manifest,
+        {
+            "schema_version": DENSE_MANIFEST_SCHEMA_VERSION,
+            "artifact_role": DENSE_ARTIFACT_ROLE,
+            "publication_status": "publishing",
+            "bundle_generation": "publishing",
+            "artifacts": {},
+        },
+    )
     if bge_enabled:
         _atomic_write_json(
             BgeM3ArtifactPaths.from_root(final.bge_root).manifest,
             {"status": "publishing"},
         )
 
-    commit_roles = {"visual_manifest", "bge_manifest"}
+    commit_roles = {"visual_manifest", "dense_manifest", "bge_manifest"}
     for role, source in staged_artifacts.items():
         if role in commit_roles:
             continue
         destination = final_artifacts[role]
         destination.parent.mkdir(parents=True, exist_ok=True)
         os.replace(source, destination)
-    for role in ("visual_manifest", "bge_manifest"):
+    for role in ("visual_manifest", "dense_manifest", "bge_manifest"):
         if role not in staged_artifacts:
             continue
         destination = final_artifacts[role]
@@ -3924,6 +4462,7 @@ def build_corpus_indexes(
                 bge_enabled=config.bge_enabled,
             )
             _validate_visual_corpus_index(paths, videos=ordered)
+            _validate_dense_corpus_index(paths, videos=ordered)
             _validate_text_corpus_index(paths, canonical_records)
             _validate_neighbor_corpus_metadata(
                 paths,
@@ -3969,6 +4508,12 @@ def build_corpus_indexes(
             source_contract,
             staged_config,
         )
+        dense = _build_dense_corpus_index(
+            staged_paths,
+            ordered,
+            source_contract,
+            staged_config,
+        )
         text = _build_text_corpus_index(
             staged_paths,
             canonical_records,
@@ -4000,7 +4545,9 @@ def build_corpus_indexes(
             LOGGER.info("[SKIP] corpus :: BGE-M3 | disabled by configuration")
 
         _rebase_staged_visual_bundle(staged_paths, paths)
+        _rebase_staged_dense_bundle(staged_paths, paths)
         visual = _validate_visual_corpus_index(staged_paths, videos=ordered)
+        dense = _validate_dense_corpus_index(staged_paths, videos=ordered)
         report = {
             "pipeline": PIPELINE_NAME,
             "schema_version": PIPELINE_SCHEMA_VERSION,
@@ -4014,6 +4561,7 @@ def build_corpus_indexes(
             "selected_keyframe_count": sum(video.selected_count for video in ordered),
             "source_contract_sha256": source_contract["contract_sha256"],
             "visual_index": visual,
+            "dense_candidate_index": dense,
             "text_index": text,
             "neighbor_mapping": neighbors,
             "segments_events": segments,
@@ -4022,6 +4570,10 @@ def build_corpus_indexes(
                 "visual_index": paths.visual_index.as_posix(),
                 "visual_frame_map": paths.visual_frame_map.as_posix(),
                 "visual_manifest": paths.visual_manifest.as_posix(),
+                "dense_index": paths.dense_index.as_posix(),
+                "dense_metadata": paths.dense_metadata.as_posix(),
+                "dense_frame_map": paths.dense_frame_map.as_posix(),
+                "dense_manifest": paths.dense_manifest.as_posix(),
                 "text_index": paths.text_index.as_posix(),
                 "neighbor_metadata": paths.neighbor_metadata.as_posix(),
                 "segment_metadata": paths.segment_metadata.as_posix(),
@@ -4039,6 +4591,7 @@ def build_corpus_indexes(
                 "source_contract_sha256": source_contract["contract_sha256"],
                 "video_ids": list(video_ids),
                 "visual_index": visual,
+                "dense_candidate_index": dense,
                 "text_index": text,
                 "neighbor_mapping": neighbors,
                 "segments_events": segments,
@@ -4066,6 +4619,7 @@ def build_corpus_indexes(
         bge_enabled=config.bge_enabled,
     )
     _validate_visual_corpus_index(paths, videos=ordered)
+    _validate_dense_corpus_index(paths, videos=ordered)
     _validate_text_corpus_index(paths, canonical_records)
     _validate_neighbor_corpus_metadata(
         paths,

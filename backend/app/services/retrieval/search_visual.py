@@ -11,7 +11,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 import numpy as np
 
@@ -241,7 +241,13 @@ def normalize_query_vector(vector: np.ndarray) -> np.ndarray:
 
 
 class Siglip2TextEncoder:
-    """Lazy SigLIP2 text encoder configured from the FAISS manifest."""
+    """Lazy SigLIP2 encoder configured from the visual FAISS manifest.
+
+    Text encoding remains the public retrieval contract.  ``encode_images`` is
+    a small companion surface for bounded TRAKE local refinement, allowing the
+    refiner to share this exact lazy model/processor instead of loading a second
+    SigLIP2 checkpoint or introducing a VLM.
+    """
 
     def __init__(
         self,
@@ -370,6 +376,80 @@ class Siglip2TextEncoder:
         features = features.float() / norm
         return features.detach().cpu().numpy().astype("float32", copy=False)
 
+    def encode_images(
+        self,
+        images: Sequence[Any],
+        *,
+        batch_size: int = 16,
+    ) -> np.ndarray:
+        """Return normalized SigLIP2 features for a bounded RGB image batch.
+
+        Callers own color conversion; this method intentionally accepts the
+        same RGB PIL/numpy values supported by the Hugging Face processor.  It
+        batches inference to keep TRAKE's local frame windows memory-bounded.
+        """
+
+        if isinstance(batch_size, bool) or int(batch_size) <= 0:
+            raise ValueError("SigLIP2 image batch_size must be positive")
+        values = list(images)
+        if not values:
+            return np.empty((0, self.contract.vector_dim), dtype="float32")
+
+        self._load()
+        assert self._model is not None
+        assert self._processor is not None
+        assert self._torch is not None
+        assert self._compute_dtype is not None
+
+        batches: list[np.ndarray] = []
+        for start in range(0, len(values), int(batch_size)):
+            image_batch = values[start : start + int(batch_size)]
+            inputs = self._processor(
+                images=image_batch,
+                return_tensors="pt",
+            )
+            model_inputs = {
+                key: value.to(
+                    self._device,
+                    non_blocking=self._device == "cuda",
+                )
+                if hasattr(value, "to")
+                else value
+                for key, value in inputs.items()
+            }
+            autocast = (
+                self._torch.autocast(
+                    device_type="cuda",
+                    dtype=self._compute_dtype,
+                )
+                if self._device == "cuda" and not self.no_autocast
+                else nullcontext()
+            )
+            with self._torch.inference_mode():
+                with autocast:
+                    output = self._model.get_image_features(**model_inputs)
+            features = _feature_tensor(output, self._torch)
+            if features.ndim != 2 or features.shape[0] != len(image_batch):
+                raise ValueError(
+                    "Unexpected SigLIP2 image feature shape: "
+                    f"{tuple(features.shape)} for batch size {len(image_batch)}"
+                )
+            if int(features.shape[-1]) != self.contract.vector_dim:
+                raise ValueError(
+                    "SigLIP2 image dimension does not match FAISS manifest: "
+                    f"{int(features.shape[-1])} != {self.contract.vector_dim}"
+                )
+            if not self._torch.isfinite(features).all():
+                raise ValueError("SigLIP2 produced NaN or Inf image features")
+            norm = features.float().norm(dim=-1, keepdim=True)
+            if self._torch.any(norm <= 0):
+                raise ValueError("SigLIP2 produced a zero image vector")
+            normalized = features.float() / norm
+            batches.append(
+                normalized.detach().cpu().numpy().astype("float32", copy=False)
+            )
+        return np.ascontiguousarray(np.concatenate(batches, axis=0), dtype="float32")
+
 
 def _feature_tensor(output: Any, torch_module: Any):
     if isinstance(output, torch_module.Tensor):
@@ -477,6 +557,23 @@ class VisualSearchEngine:
         bounded_top_k = max(1, min(int(requested_top_k), self.config.max_top_k))
         return self._search_bounded(query, bounded_top_k)
 
+    def search_by_vector(
+        self,
+        query: str,
+        query_vector: np.ndarray,
+        top_k: int | None = None,
+    ) -> VisualSearchResponse:
+        """Search selected keyframes with an already encoded query vector.
+
+        The canonical coarse-to-dense path uses this method for the original
+        query so selected-keyframe FAISS and dense-candidate FAISS share the
+        exact same SigLIP2 embedding without a second model forward pass.
+        """
+
+        requested_top_k = top_k if top_k is not None else self.config.default_top_k
+        bounded_top_k = max(1, min(int(requested_top_k), self.config.max_top_k))
+        return self._search_vector_bounded(query, query_vector, bounded_top_k)
+
     def search_pool(self, query: str, top_k: int) -> VisualSearchResponse:
         """Retrieve a validated internal candidate pool beyond the public cap.
 
@@ -493,8 +590,24 @@ class VisualSearchEngine:
 
     def _search_bounded(self, query: str, bounded_top_k: int) -> VisualSearchResponse:
         started_at = time.perf_counter()
-
         query_vector = normalize_query_vector(self.encoder.encode(query))
+        return self._search_vector_bounded(
+            query,
+            query_vector,
+            bounded_top_k,
+            started_at=started_at,
+        )
+
+    def _search_vector_bounded(
+        self,
+        query: str,
+        query_vector: np.ndarray,
+        bounded_top_k: int,
+        *,
+        started_at: float | None = None,
+    ) -> VisualSearchResponse:
+        started_at = time.perf_counter() if started_at is None else started_at
+        query_vector = normalize_query_vector(query_vector)
         if (
             self.encoder_contract is not None
             and query_vector.shape[1] != self.encoder_contract.vector_dim

@@ -12,6 +12,7 @@ from backend.app.services.indexing.build_text_index import (
     write_text_index,
 )
 from backend.app.services.retrieval.retrieval_config import (
+    OnlineRetrievalConfig,
     RetrievalConfigError,
     TrakeConfig,
     load_retrieval_runtime_config,
@@ -203,6 +204,83 @@ class Phase2RetrievalTest(unittest.TestCase):
             self.assertEqual(config.text_index.path, Path("custom/index.json"))
             self.assertEqual(config.text_index.default_top_k, 7)
 
+    def test_runtime_config_loads_online_coarse_to_dense_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "retrieval.yaml"
+            path.write_text(
+                "\n".join(
+                    [
+                        "online:",
+                        "  dense_missing_behavior: fallback_sparse",
+                        "  coarse_top_n: 40",
+                        "  dense_global_top_k: 250",
+                        "  dense_rescue_clips: 8",
+                        "  max_total_clips: 48",
+                        "  learned_rerank_enabled: false",
+                        "  vlm_rerank_enabled: false",
+                        "  max_neighbors_each_side: 2",
+                        "  segment_context_candidate_limit: 8",
+                        "  segment_context_top_k: 2",
+                        "  context_max_bonus: 0.07",
+                        "  rerank_dense_visual_weight: 0.5",
+                        "  rerank_neighbor_support_weight: 0.04",
+                        "  rerank_segment_support_weight: 0.06",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertLogs(
+                "backend.app.services.retrieval.retrieval_config",
+                level="WARNING",
+            ) as captured:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "RETRIEVAL_ONLINE_DENSE_GLOBAL_TOP_K": "275",
+                        "RETRIEVAL_ONLINE_DENSE_MISSING_BEHAVIOR": "error",
+                    },
+                    clear=False,
+                ):
+                    online = load_retrieval_runtime_config(path).online
+
+        self.assertEqual(online.coarse_top_n, 40)
+        self.assertEqual(online.dense_global_top_k, 275)
+        self.assertEqual(online.dense_rescue_clips, 8)
+        self.assertEqual(online.max_total_clips, 48)
+        self.assertEqual(online.dense_missing_behavior, "error")
+        self.assertEqual(online.rerank_weights.dense_visual, 0.5)
+        self.assertEqual(online.rerank_weights.neighbor_support, 0.04)
+        self.assertEqual(online.rerank_weights.segment_support, 0.06)
+        self.assertEqual(online.context_config.segment_candidate_limit, 8)
+        self.assertEqual(online.context_config.segment_top_k, 2)
+        self.assertEqual(online.context_config.max_bonus, 0.07)
+        self.assertFalse(hasattr(online, "learned_rerank_enabled"))
+        self.assertFalse(hasattr(online, "vlm_rerank_enabled"))
+        self.assertEqual(len(captured.output), 2)
+        self.assertTrue(all("deprecated and ignored" in item for item in captured.output))
+
+        with self.assertRaisesRegex(ValueError, "modality_hint_boost"):
+            OnlineRetrievalConfig(modality_hint_boost=True)
+
+    def test_deprecated_online_reranker_env_is_warned_and_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "retrieval.yaml"
+            path.write_text("online:\n  debug_enabled: false\n", encoding="utf-8")
+            with self.assertLogs(
+                "backend.app.services.retrieval.retrieval_config",
+                level="WARNING",
+            ) as captured:
+                with mock.patch.dict(
+                    os.environ,
+                    {"RETRIEVAL_ONLINE_LEARNED_RERANK_ENABLED": "true"},
+                    clear=False,
+                ):
+                    online = load_retrieval_runtime_config(path).online
+
+        self.assertFalse(hasattr(online, "learned_rerank_enabled"))
+        self.assertTrue(any("deprecated and ignored" in item for item in captured.output))
+
     def test_runtime_config_reports_yaml_and_schema_errors_at_exact_line(self) -> None:
         cases = (
             (
@@ -291,6 +369,10 @@ class Phase2RetrievalTest(unittest.TestCase):
             (
                 "hybrid:\n  max_gap_seconds: 0",
                 "hybrid.max_gap_seconds must be a positive number",
+            ),
+            (
+                "online:\n  dense_missing_behavior: silent",
+                "online.dense_missing_behavior must be a dense missing behavior string",
             ),
         )
         for content, message in cases:

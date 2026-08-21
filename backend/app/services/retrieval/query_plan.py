@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from backend.app.services.agent.query_expansion import (
@@ -417,19 +417,27 @@ def build_query_plan(
         events = (normalized,)
         relation = "none"
 
-    # Query expansion belongs to advanced KIS/AVS retrieval. QA receives any
-    # caller-provided expansions later at the router boundary and therefore
-    # always builds an original-only plan here.
+    # Generic query expansion belongs only to advanced KIS/AVS retrieval.
+    # QA, temporal, and TRAKE own their task-specific query parsing downstream;
+    # calling the generic provider for those routes only adds latency and the
+    # resulting variants are intentionally unused.
     effective_expansion_config = expansion_config
     effective_expansion_provider = expansion_provider
-    if resolved == "qa" and expansion_plan is None:
+    expansion_skip_reason = ""
+    if resolved not in {"kis", "avs"} and expansion_plan is None:
         effective_expansion_config = QueryExpansionConfig(enabled=False)
         effective_expansion_provider = None
+        expansion_skip_reason = f"{resolved}_route"
     resolved_expansion = expansion_plan or build_query_expansion_plan(
         original,
         provider=effective_expansion_provider,
         config=effective_expansion_config,
     )
+    if expansion_skip_reason:
+        resolved_expansion = replace(
+            resolved_expansion,
+            fallback_reason=expansion_skip_reason,
+        )
     accepted_paraphrases = tuple(
         value.text
         for value in resolved_expansion.accepted_variants

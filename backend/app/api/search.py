@@ -27,6 +27,21 @@ except ImportError:  # pragma: no cover
     Field = None
 
 
+def _online_request_options(
+    *,
+    include_context: bool | None,
+    debug: bool | None,
+) -> dict[str, bool]:
+    """Return only explicit request overrides, preserving runtime defaults."""
+
+    options: dict[str, bool] = {}
+    if include_context is not None:
+        options["include_context"] = include_context
+    if debug is not None:
+        options["debug"] = debug
+    return options
+
+
 if APIRouter is not None:
     router = APIRouter(prefix="/api/search", tags=["search"])
 
@@ -36,6 +51,8 @@ if APIRouter is not None:
         top_k: int = Field(default=20, ge=1, le=200)
         task_mode: str = "auto"
         expanded_queries: list[str] = Field(default_factory=list, max_length=20)
+        include_context: bool | None = None
+        debug: bool | None = None
 
     class ExportBody(BaseModel):
         query: str
@@ -53,6 +70,10 @@ if APIRouter is not None:
                     body.mode,
                     task_mode=body.task_mode,
                     expanded_queries=body.expanded_queries,
+                    **_online_request_options(
+                        include_context=body.include_context,
+                        debug=body.debug,
+                    ),
                 ),
                 "message": None,
             }
@@ -119,6 +140,8 @@ def search(
     *,
     task_mode: str = "auto",
     expanded_queries: list[str] | None = None,
+    include_context: bool | None = None,
+    debug: bool | None = None,
 ) -> dict:
     return _dispatch_search(
         query,
@@ -126,6 +149,10 @@ def search(
         mode,
         task_mode=task_mode,
         expanded_queries=expanded_queries,
+        **_online_request_options(
+            include_context=include_context,
+            debug=debug,
+        ),
     )
 
 
@@ -136,19 +163,36 @@ def _dispatch_search(
     *,
     task_mode: str = "auto",
     expanded_queries: list[str] | None = None,
+    include_context: bool | None = None,
+    debug: bool | None = None,
 ) -> dict:
     normalized = mode.casefold().strip()
+    online_options = _online_request_options(
+        include_context=include_context,
+        debug=debug,
+    )
     if normalized in {"online", "auto"}:
         return search_online(
             query=query,
             task=task_mode,
             top_k=top_k,
             expanded_queries=expanded_queries or [],
+            **online_options,
         )
     if normalized in {"kis", "hybrid"}:
-        return search_online(query=query, task="kis", top_k=top_k)
+        return search_online(
+            query=query,
+            task="kis",
+            top_k=top_k,
+            **online_options,
+        )
     if normalized == "avs":
-        return search_online(query=query, task="avs", top_k=top_k)
+        return search_online(
+            query=query,
+            task="avs",
+            top_k=top_k,
+            **online_options,
+        )
     if normalized in {
         "qa",
         "qa_evidence",
@@ -162,11 +206,22 @@ def _dispatch_search(
             task="qa",
             top_k=min(5, int(top_k)),
             expanded_queries=expanded_queries or [],
+            **online_options,
         )
     if normalized == "temporal":
-        return search_online(query=query, task="temporal", top_k=top_k)
+        return search_online(
+            query=query,
+            task="temporal",
+            top_k=top_k,
+            **online_options,
+        )
     if normalized == "trake":
-        return search_online(query=query, task="trake", top_k=min(100, int(top_k)))
+        return search_online(
+            query=query,
+            task="trake",
+            top_k=min(100, int(top_k)),
+            **online_options,
+        )
 
     # Modality-only modes are retained as diagnostics. User-facing task routes
     # above all pass through the canonical OnlinePipeline.

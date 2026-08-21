@@ -53,25 +53,52 @@ class FakeSiglip2Processor:
     def __init__(self) -> None:
         self.calls = []
 
-    def __call__(self, *, text, padding: str, return_tensors: str):
+    def __call__(
+        self,
+        *,
+        text=None,
+        images=None,
+        padding: str | None = None,
+        return_tensors: str,
+    ):
+        if text is not None:
+            self.calls.append(
+                {
+                    "text": text,
+                    "padding": padding,
+                    "return_tensors": return_tensors,
+                }
+            )
+            return {
+                "input_ids": torch.tensor([[1, 2]], dtype=torch.int64),
+                "attention_mask": torch.tensor([[1, 1]], dtype=torch.int64),
+            }
         self.calls.append(
             {
-                "text": text,
-                "padding": padding,
+                "image_count": len(images),
                 "return_tensors": return_tensors,
             }
         )
         return {
-            "input_ids": torch.tensor([[1, 2]], dtype=torch.int64),
-            "attention_mask": torch.tensor([[1, 1]], dtype=torch.int64),
+            "pixel_values": torch.ones(
+                (len(images), 3, 2, 2),
+                dtype=torch.float32,
+            )
         }
 
 
 class FakeSiglip2Model:
-    def __init__(self, vector: list[float] | None = None) -> None:
+    def __init__(
+        self,
+        vector: list[float] | None = None,
+        image_vectors: list[list[float]] | None = None,
+    ) -> None:
         self.vector = vector or [3.0, 4.0]
+        self.image_vectors = image_vectors
+        self.image_offset = 0
         self.eval_called = False
         self.get_text_features_called = False
+        self.get_image_features_called = False
 
     def to(self, device: str):
         self.device = device
@@ -84,6 +111,14 @@ class FakeSiglip2Model:
     def get_text_features(self, input_ids, attention_mask):
         self.get_text_features_called = True
         return torch.tensor([self.vector], dtype=torch.float32)
+
+    def get_image_features(self, pixel_values):
+        self.get_image_features_called = True
+        batch_size = int(pixel_values.shape[0])
+        vectors = self.image_vectors or [self.vector] * batch_size
+        selected = vectors[self.image_offset : self.image_offset + batch_size]
+        self.image_offset += batch_size
+        return torch.tensor(selected, dtype=torch.float32)
 
 
 def siglip2_contract(vector_dim: int = 2) -> EncoderContract:
@@ -208,6 +243,40 @@ class VisualSearchEngineTest(unittest.TestCase):
         self.assertEqual(vector.dtype, np.float32)
         self.assertAlmostEqual(float(np.linalg.norm(vector)), 1.0, places=6)
 
+    def test_siglip2_encoder_batches_normalized_image_features_on_same_model(self) -> None:
+        model = FakeSiglip2Model(
+            image_vectors=[[3.0, 4.0], [0.0, 2.0], [5.0, 0.0]],
+        )
+        processor = FakeSiglip2Processor()
+        encoder = Siglip2TextEncoder(
+            contract=siglip2_contract(),
+            device="cpu",
+            model=model,
+            processor=processor,
+        )
+
+        vectors = encoder.encode_images(
+            [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(3)],
+            batch_size=2,
+        )
+
+        self.assertTrue(model.eval_called)
+        self.assertTrue(model.get_image_features_called)
+        self.assertEqual(
+            processor.calls,
+            [
+                {"image_count": 2, "return_tensors": "pt"},
+                {"image_count": 1, "return_tensors": "pt"},
+            ],
+        )
+        self.assertEqual(vectors.shape, (3, 2))
+        self.assertEqual(vectors.dtype, np.float32)
+        np.testing.assert_allclose(
+            np.linalg.norm(vectors, axis=1),
+            np.ones(3, dtype=np.float32),
+            atol=1e-6,
+        )
+
     def test_siglip2_encoder_rejects_manifest_dimension_mismatch(self) -> None:
         encoder = Siglip2TextEncoder(
             contract=siglip2_contract(vector_dim=3),
@@ -299,6 +368,54 @@ class VisualSearchEngineTest(unittest.TestCase):
             self.assertEqual(response.results[0].timestamp, 2.0)
             self.assertEqual(response.results[0].score, 0.91)
             self.assertEqual(response.results[1].frame_id, "FRAME_L01_V001_000001")
+
+    def test_search_by_vector_skips_text_encoder_and_normalizes_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            frame_map_path = Path(tmp_dir) / "frame_map.json"
+            frame_map_path.write_text(
+                json.dumps(
+                    {
+                        "0": {
+                            "frame_id": "F000",
+                            "video_id": "V001",
+                            "timestamp": 0.0,
+                            "keyframe_path": "data/keyframes/V001/F000.jpg",
+                        },
+                        "1": {
+                            "frame_id": "F001",
+                            "video_id": "V001",
+                            "timestamp": 1.0,
+                            "keyframe_path": "data/keyframes/V001/F001.jpg",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class RejectingEncoder:
+                def encode(self, query: str) -> np.ndarray:
+                    raise AssertionError(f"unexpected second encoding: {query}")
+
+            searcher = FakeSearcher()
+            engine = VisualSearchEngine(
+                config=VisualSearchConfig(default_top_k=2),
+                encoder=RejectingEncoder(),
+                searcher=searcher,
+                metadata_store=MetadataStore.from_frame_map(frame_map_path),
+            )
+
+            response = engine.search_by_vector(
+                "a man cooking in a kitchen",
+                np.asarray([3.0, 4.0], dtype=np.float32),
+                top_k=2,
+            )
+
+            self.assertEqual(response.top_k, 2)
+            self.assertEqual(searcher.seen_top_k, 2)
+            np.testing.assert_allclose(
+                searcher.seen_vector,
+                np.asarray([[0.6, 0.8]], dtype=np.float32),
+            )
 
     def test_search_filters_scores_below_configured_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

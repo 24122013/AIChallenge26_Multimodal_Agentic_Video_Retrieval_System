@@ -36,6 +36,46 @@ query_expansion:
   dtype: auto
   quantization: 4bit
 
+online:
+  # Canonical KIS/AVS route: selected-keyframe RRF -> dense rescue -> CSES.
+  coarse_to_dense_enabled: true
+  dense_enabled: true
+  # Legacy corpora without the new dense bundle stay usable, but the response
+  # trace must say selected_only_fallback instead of pretending dense ran.
+  dense_missing_behavior: fallback_sparse
+  coarse_top_n: 50
+  dense_global_top_k: 300
+  dense_rescue_clips: 10
+  max_total_clips: 60
+  dense_frames_per_clip: 12
+  rrf_k: 60
+  modality_hint_boost: 1.5
+  similarity_threshold: 0.92
+  temporal_window_seconds: 2.0
+  max_event_gap_seconds: 180.0
+  rrf_enabled: true
+  cses_enabled: true
+  deterministic_rerank_enabled: true
+  debug_enabled: false
+  # Context scoring is metadata-only and runs after CSES, before final Top-K.
+  # It activates only when the matching ONLINE_*_CONTEXT_ENABLED artifact is loaded.
+  neighbor_scoring_enabled: true
+  segment_scoring_enabled: true
+  max_neighbors_each_side: 2
+  segment_context_candidate_limit: 12
+  segment_context_top_k: 3
+  context_max_bonus: 0.08
+  rerank_coarse_rrf_weight: 0.14
+  rerank_dense_visual_weight: 0.39
+  rerank_caption_weight: 0.11
+  rerank_ocr_weight: 0.10
+  rerank_objects_weight: 0.07
+  rerank_cses_gain_weight: 0.04
+  rerank_temporal_consistency_weight: 0.03
+  rerank_modality_alignment_weight: 0.02
+  rerank_neighbor_support_weight: 0.05
+  rerank_segment_support_weight: 0.05
+
 trake:
   # BGE-M3 is independently opt-in for TRAKE; QA flags never enable it here.
   bge_dense_enabled: false

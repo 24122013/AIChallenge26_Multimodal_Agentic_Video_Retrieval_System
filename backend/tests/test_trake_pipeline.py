@@ -5,6 +5,8 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
+
 from backend.app.models.retrieval import RetrievalResult, VisualSearchResponse
 from backend.app.services.retrieval.retrieval_config import TrakeConfig
 from backend.app.services.trake.candidate_video import gate_candidate_videos
@@ -27,6 +29,7 @@ from backend.app.services.trake.temporal_refinement import (
     DecodedFrame,
     LocalFrameHypothesis,
     RefinementVariant,
+    Siglip2LocalFrameScorer,
     TemporalRefiner,
     select_local_hypotheses,
 )
@@ -214,6 +217,46 @@ class FakeDecoder:
             DecodedFrame(index, object())
             for index in range(start_frame, end_frame + 1, stride)
         ]
+
+
+class FakeImageDecoder:
+    def decode(
+        self,
+        video_path: Path,
+        *,
+        start_frame: int,
+        end_frame: int,
+        stride: int,
+    ) -> list[DecodedFrame]:
+        return [
+            DecodedFrame(
+                index,
+                np.full((2, 2, 3), index % 255, dtype=np.uint8),
+            )
+            for index in range(start_frame, end_frame + 1, stride)
+        ]
+
+
+class FakeSiglip2LocalEncoder:
+    def __init__(self, image_vectors: list[list[float]]) -> None:
+        self.image_vectors = np.asarray(image_vectors, dtype=np.float32)
+        self.queries: list[str] = []
+        self.images: list[np.ndarray] = []
+        self.batch_sizes: list[int] = []
+
+    def encode(self, query: str) -> np.ndarray:
+        self.queries.append(query)
+        return np.asarray([[1.0, 0.0]], dtype=np.float32)
+
+    def encode_images(
+        self,
+        images: list[np.ndarray],
+        *,
+        batch_size: int = 16,
+    ) -> np.ndarray:
+        self.images.extend(images)
+        self.batch_sizes.append(batch_size)
+        return self.image_vectors[: len(images)]
 
 
 class SequenceScorer:
@@ -703,6 +746,76 @@ class TrakeCorePipelineTest(unittest.TestCase):
         self.assertEqual(transition[0].strategy, "first_positive_transition")
         self.assertEqual(peak[0].frame_index, 3)
         self.assertEqual(peak[0].strategy, "local_peak")
+
+    def test_siglip2_local_scorer_returns_finite_aligned_semantic_scores(self) -> None:
+        encoder = FakeSiglip2LocalEncoder(
+            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]],
+        )
+        scorer = Siglip2LocalFrameScorer(encoder, batch_size=2)
+        frames = [
+            DecodedFrame(
+                index,
+                np.asarray([[[1, 2, 3]]], dtype=np.uint8),
+            )
+            for index in range(3)
+        ]
+
+        scores = scorer.score(_event(0, "peak"), frames)
+
+        self.assertEqual(encoder.queries, ["scene peak"])
+        self.assertEqual(encoder.batch_sizes, [2])
+        self.assertEqual(len(scores), len(frames))
+        self.assertTrue(np.isfinite(np.asarray(scores)).all())
+        np.testing.assert_allclose(scores, [1.0, 0.5, 0.0], atol=1e-6)
+        # OpenCV's BGR pixel must reach the shared SigLIP2 processor as RGB.
+        self.assertEqual(encoder.images[0][0, 0].tolist(), [3, 2, 1])
+
+    def test_pipeline_injected_siglip2_scorer_applies_local_refinement(self) -> None:
+        plan = TemporalEventPlan(
+            original_query="peak",
+            context="",
+            events=(_event(0, "peak", BoundaryType.PEAK),),
+            parser_source="test",
+            confidence=1.0,
+        )
+        encoder = FakeSiglip2LocalEncoder(
+            [[0.0, 1.0], [0.6, 0.8], [1.0, 0.0], [0.6, 0.8], [0.0, 1.0]],
+        )
+        scorer = Siglip2LocalFrameScorer(encoder, batch_size=3)
+        engine = FakeRetrievalEngine(
+            {"scene peak": [_result("INTERNAL_PEAK", 100, score=0.9)]}
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary, "V1.mp4").touch()
+            pipeline = TrakePipeline(
+                retrieval_engine=engine,
+                config=TrakeConfig(
+                    event_top_k=10,
+                    refinement_top_paths=1,
+                    window_before_frames=2,
+                    window_after_frames=2,
+                    dense_stride_frames=1,
+                ),
+                parser=StaticParser(plan),
+                local_scorer=scorer,
+                local_decoder=FakeImageDecoder(),
+                video_root=temporary,
+            )
+            response = pipeline.search("peak", top_k=1)
+
+        self.assertTrue(response["hypotheses"])
+        self.assertTrue(response["trace"]["refinement"]["scorer_available"])
+        self.assertEqual(
+            response["trace"]["feature_flags"]["local_scorer"],
+            "Siglip2LocalFrameScorer",
+        )
+        self.assertTrue(
+            response["hypotheses"][0]["score_breakdown"]["refinement"]["applied"]
+        )
+        self.assertNotIn(
+            "local_refinement_scorer_unavailable",
+            response["trace"]["warnings"],
+        )
 
     def test_flat_local_scores_preserve_coarse_frame_without_false_confidence(self) -> None:
         frames = [DecodedFrame(index, object()) for index in range(40, 161)]
