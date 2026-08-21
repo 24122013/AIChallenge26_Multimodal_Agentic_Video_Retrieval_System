@@ -3,6 +3,8 @@
 from backend.app.services.submission.csv_export import (
     SubmissionExportError,
     export_query_csv,
+    export_response_csv,
+    save_exported_csv,
     serialize_kis_csv,
     serialize_qa_csv,
     serialize_trake_csv,
@@ -11,6 +13,8 @@ from backend.app.services.submission.csv_export import (
 __all__ = [
     "SubmissionExportError",
     "export_query_csv",
+    "export_response_csv",
+    "save_exported_csv",
     "serialize_kis_csv",
     "serialize_qa_csv",
     "serialize_trake_csv",

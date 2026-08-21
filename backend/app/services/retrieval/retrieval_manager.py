@@ -546,6 +546,10 @@ def load_visual_search_config() -> VisualSearchConfig:
             "RETRIEVAL_NO_AUTOCAST",
             defaults.no_autocast,
         ),
+        local_files_only=_bool_from_env(
+            "RETRIEVAL_MODELS_LOCAL_ONLY",
+            defaults.local_files_only,
+        ),
         default_top_k=int(
             os.getenv("RETRIEVAL_DEFAULT_TOP_K", defaults.default_top_k)
         ),
@@ -1679,12 +1683,12 @@ def search_trake(
     query: str,
     top_k: int | None = None,
 ) -> dict[str, Any]:
-    """Return ranked same-video TRAKE frame sequences, never flattened frames."""
+    """Return up to 100 genuine ranked same-video TRAKE sequences."""
 
     config = get_runtime_config().trake
-    requested_top_k = config.max_answers if top_k is None else int(top_k)
-    requested_top_k = max(1, min(requested_top_k, config.max_answers, 100))
-    return get_trake_pipeline().search(query=query, top_k=requested_top_k)
+    if config.max_answers < 100:
+        raise RuntimeError("TRAKE runtime must allow exactly 100 results")
+    return get_trake_pipeline().search(query=query, top_k=100)
 
 
 def search_qa_evidence(

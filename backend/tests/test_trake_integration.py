@@ -39,7 +39,7 @@ class TrakePublicIntegrationTest(unittest.TestCase):
             return_value=response,
         ) as direct:
             self.assertIs(retrieval_api.trake_search("query", 50), response)
-        direct.assert_called_once_with(query="query", top_k=50)
+        direct.assert_called_once_with(query="query", top_k=100)
 
         with mock.patch.object(
             search_api,
@@ -47,12 +47,12 @@ class TrakePublicIntegrationTest(unittest.TestCase):
             return_value=response,
         ) as online:
             self.assertIs(
-                search_api._dispatch_search("query", 150, "trake"),
+                search_api._dispatch_search("query", 5, "trake"),
                 response,
             )
         online.assert_called_once_with(query="query", task="trake", top_k=100)
 
-    def test_manager_search_trake_uses_cached_pipeline_and_caps_top_k(self) -> None:
+    def test_manager_search_trake_uses_cached_pipeline_and_fixes_top_k(self) -> None:
         pipeline = mock.Mock()
         pipeline.search.return_value = {"task": "trake", "hypotheses": []}
         runtime = SimpleNamespace(trake=TrakeConfig())
@@ -68,7 +68,7 @@ class TrakePublicIntegrationTest(unittest.TestCase):
                 return_value=pipeline,
             ),
         ):
-            response = retrieval_manager.search_trake("query", top_k=500)
+            response = retrieval_manager.search_trake("query", top_k=5)
 
         self.assertEqual(response["task"], "trake")
         pipeline.search.assert_called_once_with(query="query", top_k=100)

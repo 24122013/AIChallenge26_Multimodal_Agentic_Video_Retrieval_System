@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -81,19 +82,51 @@ class Siglip2LocalFrameScorer:
             raise ValueError("TRAKE local scorer batch_size must be positive")
         self.encoder = encoder
         self.batch_size = int(batch_size)
+        self._text_cache: dict[str, np.ndarray] = {}
+        self._image_cache: dict[int, np.ndarray] = {}
+        self._stats: dict[str, int] = {}
+
+    def begin_request(self) -> None:
+        self._text_cache.clear()
+        self._image_cache.clear()
+        self._stats = {
+            "text_encode_calls": 0,
+            "image_encode_calls": 0,
+            "frames_encoded": 0,
+            "frame_embedding_cache_hits": 0,
+        }
+
+    @property
+    def request_stats(self) -> dict[str, int]:
+        return dict(self._stats)
 
     def score(
         self,
         event: TemporalEvent,
         frames: Sequence[DecodedFrame],
     ) -> Sequence[float]:
+        semantic, _ = self.score_with_motion(event, frames)
+        return semantic
+
+    def score_with_motion(
+        self,
+        event: TemporalEvent,
+        frames: Sequence[DecodedFrame],
+    ) -> tuple[list[float], list[float]]:
         if not frames:
-            return []
-        query = " ".join(str(event.retrieval_query).split())
+            return [], []
+        query = " ".join(
+            str(event.refinement_query or event.retrieval_query).split()
+        )
         if not query:
             raise ValueError("TRAKE local refinement query must not be empty")
 
-        query_vector = np.asarray(self.encoder.encode(query), dtype=np.float32)
+        cached_query = self._text_cache.get(query)
+        if cached_query is None:
+            cached_query = np.asarray(self.encoder.encode(query), dtype=np.float32)
+            self._text_cache[query] = cached_query
+            self._stats["text_encode_calls"] = self._stats.get("text_encode_calls", 0) + 1
+        query_vector = np.asarray(cached_query, dtype=np.float32)
         if query_vector.ndim == 2 and query_vector.shape[0] == 1:
             query_vector = query_vector[0]
         if query_vector.ndim != 1 or not np.isfinite(query_vector).all():
@@ -103,14 +136,30 @@ class Siglip2LocalFrameScorer:
             raise ValueError("TRAKE local query embedding must not be zero")
         query_vector = query_vector / query_norm
 
-        rgb_images = [_to_rgb_image(frame.image) for frame in frames]
-        image_vectors = np.asarray(
-            self.encoder.encode_images(
-                rgb_images,
-                batch_size=self.batch_size,
-            ),
-            dtype=np.float32,
-        )
+        keys = [id(frame.image) for frame in frames]
+        missing = [
+            (key, _to_rgb_image(frame.image))
+            for key, frame in zip(keys, frames)
+            if key not in self._image_cache
+        ]
+        if missing:
+            encoded = np.asarray(
+                self.encoder.encode_images(
+                    [image for _, image in missing],
+                    batch_size=self.batch_size,
+                ),
+                dtype=np.float32,
+            )
+            if encoded.ndim != 2 or encoded.shape[0] != len(missing):
+                raise ValueError("TRAKE local image embeddings must align with frames")
+            for (key, _), vector in zip(missing, encoded):
+                self._image_cache[key] = vector
+            self._stats["image_encode_calls"] = self._stats.get("image_encode_calls", 0) + 1
+            self._stats["frames_encoded"] = self._stats.get("frames_encoded", 0) + len(missing)
+        self._stats["frame_embedding_cache_hits"] = self._stats.get(
+            "frame_embedding_cache_hits", 0
+        ) + len(frames) - len(missing)
+        image_vectors = np.asarray([self._image_cache[key] for key in keys], dtype=np.float32)
         if image_vectors.ndim != 2 or image_vectors.shape[0] != len(frames):
             raise ValueError("TRAKE local image embeddings must align with frames")
         if image_vectors.shape[1] != query_vector.shape[0]:
@@ -127,7 +176,14 @@ class Siglip2LocalFrameScorer:
         scores = np.clip((image_vectors @ query_vector + 1.0) / 2.0, 0.0, 1.0)
         if scores.shape != (len(frames),) or not np.isfinite(scores).all():
             raise ValueError("TRAKE local scorer produced invalid scores")
-        return [float(value) for value in scores]
+        deltas = np.zeros(len(frames), dtype=np.float32)
+        if len(frames) > 1:
+            deltas[1:] = np.clip(
+                1.0 - np.sum(image_vectors[1:] * image_vectors[:-1], axis=1),
+                0.0,
+                1.0,
+            )
+        return [float(value) for value in scores], [float(value) for value in deltas]
 
 
 def _to_rgb_image(image: Any) -> Any:
@@ -251,6 +307,77 @@ class TemporalRefiner:
         )
         self.decoder = decoder or OpenCVLocalFrameDecoder()
         self.scorer = scorer
+        self._frame_cache: dict[tuple[str, int], DecodedFrame] = {}
+        self._stats: dict[str, float | int] = {}
+
+    def begin_request(self) -> None:
+        self._frame_cache.clear()
+        self._stats = {
+            "decode_calls": 0,
+            "frames_decoded": 0,
+            "decoded_frame_cache_hits": 0,
+            "frame_decode_ms": 0.0,
+            "frame_embedding_ms": 0.0,
+        }
+        begin = getattr(self.scorer, "begin_request", None)
+        if callable(begin):
+            begin()
+
+    def end_request(self) -> None:
+        return None
+
+    @property
+    def request_stats(self) -> dict[str, Any]:
+        output = dict(self._stats)
+        scorer_stats = getattr(self.scorer, "request_stats", {})
+        if isinstance(scorer_stats, dict):
+            output.update(scorer_stats)
+        return output
+
+    def _decode_cached(
+        self,
+        video_path: Path,
+        video_id: str,
+        *,
+        start_frame: int,
+        end_frame: int,
+        stride: int,
+    ) -> list[DecodedFrame]:
+        requested = list(range(start_frame, end_frame + 1, stride))
+        missing = [index for index in requested if (video_id, index) not in self._frame_cache]
+        self._stats["decoded_frame_cache_hits"] = int(
+            self._stats.get("decoded_frame_cache_hits", 0)
+        ) + len(requested) - len(missing)
+        ranges: list[tuple[int, int]] = []
+        for index in missing:
+            if ranges and index == ranges[-1][1] + stride:
+                ranges[-1] = (ranges[-1][0], index)
+            else:
+                ranges.append((index, index))
+        for range_start, range_end in ranges:
+            started = time.perf_counter()
+            decoded = list(
+                self.decoder.decode(
+                    video_path,
+                    start_frame=range_start,
+                    end_frame=range_end,
+                    stride=stride,
+                )
+            )
+            self._stats["frame_decode_ms"] = round(
+                float(self._stats.get("frame_decode_ms", 0.0))
+                + (time.perf_counter() - started) * 1000.0,
+                3,
+            )
+            self._stats["decode_calls"] = int(self._stats.get("decode_calls", 0)) + 1
+            self._stats["frames_decoded"] = int(self._stats.get("frames_decoded", 0)) + len(decoded)
+            for frame in decoded:
+                self._frame_cache[(video_id, frame.frame_index)] = frame
+        return [
+            self._frame_cache[(video_id, index)]
+            for index in requested
+            if (video_id, index) in self._frame_cache
+        ]
 
     def refine(
         self,
@@ -284,15 +411,27 @@ class TemporalRefiner:
             start = max(0, coarse - self.config.window_before_frames)
             end = coarse + self.config.window_after_frames
             try:
-                frames = list(
-                    self.decoder.decode(
-                        video_path,
-                        start_frame=start,
-                        end_frame=end,
-                        stride=self.config.dense_stride_frames,
-                    )
+                frames = self._decode_cached(
+                    video_path,
+                    path.video_id,
+                    start_frame=start,
+                    end_frame=end,
+                    stride=self.config.dense_stride_frames,
                 )
-                scores = list(self.scorer.score(event, frames))
+                embedding_started = time.perf_counter()
+                score_with_motion = getattr(self.scorer, "score_with_motion", None)
+                if callable(score_with_motion):
+                    scores, motion_scores = score_with_motion(event, frames)
+                    scores = list(scores)
+                    motion_scores = list(motion_scores)
+                else:
+                    scores = list(self.scorer.score(event, frames))
+                    motion_scores = None
+                self._stats["frame_embedding_ms"] = round(
+                    float(self._stats.get("frame_embedding_ms", 0.0))
+                    + (time.perf_counter() - embedding_started) * 1000.0,
+                    3,
+                )
                 if not frames or len(scores) != len(frames):
                     raise ValueError("local_score_shape_mismatch")
                 if any(not math.isfinite(float(score)) for score in scores):
@@ -303,6 +442,7 @@ class TemporalRefiner:
                     scores,
                     limit=self.config.local_hypotheses_per_event,
                     coarse_frame_index=coarse,
+                    motion_scores=motion_scores,
                 )
                 if not selected:
                     raise ValueError("local_hypothesis_empty")
@@ -340,6 +480,8 @@ def select_local_hypotheses(
     *,
     limit: int,
     coarse_frame_index: int | None = None,
+    motion_scores: Sequence[float] | None = None,
+    confirmation_frames: int = 2,
 ) -> list[LocalFrameHypothesis]:
     """Select boundary-aware local frame alternatives from fake or real scores."""
 
@@ -349,6 +491,10 @@ def select_local_hypotheses(
         raise ValueError("local frames and scores must align")
     if not frames:
         return []
+    if motion_scores is not None and len(motion_scores) != len(frames):
+        raise ValueError("local motion scores and frames must align")
+    if confirmation_frames <= 0:
+        raise ValueError("confirmation_frames must be positive")
     pairs = sorted(
         ((frame.frame_index, float(score)) for frame, score in zip(frames, scores)),
         key=lambda item: item[0],
@@ -410,12 +556,43 @@ def select_local_hypotheses(
         values = [score for _, score in pairs]
         low, high = min(values), max(values)
         threshold = low + 0.55 * (high - low)
-        crossings = [
-            pair
-            for index, pair in enumerate(pairs)
-            if pair[1] >= threshold
-            and (index == 0 or pairs[index - 1][1] < threshold)
-        ]
+        motion_by_frame = {
+            frame.frame_index: float(value)
+            for frame, value in zip(frames, motion_scores or [0.0] * len(frames))
+        }
+        max_motion = max(motion_by_frame.values(), default=0.0)
+        motion_threshold = 0.35 * max_motion
+        crossings = []
+        for index, pair in enumerate(pairs):
+            confirmed = all(
+                pairs[future][1] >= threshold
+                for future in range(index, min(len(pairs), index + confirmation_frames))
+            ) and min(len(pairs), index + confirmation_frames) - index >= confirmation_frames
+            motion_ok = motion_scores is None or (
+                max_motion > 1e-6 and motion_by_frame[pair[0]] >= motion_threshold
+            )
+            if (
+                pair[1] >= threshold
+                and (index == 0 or pairs[index - 1][1] < threshold)
+                and confirmed
+                and motion_ok
+            ):
+                crossings.append(pair)
+        if not crossings and motion_scores is not None:
+            fallback_frame, fallback_score = min(
+                pairs,
+                key=lambda item: (abs(item[0] - center), item[0]),
+            )
+            return [
+                LocalFrameHypothesis(
+                    frame_index=int(fallback_frame),
+                    score=round(fallback_score, 6),
+                    strategy="insufficient_temporal_signal_fallback",
+                    confidence=0.0,
+                    source="canonical_metadata",
+                    warning="insufficient_temporal_boundary_signal",
+                )
+            ]
         primary = min(crossings, key=lambda item: item[0]) if crossings else max(
             pairs,
             key=lambda item: (item[1], -item[0]),

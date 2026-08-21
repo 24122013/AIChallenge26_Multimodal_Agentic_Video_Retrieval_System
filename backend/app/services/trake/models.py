@@ -61,9 +61,20 @@ class TemporalEvent:
     name: str = ""
     boundary_type: BoundaryType | str = BoundaryType.UNKNOWN
     protected_terms: tuple[str, ...] = ()
+    # Additive semantic fields.  Defaults keep older constructors and clients
+    # source-compatible while the parser exposes the richer TRAKE contract.
+    event_context: str = ""
+    target_text: str = ""
+    refinement_query: str = ""
+    normalized_text: str = ""
+    parser_warnings: tuple[str, ...] = ()
+    semantic_confidence: float = 0.0
+    parser_trace: Mapping[str, Any] = field(default_factory=dict)
+    source_label: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "protected_terms", tuple(self.protected_terms))
+        object.__setattr__(self, "parser_warnings", tuple(self.parser_warnings))
         # Validate string inputs while retaining the string-compatible enum.
         object.__setattr__(
             self,
@@ -79,6 +90,14 @@ class TemporalEvent:
             "retrieval_query": self.retrieval_query,
             "boundary_type": _boundary_value(self.boundary_type),
             "protected_terms": list(self.protected_terms),
+            "event_context": self.event_context,
+            "target_text": self.target_text,
+            "refinement_query": self.refinement_query,
+            "normalized_text": self.normalized_text,
+            "parser_warnings": list(self.parser_warnings),
+            "semantic_confidence": self.semantic_confidence,
+            "parser_trace": _stable_value(self.parser_trace),
+            "source_label": self.source_label,
         }
 
 
@@ -92,6 +111,8 @@ class TemporalEventPlan:
     parser_source: str = "deterministic_fallback"
     confidence: float = 0.0
     warnings: tuple[str, ...] = ()
+    structural_confidence: float = 0.0
+    semantic_confidence: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "events", tuple(self.events))
@@ -111,6 +132,8 @@ class TemporalEventPlan:
             "parser_source": self.parser_source,
             "confidence": self.confidence,
             "warnings": list(self.warnings),
+            "structural_confidence": self.structural_confidence,
+            "semantic_confidence": self.semantic_confidence,
         }
 
 

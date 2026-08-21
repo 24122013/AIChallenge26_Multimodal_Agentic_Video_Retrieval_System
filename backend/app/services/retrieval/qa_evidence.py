@@ -484,7 +484,7 @@ class QaEvidenceSearchEngine:
         selected = merge_candidates(
             [final_pool],
             top_k=requested_top_k,
-            dedupe_same_shot=True,
+            dedupe_same_shot=False,
         )
         conflict_keys = _conflicting_shots(conflict_sources)
         evidence = (

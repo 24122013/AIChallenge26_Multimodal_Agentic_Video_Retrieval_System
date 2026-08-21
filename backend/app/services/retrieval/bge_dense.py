@@ -12,6 +12,7 @@ import math
 import threading
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -460,6 +461,35 @@ class BgeM3DenseSearchEngine:
             output.append(_retrieval_result(record, float(score), row))
         return output
 
+    def search_many(
+        self,
+        queries: Sequence[str],
+        top_k: int = 20,
+    ) -> list[list[RetrievalResult]]:
+        values = [" ".join(str(query).split()) for query in queries]
+        if not values or any(not query for query in values):
+            raise ValueError("BGE-M3 queries must not be empty")
+        if int(top_k) <= 0:
+            raise ValueError("BGE-M3 top_k must be positive")
+        vectors = _encode_and_normalize(self.encoder, values, expected_rows=len(values))
+        limit = min(int(top_k), len(self.artifacts.frame_records))
+        scores, rows = self.artifacts.index.search(
+            np.ascontiguousarray(vectors, dtype=np.float32),
+            limit,
+        )
+        return [
+            [
+                _retrieval_result(
+                    self.artifacts.frame_records[row]["metadata"],
+                    float(score),
+                    row,
+                )
+                for score, row in zip(row_scores.tolist(), row_ids.tolist())
+                if row >= 0
+            ]
+            for row_scores, row_ids in zip(scores, rows)
+        ]
+
 
 class LazyBgeM3Encoder:
     """Lazy Transformers BGE-M3 CLS encoder for GPU or CPU execution."""
@@ -492,6 +522,16 @@ class LazyBgeM3Encoder:
         self._device = "cpu"
         self.resolved_revision = model_revision
         self._call_lock = threading.RLock()
+        self._model_load_count = 0
+        self._last_model_load_ms = 0.0
+
+    @property
+    def model_load_count(self) -> int:
+        return self._model_load_count
+
+    @property
+    def last_model_load_ms(self) -> float:
+        return self._last_model_load_ms
 
     def __call__(self, texts: Sequence[str]) -> np.ndarray:
         if not texts:
@@ -525,6 +565,10 @@ class LazyBgeM3Encoder:
     def _load(self) -> None:
         if self._model is not None:
             return
+        load_started = time.perf_counter()
+        if self.local_files_only:
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         try:
             import torch
             from transformers import AutoModel, AutoTokenizer
@@ -554,6 +598,11 @@ class LazyBgeM3Encoder:
         self._tokenizer = tokenizer
         self._model = model
         self._device = device
+        self._model_load_count += 1
+        self._last_model_load_ms = round(
+            (time.perf_counter() - load_started) * 1000.0,
+            3,
+        )
         config = getattr(model, "config", None)
         self.resolved_revision = str(
             getattr(config, "_commit_hash", None) or self.model_revision

@@ -61,21 +61,12 @@ def align_candidate_video(
         config=runtime,
         allow_equal_frame=False,
     )
-    fallback = False
-    if not states:
-        states = _build_beam(
-            ordered,
-            config=runtime,
-            allow_equal_frame=True,
-        )
-        fallback = bool(states)
-
     paths = [
         _to_temporal_path(
             video,
             state.candidates,
             config=runtime,
-            warnings=("alignment_equal_frame_fallback",) if fallback else (),
+            warnings=(),
         )
         for state in states
         if len(state.candidates) == event_count

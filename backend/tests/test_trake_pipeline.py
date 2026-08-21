@@ -272,6 +272,110 @@ class SequenceScorer:
 
 
 class TrakeCorePipelineTest(unittest.TestCase):
+    def test_out_of_corpus_low_semantic_support_returns_no_sequence(self) -> None:
+        plan = TemporalEventPlan(
+            "lion dance",
+            "",
+            (_event(0, "lion spins"), _event(1, "dragon moves")),
+        )
+        engine = FakeRetrievalEngine(
+            {
+                "scene lion spins": [_result("LOW1", 10, score=0.01)],
+                "scene dragon moves": [_result("LOW2", 20, score=0.02)],
+            }
+        )
+        response = TrakePipeline(
+            retrieval_engine=engine,
+            parser=StaticParser(plan),
+            config=TrakeConfig(
+                refinement_enabled=False,
+                minimum_semantic_support=0.2,
+            ),
+        ).search("lion dance")
+
+        self.assertEqual(response["status"], "insufficient_support")
+        self.assertEqual(response["hypotheses"], [])
+        self.assertIn("no_video_supports_all_events", response["warnings"])
+
+    def test_strict_alignment_never_reuses_one_frame_for_two_events(self) -> None:
+        video = VideoCandidate(
+            video_id="V1",
+            coverage=1.0,
+            event_support=1.0,
+            event_candidates={
+                0: (_candidate(0, 10),),
+                1: (_candidate(1, 10),),
+            },
+        )
+
+        self.assertEqual(align_candidate_video(video, event_count=2), [])
+
+    def test_motion_crossing_requires_confirmation_and_falls_back_when_flat(self) -> None:
+        frames = [DecodedFrame(index, object()) for index in range(5)]
+        event = _event(0, "starts moving", BoundaryType.FIRST_TRANSITION)
+        crossing = select_local_hypotheses(
+            event,
+            frames,
+            [0.1, 0.2, 0.8, 0.9, 0.85],
+            motion_scores=[0.0, 0.05, 0.9, 0.1, 0.05],
+            limit=2,
+            coarse_frame_index=3,
+        )
+        flat_motion = select_local_hypotheses(
+            event,
+            frames,
+            [0.1, 0.2, 0.8, 0.9, 0.85],
+            motion_scores=[0.0] * 5,
+            limit=2,
+            coarse_frame_index=3,
+        )
+
+        self.assertEqual(crossing[0].frame_index, 2)
+        self.assertEqual(flat_motion[0].frame_index, 3)
+        self.assertEqual(flat_motion[0].confidence, 0.0)
+        self.assertEqual(flat_motion[0].warning, "insufficient_temporal_boundary_signal")
+
+    def test_overlapping_refinement_windows_reuse_decode_and_embeddings(self) -> None:
+        class CountingDecoder(FakeImageDecoder):
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def decode(self, *args, **kwargs):
+                self.calls += 1
+                return super().decode(*args, **kwargs)
+
+        event = _event(0, "peak", BoundaryType.PEAK)
+        path = TemporalPath(
+            video_id="V1",
+            event_candidates=(_candidate(0, 100),),
+            score=0.8,
+        )
+        plan = TemporalEventPlan("peak", "", (event,))
+        decoder = CountingDecoder()
+        encoder = FakeSiglip2LocalEncoder(
+            [[1.0, 0.0], [0.8, 0.2], [0.6, 0.4], [0.4, 0.6], [0.2, 0.8]],
+        )
+        scorer = Siglip2LocalFrameScorer(encoder)
+        with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary, "V1.mp4").touch()
+            refiner = TemporalRefiner(
+                config=TrakeConfig(window_before_frames=2, window_after_frames=2),
+                video_root=temporary,
+                decoder=decoder,
+                scorer=scorer,
+            )
+            refiner.begin_request()
+            self.assertTrue(refiner.refine(path, plan))
+            self.assertTrue(refiner.refine(path, plan))
+
+        stats = refiner.request_stats
+        self.assertEqual(decoder.calls, 1)
+        self.assertEqual(stats["frames_decoded"], 5)
+        self.assertEqual(stats["frames_encoded"], 5)
+        self.assertEqual(stats["image_encode_calls"], 1)
+        self.assertGreaterEqual(stats["decoded_frame_cache_hits"], 5)
+        self.assertGreaterEqual(stats["frame_embedding_cache_hits"], 5)
+
     def test_event_retrieval_is_independent_context_only_scores_video(self) -> None:
         plan = TemporalEventPlan(
             original_query="scene; 1. enter; 2. sit",
@@ -946,6 +1050,53 @@ class TrakeCorePipelineTest(unittest.TestCase):
             second["trace"]["bge_contract"]["dense"]["resolved_revision"],
             "commit-1",
         )
+
+    def test_supported_pipeline_can_return_exactly_100_unique_sequences(self) -> None:
+        plan = TemporalEventPlan(
+            original_query="first then second then third",
+            context="",
+            events=(
+                _event(0, "first"),
+                _event(1, "second"),
+                _event(2, "third"),
+            ),
+            parser_source="test",
+            confidence=1.0,
+        )
+        values: dict[str, list[RetrievalResult]] = {}
+        for event_index, (name, offset) in enumerate(
+            (("first", 0), ("second", 200), ("third", 400))
+        ):
+            values[f"scene {name}"] = [
+                _result(
+                    f"E{event_index}_F{index}",
+                    offset + index * 5,
+                    score=1.0 - index / 100.0,
+                    shot_id=f"E{event_index}_S{index}",
+                )
+                for index in range(20)
+            ]
+
+        response = TrakePipeline(
+            retrieval_engine=FakeRetrievalEngine(values),
+            config=TrakeConfig(
+                refinement_enabled=False,
+                event_top_k=100,
+                beam_width=500,
+                k_best_paths_per_video=100,
+            ),
+            parser=StaticParser(plan),
+        ).search(plan.original_query, top_k=100)
+
+        identities = {
+            (item["video_id"], tuple(item["frame_ids"]))
+            for item in response["hypotheses"]
+        }
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["top_k"], 100)
+        self.assertEqual(len(response["hypotheses"]), 100)
+        self.assertEqual(len(identities), 100)
+        self.assertEqual(response["trace"]["ranking"]["output_count"], 100)
 
 
 if __name__ == "__main__":

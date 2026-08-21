@@ -56,8 +56,9 @@ lineage entries. Each lineage entry must repeat its event index, video and
 `original_frame_index`; event retrieval/ranking reject missing original-frame
 identity and incomplete/unordered sequences. Submission revalidates the emitted
 lineage against `frame_ids` fail-closed and
-deduplicates `(video_id, tuple(frame_ids))`, not individual frames. The current
-provisional CSV header is `video_id,frame_id_1,...,frame_id_N`.
+deduplicates `(video_id, tuple(frame_ids))`, not individual frames. Official
+submission CSV files are headerless; each TRAKE row is
+`video_id,frame_id_1,...,frame_id_N`.
 
 ## TRAKE response and refinement audit
 
@@ -77,9 +78,8 @@ claim is made.
 
 ## Current risks
 
-- No official `data/sample_submission.csv` is present. Until one is supplied,
-  export uses isolated provisional headers and normalizes `video_id` to the
-  filename stem.
+- Export follows the official headerless CSV instructions and normalizes
+  `video_id` to the filename stem.
 - The repository exposes routers but still has no canonical FastAPI application
   factory; route contracts are unit-testable and ready to mount.
 - Full model/dataset E2E behavior still requires target-machine profiling and

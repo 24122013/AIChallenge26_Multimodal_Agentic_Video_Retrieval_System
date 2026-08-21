@@ -311,8 +311,8 @@ python -m backend.app.services.submission.export_query `
   --output data/submissions/trake_result.csv
 ```
 
-Until an official sample submission is added, the isolated header assumption is
-`video_id,frame_id_1,...,frame_id_N`. Each `frame_id_j` is original zero-based
+Official submission CSV files are headerless. Each TRAKE row is
+`video_id,frame_id_1,...,frame_id_N`, where each `frame_id_j` is original zero-based
 `frame_index`. Export validates lineage fail-closed, writes no score/timestamp/
 path/trace, and exact-deduplicates the whole `(video_id, tuple(frame_ids))`
 sequence.

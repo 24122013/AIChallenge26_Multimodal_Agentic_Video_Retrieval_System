@@ -16,6 +16,87 @@ from backend.app.services.trake.query_parser import (
 
 
 class TrakeQueryParserTest(unittest.TestCase):
+    LION_DANCE_QUERY = """Đoạn video múa lân một con lân màu vàng đen trắng, tìm các sự kiện sau:
+E1: Lân quay vòng trên cột số 4 bằng 2 chân trước rồi tiếp đất. Khoảnh khắc đầu tiên mà lân bắt đầu xoay vòng.
+E2: Khoảnh khắc 4 chân hoàn toàn chạm đất đầu tiên.
+E3: Khoảnh khắc đầu tiên 2 người biểu diễn lân cúi chào ban giám khảo.
+E4: Sau đó lân tiến lại chào một con rồng. Khoảnh khắc đầu tiên con rồng cử động đầu."""
+
+    def test_full_lion_dance_contract_preserves_four_target_moments(self) -> None:
+        plan = parse_trake_query(self.LION_DANCE_QUERY)
+
+        self.assertEqual(plan.original_query, self.LION_DANCE_QUERY)
+        self.assertEqual(
+            plan.context,
+            "Đoạn video múa lân một con lân màu vàng đen trắng",
+        )
+        self.assertEqual(plan.parser_source, "deterministic_list")
+        self.assertEqual([event.index for event in plan.events], [0, 1, 2, 3])
+        self.assertEqual([event.source_label for event in plan.events], ["E1", "E2", "E3", "E4"])
+        self.assertEqual(
+            [event.boundary_type for event in plan.events],
+            [
+                BoundaryType.FIRST_TRANSITION,
+                BoundaryType.FIRST_CONTACT,
+                BoundaryType.FIRST_TRANSITION,
+                BoundaryType.FIRST_TRANSITION,
+            ],
+        )
+        self.assertEqual(
+            plan.events[0].event_context,
+            "Lân quay vòng trên cột số 4 bằng 2 chân trước rồi tiếp đất",
+        )
+        self.assertEqual(
+            plan.events[0].target_text,
+            "Lân bắt đầu xoay vòng trên cột số 4",
+        )
+        self.assertNotIn("tiếp đất", plan.events[0].refinement_query)
+        self.assertIn("bắt đầu xoay vòng", plan.events[0].refinement_query)
+        for constraint in ("4 chân", "hoàn toàn", "chạm đất", "đầu tiên"):
+            self.assertIn(constraint, plan.events[1].retrieval_query)
+        self.assertIn("bắt đầu cúi chào", plan.events[2].target_text)
+        self.assertEqual(
+            plan.events[3].target_text,
+            "Con rồng bắt đầu cử động đầu",
+        )
+        self.assertEqual(
+            plan.events[3].event_context,
+            "Lân tiến lại chào một con rồng",
+        )
+        self.assertEqual(len(plan.events), 4)
+        self.assertLess(plan.confidence, 1.0)
+        self.assertEqual(plan.structural_confidence, 1.0)
+        self.assertGreater(plan.semantic_confidence, 0.8)
+
+    def test_typo_normalization_is_allowlisted_and_original_is_untouched(self) -> None:
+        plan = parse_trake_query("E1: Khoảnh khắc đầu tiên hai người cuối chào ban giám khảo")
+
+        event = plan.events[0]
+        self.assertIn("cuối chào", event.original_text)
+        self.assertIn("cúi chào", event.normalized_text)
+        self.assertIn("cúi chào", event.target_text)
+        self.assertIn(
+            "normalized_probable_typo: cuối chào -> cúi chào",
+            event.parser_warnings,
+        )
+
+    def test_empty_marker_is_preserved_in_event_cardinality(self) -> None:
+        plan = parse_trake_query("E1: first a door opens\r\nE2:\r\nE3: then a person exits")
+
+        self.assertEqual(len(plan.events), 3)
+        self.assertEqual([event.index for event in plan.events], [0, 1, 2])
+        self.assertEqual(plan.events[1].original_text, "")
+        self.assertIn("empty_event_marker_preserved", plan.warnings)
+        self.assertIn("empty_event_marker", plan.events[1].parser_warnings)
+
+    def test_weak_first_cue_does_not_hide_later_strong_start_cue(self) -> None:
+        event = parse_trake_query(
+            "E1: Khoảnh khắc đầu tiên mà lân bắt đầu xoay vòng"
+        ).events[0]
+
+        self.assertEqual(event.boundary_type, BoundaryType.FIRST_TRANSITION)
+        self.assertIn("bắt đầu", event.parser_trace["matched_cues"])
+
     def test_numbered_vietnamese_events_preserve_count_order_and_boundaries(self) -> None:
         query = """Bối cảnh: một trận bóng ngoài trời.
 Các sự kiện:

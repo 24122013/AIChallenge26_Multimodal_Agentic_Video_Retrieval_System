@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -21,6 +22,9 @@ from backend.app.services.metadata.metadata_store import FrameRecord, MetadataSt
 
 class TextEncoder(Protocol):
     def encode(self, query: str) -> np.ndarray:
+        ...
+
+    def encode_texts(self, queries: Sequence[str]) -> np.ndarray:
         ...
 
 
@@ -43,6 +47,7 @@ class VisualSearchConfig:
     device: str = "auto"
     model_cache_dir: Path = Path("data/model_cache/siglip2")
     no_autocast: bool = False
+    local_files_only: bool = False
     default_top_k: int = 20
     max_top_k: int = 200
     min_score: float | None = None
@@ -255,6 +260,7 @@ class Siglip2TextEncoder:
         device: str = "auto",
         model_cache_dir: Path | None = None,
         no_autocast: bool = False,
+        local_files_only: bool = False,
         model: Any | None = None,
         processor: Any | None = None,
     ) -> None:
@@ -262,16 +268,32 @@ class Siglip2TextEncoder:
         self.requested_device = device
         self.model_cache_dir = model_cache_dir
         self.no_autocast = no_autocast
+        self.local_files_only = bool(local_files_only)
         self._model = model
         self._processor = processor
         self._torch = None
         self._device = ""
         self._compute_dtype = None
+        self._model_load_count = 0
+        self._last_model_load_ms = 0.0
+
+    @property
+    def model_load_count(self) -> int:
+        return self._model_load_count
+
+    @property
+    def last_model_load_ms(self) -> float:
+        return self._last_model_load_ms
 
     def _load(self) -> None:
         if self._device:
             return
 
+        if self.local_files_only:
+            # Set before importing Transformers/Hugging Face so a cached-only
+            # runtime performs no metadata/network probe.
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         try:
             import torch
         except ImportError as exc:  # pragma: no cover - depends on local environment.
@@ -289,6 +311,7 @@ class Siglip2TextEncoder:
             raise RuntimeError("CUDA was requested for retrieval, but it is unavailable")
 
         if self._model is None or self._processor is None:
+            load_started = time.perf_counter()
             try:
                 from transformers import AutoModel, AutoProcessor
             except ImportError as exc:  # pragma: no cover - depends on local environment.
@@ -297,6 +320,7 @@ class Siglip2TextEncoder:
                     "Install project requirements first."
                 ) from exc
             kwargs: dict[str, Any] = {"revision": self.contract.model_revision}
+            kwargs["local_files_only"] = self.local_files_only
             if self.model_cache_dir:
                 self.model_cache_dir.mkdir(parents=True, exist_ok=True)
                 kwargs["cache_dir"] = self.model_cache_dir.as_posix()
@@ -307,6 +331,11 @@ class Siglip2TextEncoder:
             self._processor = AutoProcessor.from_pretrained(
                 self.contract.processor_name,
                 **kwargs,
+            )
+            self._model_load_count += 1
+            self._last_model_load_ms = round(
+                (time.perf_counter() - load_started) * 1000.0,
+                3,
             )
 
         self._model.to(device)
@@ -323,9 +352,12 @@ class Siglip2TextEncoder:
             self._compute_dtype = torch.float32
 
     def encode(self, query: str) -> np.ndarray:
-        query = query.strip()
-        if not query:
-            raise ValueError("query must not be empty")
+        return self.encode_texts([query])
+
+    def encode_texts(self, queries: Sequence[str]) -> np.ndarray:
+        values = [str(query).strip() for query in queries]
+        if not values or any(not query for query in values):
+            raise ValueError("queries must not be empty")
 
         self._load()
         assert self._model is not None
@@ -334,7 +366,7 @@ class Siglip2TextEncoder:
         assert self._compute_dtype is not None
 
         inputs = self._processor(
-            text=[query],
+            text=values,
             padding="max_length",
             return_tensors="pt",
         )
@@ -359,7 +391,7 @@ class Siglip2TextEncoder:
             with autocast:
                 output = self._model.get_text_features(**model_inputs)
         features = _feature_tensor(output, self._torch)
-        if features.ndim != 2 or features.shape[0] != 1:
+        if features.ndim != 2 or features.shape[0] != len(values):
             raise ValueError(
                 f"Unexpected SigLIP2 text feature shape: {tuple(features.shape)}"
             )
@@ -534,6 +566,7 @@ class VisualSearchEngine:
                 device=config.device,
                 model_cache_dir=config.model_cache_dir,
                 no_autocast=config.no_autocast,
+                local_files_only=config.local_files_only,
             )
         else:
             self.encoder = encoder
@@ -587,6 +620,42 @@ class VisualSearchEngine:
         if not 1 <= requested <= 10_000:
             raise ValueError("internal visual candidate pool must be between 1 and 10000")
         return self._search_bounded(query, requested)
+
+    def search_many_pool(
+        self,
+        queries: Sequence[str],
+        top_k: int,
+    ) -> list[VisualSearchResponse]:
+        """Batch text encoding and FAISS lookup for TRAKE event queries."""
+
+        requested = int(top_k)
+        if not 1 <= requested <= 10_000:
+            raise ValueError("internal visual candidate pool must be between 1 and 10000")
+        values = [str(query) for query in queries]
+        if not values:
+            return []
+        encode_many = getattr(self.encoder, "encode_texts", None)
+        if not callable(encode_many):
+            return [self._search_bounded(query, requested) for query in values]
+        started_at = time.perf_counter()
+        vectors = np.asarray(encode_many(values), dtype="float32")
+        if vectors.ndim != 2 or vectors.shape[0] != len(values) or not np.isfinite(vectors).all():
+            raise ValueError("batched SigLIP2 query vectors must be finite and aligned")
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        if np.any(norms <= 0):
+            raise ValueError("batched SigLIP2 query vectors must not be zero")
+        vectors = np.ascontiguousarray(vectors / norms, dtype="float32")
+        scores, indices = self.searcher.search(vectors, requested)
+        latency = round((time.perf_counter() - started_at) * 1000, 3)
+        return [
+            VisualSearchResponse(
+                query=query,
+                top_k=requested,
+                latency_ms=latency,
+                results=self._to_results(scores=row_scores, indices=row_indices),
+            )
+            for query, row_scores, row_indices in zip(values, scores, indices)
+        ]
 
     def _search_bounded(self, query: str, bounded_top_k: int) -> VisualSearchResponse:
         started_at = time.perf_counter()

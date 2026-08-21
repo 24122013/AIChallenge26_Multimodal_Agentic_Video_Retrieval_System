@@ -62,7 +62,6 @@ class TrakeSubmissionTests(unittest.TestCase):
         self.assertEqual(
             parsed,
             [
-                ["video_id", "frame_id_1", "frame_id_2", "frame_id_3", "frame_id_4"],
                 ["L10_V010", "101", "150", "203", "251"],
             ],
         )
@@ -80,7 +79,7 @@ class TrakeSubmissionTests(unittest.TestCase):
             )
         )
         self.assertEqual(
-            parsed[1:],
+            parsed,
             [
                 ["V1", "10", "20", "30"],
                 ["V1", "10", "21", "30"],
@@ -115,7 +114,7 @@ class TrakeSubmissionTests(unittest.TestCase):
                 }
             )
         )
-        self.assertEqual(parsed[1:], [["V1", "15", "20"]])
+        self.assertEqual(parsed, [["V1", "15", "20"]])
 
     def test_internal_frame_id_and_timestamp_are_never_used_as_fallback(self) -> None:
         response = {
@@ -134,7 +133,7 @@ class TrakeSubmissionTests(unittest.TestCase):
         parsed = _rows(serialize_trake_csv(response))
         self.assertEqual(
             parsed,
-            [["video_id", "frame_id_1", "frame_id_2"]],
+            [],
         )
 
     def test_model_to_dict_derives_lineage_only_from_retrieval_frame_index(self) -> None:
@@ -159,7 +158,7 @@ class TrakeSubmissionTests(unittest.TestCase):
             coarse_candidates=candidates,
         )
         self.assertEqual(
-            _rows(serialize_trake_csv([hypothesis]))[1],
+            _rows(serialize_trake_csv([hypothesis]))[0],
             ["V1", "17", "29"],
         )
 
@@ -184,15 +183,15 @@ class TrakeSubmissionTests(unittest.TestCase):
         )
         self.assertEqual(
             _rows(serialize_trake_csv([missing])),
-            [["video_id", "frame_id_1", "frame_id_2"]],
+            [],
         )
 
     def test_limit_is_applied_after_invalid_and_duplicate_rows(self) -> None:
         hypotheses = [_hypothesis("V", [index, index + 200]) for index in range(105)]
         hypotheses.insert(0, {"video_id": "V", "frame_ids": [0, 200]})
         parsed = _rows(serialize_trake_csv(hypotheses, top_k=100))
-        self.assertEqual(len(parsed), 101)
-        self.assertEqual(parsed[1], ["V", "0", "200"])
+        self.assertEqual(len(parsed), 100)
+        self.assertEqual(parsed[0], ["V", "0", "200"])
         self.assertEqual(parsed[-1], ["V", "99", "299"])
 
     def test_export_uses_trake_online_route_and_stable_filename(self) -> None:
@@ -210,7 +209,7 @@ class TrakeSubmissionTests(unittest.TestCase):
         )
         self.assertEqual(exported.filename, "trake_result.csv")
         self.assertEqual(exported.row_count, 1)
-        self.assertEqual(_rows(exported.content)[1], ["V9", "12", "31"])
+        self.assertEqual(_rows(exported.content)[0], ["V9", "12", "31"])
         self.assertEqual(
             online_search.call_args.kwargs,
             {"query": "first event then second event", "task": "trake", "top_k": 7},

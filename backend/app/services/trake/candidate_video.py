@@ -64,10 +64,27 @@ def gate_candidate_videos(
     )
     ranked: list[VideoCandidate] = []
     for video_id, by_event in grouped.items():
-        supported = sorted(index for index, values in by_event.items() if values)
+        supported = sorted(
+            index
+            for index, values in by_event.items()
+            if any(
+                item.normalized_score >= runtime.minimum_per_event_support
+                and float(item.result.score) >= runtime.minimum_semantic_support
+                and _has_absolute_semantic_support(item, runtime)
+                for item in values
+            )
+        )
         coverage = len(supported) / event_count
         per_event_best = [
-            max((item.normalized_score for item in by_event.get(index, ())), default=0.0)
+            max(
+                (
+                    item.normalized_score
+                    for item in by_event.get(index, ())
+                    if float(item.result.score) >= runtime.minimum_semantic_support
+                    and _has_absolute_semantic_support(item, runtime)
+                ),
+                default=0.0,
+            )
             for index in range(event_count)
         ]
         event_support = sum(per_event_best) / event_count
@@ -109,24 +126,15 @@ def gate_candidate_videos(
             item.video_id,
         )
     )
-    full = [item for item in ranked if item.coverage >= 1.0]
+    full = [
+        item for item in ranked
+        if item.coverage >= runtime.minimum_sequence_coverage
+        and (not runtime.complete_event_required or item.coverage >= 1.0)
+    ]
     warnings: list[str] = []
     alignment_pool = full
     if not full and ranked:
-        alignment_pool = ranked
-        warnings.append("no_full_coverage_video_fallback")
-        alignment_pool = [
-            VideoCandidate(
-                video_id=item.video_id,
-                coverage=item.coverage,
-                event_support=item.event_support,
-                context_score=item.context_score,
-                total_score=item.total_score,
-                event_candidates=item.event_candidates,
-                warnings=tuple((*item.warnings, "incomplete_event_coverage")),
-            )
-            for item in alignment_pool
-        ]
+        warnings.extend(("no_video_supports_all_events", "insufficient_event_support"))
     selected = tuple(alignment_pool[: runtime.top_videos])
     return VideoGatingResult(
         videos=selected,
@@ -136,6 +144,14 @@ def gate_candidate_videos(
             "full_coverage_count": len(full),
             "selected_video_count": len(selected),
             "fallback_used": bool(ranked and not full),
+            "support_policy": {
+                "minimum_per_event_support": runtime.minimum_per_event_support,
+                "minimum_sequence_coverage": runtime.minimum_sequence_coverage,
+                "minimum_semantic_support": runtime.minimum_semantic_support,
+                "minimum_visual_support": runtime.minimum_visual_support,
+                "minimum_dense_support": runtime.minimum_dense_support,
+                "complete_event_required": runtime.complete_event_required,
+            },
             "video_scores": [
                 {
                     "video_id": item.video_id,
@@ -173,6 +189,31 @@ class CandidateVideoRanker:
 
 
 rank_candidate_videos = gate_candidate_videos
+
+
+def _has_absolute_semantic_support(
+    candidate: EventCandidate,
+    config: TrakeConfig,
+) -> bool:
+    """Reject rank-only support using pre-RRF modality similarities.
+
+    RRF and normalized alignment scores are intentionally relative and always
+    produce a winner.  At least one absolute visual or BGE dense signal must
+    cross its independently configurable floor before that winner is evidence.
+    """
+
+    scores = candidate.result.modality_scores
+    visual = scores.get("visual")
+    dense = scores.get(
+        "dense_text",
+        scores.get("bge_dense", scores.get("trake_bge_dense_raw")),
+    )
+    visual_ok = visual is not None and float(visual) >= config.minimum_visual_support
+    dense_ok = dense is not None and float(dense) >= config.minimum_dense_support
+    if visual is None and dense is None:
+        # Lightweight/custom engines expose only the canonical result score.
+        return float(candidate.result.score) >= config.minimum_semantic_support
+    return visual_ok or dense_ok
 
 
 __all__ = [

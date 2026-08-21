@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import type {
     ApiResponse,
     Candidate,
@@ -21,6 +21,9 @@ interface UseSearchReturn {
     setSortBy: (key: SortKey) => void;
     executeSearch: (payload: SearchPayload) => Promise<void>;
     apiResponseData: ApiResponse<SearchData> | null;
+    elapsedSeconds: number;
+    searchStage: string;
+    cancelSearch: () => void;
 }
 
 function getScore(scene: VideoScene, key: SortKey): number {
@@ -120,6 +123,30 @@ export function useSearch(): UseSearchReturn {
     const [sortBy, setSortBy] = useState<SortKey>('arrival');
     const [apiResponseData, setApiResponseData] = useState<ApiResponse<SearchData> | null>(null);
     const runIdRef = useRef(0);
+    const abortRef = useRef<AbortController | null>(null);
+    const searchStartedRef = useRef<number | null>(null);
+    const [elapsedSeconds, setElapsedSeconds] = useState(0);
+    const [searchStage, setSearchStage] = useState('Idle');
+
+    useEffect(() => {
+        if (!isSearching) return;
+        const timer = window.setInterval(() => {
+            if (searchStartedRef.current !== null) {
+                setElapsedSeconds(Math.floor((Date.now() - searchStartedRef.current) / 1000));
+            }
+        }, 500);
+        return () => window.clearInterval(timer);
+    }, [isSearching]);
+
+    const cancelSearch = useCallback(() => {
+        if (!abortRef.current) return;
+        ++runIdRef.current;
+        abortRef.current.abort();
+        abortRef.current = null;
+        setIsSearching(false);
+        setSearchStage('Cancelled');
+        setSearchError('TRAKE search was cancelled. Your query has been preserved.');
+    }, []);
 
     const clearResults = useCallback(() => {
         setResults([]);
@@ -130,27 +157,48 @@ export function useSearch(): UseSearchReturn {
 
     const executeSearch = useCallback(async (payload: SearchPayload) => {
         const runId = ++runIdRef.current;
+        abortRef.current?.abort();
+        const controller = new AbortController();
+        abortRef.current = controller;
         clearResults();
         setIsSearching(true);
+        searchStartedRef.current = Date.now();
+        setElapsedSeconds(0);
 
         const validQueries = payload.text_queries?.filter(item => item.query.trim()) ?? [];
         if (validQueries.length === 0) {
             setSearchError('Please enter a search query.');
             setIsSearching(false);
+            abortRef.current = null;
             return;
         }
 
+        const isTrakeRequest = validQueries.some(
+            item => item.mode.toLowerCase() === 'trake',
+        );
+        const configuredTimeout = Number(import.meta.env.VITE_TRAKE_TIMEOUT_MS ?? 240000);
+        const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+            ? configuredTimeout
+            : 240000;
+        const timeoutId = isTrakeRequest
+            ? window.setTimeout(() => controller.abort('trake_timeout'), timeoutMs)
+            : null;
+        setSearchStage(isTrakeRequest ? 'Parsing and retrieving ordered events' : 'Searching');
         try {
             const responses = await Promise.all(validQueries.map(async queryParam => {
+                const topK = queryParam.mode.toLowerCase() === 'trake'
+                    ? 100
+                    : (payload.config.topK || queryParam.top_k || 20);
                 const response = await fetch(`${API_PROXY}/search`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         query: queryParam.query,
                         mode: queryParam.mode,
-                        top_k: payload.config.topK || queryParam.top_k || 20,
+                        top_k: topK,
                         expanded_queries: queryParam.expanded_queries ?? [],
                     }),
+                    signal: controller.signal,
                 });
                 const body = await response.json().catch(() => null) as
                     | (Partial<ApiResponse<SearchData>> & { detail?: string })
@@ -162,6 +210,7 @@ export function useSearch(): UseSearchReturn {
             }));
 
             if (runIdRef.current !== runId) return;
+            setSearchStage('Validating complete sequences');
             const aggregatedResults: VideoScene[] = [];
             const seenIds = new Set<string>();
             let totalLatency = 0;
@@ -180,11 +229,25 @@ export function useSearch(): UseSearchReturn {
             setApiResponseData(responses[0] ?? null);
             setResults(aggregatedResults);
             setLatency(totalLatency);
+            setSearchStage('Complete');
         } catch (error) {
             if (runIdRef.current === runId) {
-                setSearchError(error instanceof Error ? error.message : 'Search failed unexpectedly.');
+                if (controller.signal.aborted) {
+                    const timedOut = controller.signal.reason === 'trake_timeout';
+                    setSearchStage(timedOut ? 'Timed out' : 'Cancelled');
+                    setSearchError(
+                        timedOut
+                            ? `TRAKE search timed out after ${Math.round(timeoutMs / 1000)} seconds. Your query has been preserved.`
+                            : 'TRAKE search was cancelled. Your query has been preserved.',
+                    );
+                } else {
+                    setSearchStage('Failed');
+                    setSearchError(error instanceof Error ? error.message : 'Search failed unexpectedly.');
+                }
             }
         } finally {
+            if (timeoutId !== null) window.clearTimeout(timeoutId);
+            if (abortRef.current === controller) abortRef.current = null;
             if (runIdRef.current === runId) setIsSearching(false);
         }
     }, [clearResults]);
@@ -202,5 +265,8 @@ export function useSearch(): UseSearchReturn {
         setSortBy,
         executeSearch,
         apiResponseData,
+        elapsedSeconds,
+        searchStage,
+        cancelSearch,
     };
 }

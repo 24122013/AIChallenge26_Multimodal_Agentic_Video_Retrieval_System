@@ -740,11 +740,11 @@ mount vào FastAPI application sau này:
 ```
 
 Response là `text/csv; charset=utf-8` với `Content-Disposition: attachment`.
-KIS dùng header `video_id,frame_id`; QA dùng
-`video_id,frame_id,answer`. Ranking được giữ nguyên, cặp frame trùng bị loại theo
+Theo hướng dẫn nộp bài chính thức, mọi CSV đều **không có header**. KIS dùng mỗi
+row `video_id,frame_id`; QA dùng `video_id,frame_id,answer`. Ranking được giữ nguyên, cặp frame trùng bị loại theo
 lần xuất hiện đầu tiên và không tạo row giả. QA chỉ xuất khi grounded answer có
 `status=answered`, nội dung không rỗng và citation hợp lệ; abstain hoặc thiếu dẫn
-chứng trả lỗi rõ ràng. TRAKE dùng header provisional
+chứng trả lỗi rõ ràng. TRAKE dùng row
 `video_id,frame_id_1,...,frame_id_N`, trong đó mỗi row là một complete sequence
 cùng video và có đúng N event. Dedupe TRAKE dùng toàn identity
 `(video_id, tuple(frame_ids))`, không loại hai sequence chỉ vì chúng dùng chung
@@ -769,8 +769,12 @@ python -m backend.app.services.submission.export_query `
   --top-k 100 --output data/submissions/trake_result.csv
 ```
 
-Khi chưa có `data/sample_submission.csv` chính thức, header TRAKE ở trên là một
-assumption được cô lập trong serializer và `video_id` là stem không có `.mp4`.
+Nút **Export to CSV** trên UI gọi `POST /api/search/export-current`, không chạy lại
+retrieval, hỏi official query ID (ví dụ `query-1-kis`) rồi ghi result set hiện tại
+thành đúng tên `query-1-kis.csv` trong `data/submission/`. `video_id` là stem không
+có `.mp4`.
+Khi QA answer mode đang tắt, UI cho phép nhập answer thủ công (tối đa 100 ký tự);
+video và frame vẫn lấy từ evidence đã retrieval, không chạy model trả lời.
 Mọi cột mang tên `frame_id` trong file nộp luôn lấy từ original `frame_index`;
 không dùng ordinal của keyframe, timestamp, tên file, internal frame ID hoặc
 FAISS row.

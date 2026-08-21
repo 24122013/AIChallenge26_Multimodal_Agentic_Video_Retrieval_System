@@ -126,6 +126,13 @@ _CONFIG_SCHEMA = {
         "context_weight": "non-negative number",
         "coverage_weight": "non-negative number",
         "event_support_weight": "non-negative number",
+        "minimum_per_event_support": "unit interval number",
+        "minimum_sequence_coverage": "unit interval number",
+        "minimum_semantic_support": "non-negative number",
+        "minimum_visual_support": "non-negative number",
+        "minimum_dense_support": "non-negative number",
+        "complete_event_required": "boolean",
+        "stage_deadline_seconds": "positive number",
         "alignment_method": "beam or dp string",
         "beam_width": "positive integer",
         "k_best_paths_per_video": "positive integer",
@@ -301,9 +308,16 @@ class TrakeConfig:
     context_weight: float = 0.10
     coverage_weight: float = 0.45
     event_support_weight: float = 0.45
+    minimum_per_event_support: float = 0.05
+    minimum_sequence_coverage: float = 1.0
+    minimum_semantic_support: float = 0.15
+    minimum_visual_support: float = 0.15
+    minimum_dense_support: float = 0.55
+    complete_event_required: bool = True
+    stage_deadline_seconds: float = 180.0
     alignment_method: str = "beam"
     beam_width: int = 200
-    k_best_paths_per_video: int = 10
+    k_best_paths_per_video: int = 100
     gap_penalty: str = "log"
     gap_lambda: float = 0.02
     refinement_enabled: bool = True
@@ -348,8 +362,19 @@ class TrakeConfig:
             "gap_lambda",
             "hybrid_rrf_weight",
             "bge_rrf_weight",
+            "minimum_per_event_support",
+            "minimum_sequence_coverage",
+            "minimum_semantic_support",
+            "minimum_visual_support",
+            "minimum_dense_support",
         ):
             _validate_non_negative_number(name, getattr(self, name))
+        if not 0 <= self.minimum_per_event_support <= 1:
+            raise ValueError("trake.minimum_per_event_support must be between 0 and 1")
+        if not 0 <= self.minimum_sequence_coverage <= 1:
+            raise ValueError("trake.minimum_sequence_coverage must be between 0 and 1")
+        if not math.isfinite(float(self.stage_deadline_seconds)) or self.stage_deadline_seconds <= 0:
+            raise ValueError("trake.stage_deadline_seconds must be a positive finite number")
         if self.context_weight + self.coverage_weight + self.event_support_weight <= 0:
             raise ValueError("trake video scoring weights must include a positive value")
         if self.hybrid_rrf_weight + self.bge_rrf_weight <= 0:
@@ -390,6 +415,7 @@ class TrakeConfig:
             "bge_reranker_enabled",
             "bge_required",
             "refinement_enabled",
+            "complete_event_required",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"trake.{name} must be a boolean")
@@ -848,6 +874,41 @@ def load_retrieval_runtime_config(
             "RETRIEVAL_TRAKE_EVENT_SUPPORT_WEIGHT",
             trake_raw.get("event_support_weight"),
             TrakeConfig.event_support_weight,
+        ),
+        minimum_per_event_support=_float_env(
+            "RETRIEVAL_TRAKE_MINIMUM_PER_EVENT_SUPPORT",
+            trake_raw.get("minimum_per_event_support"),
+            TrakeConfig.minimum_per_event_support,
+        ),
+        minimum_sequence_coverage=_float_env(
+            "RETRIEVAL_TRAKE_MINIMUM_SEQUENCE_COVERAGE",
+            trake_raw.get("minimum_sequence_coverage"),
+            TrakeConfig.minimum_sequence_coverage,
+        ),
+        minimum_semantic_support=_float_env(
+            "RETRIEVAL_TRAKE_MINIMUM_SEMANTIC_SUPPORT",
+            trake_raw.get("minimum_semantic_support"),
+            TrakeConfig.minimum_semantic_support,
+        ),
+        minimum_visual_support=_float_env(
+            "RETRIEVAL_TRAKE_MINIMUM_VISUAL_SUPPORT",
+            trake_raw.get("minimum_visual_support"),
+            TrakeConfig.minimum_visual_support,
+        ),
+        minimum_dense_support=_float_env(
+            "RETRIEVAL_TRAKE_MINIMUM_DENSE_SUPPORT",
+            trake_raw.get("minimum_dense_support"),
+            TrakeConfig.minimum_dense_support,
+        ),
+        complete_event_required=_bool_env(
+            "RETRIEVAL_TRAKE_COMPLETE_EVENT_REQUIRED",
+            trake_raw.get("complete_event_required"),
+            TrakeConfig.complete_event_required,
+        ),
+        stage_deadline_seconds=_float_env(
+            "RETRIEVAL_TRAKE_STAGE_DEADLINE_SECONDS",
+            trake_raw.get("stage_deadline_seconds"),
+            TrakeConfig.stage_deadline_seconds,
         ),
         alignment_method=_string_env(
             "RETRIEVAL_TRAKE_ALIGNMENT_METHOD",

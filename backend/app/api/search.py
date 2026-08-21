@@ -1,6 +1,7 @@
 """Unified search API wrappers for Retrieval Phase 1-3."""
 from __future__ import annotations
 
+from backend.app.core.environment import PROJECT_ROOT
 from backend.app.services.retrieval.retrieval_manager import (
     search_caption,
     search_object,
@@ -9,10 +10,12 @@ from backend.app.services.retrieval.retrieval_manager import (
     search_visual,
 )
 from backend.app.services.retrieval.qa_pipeline import RequiredQaPipelineError
-from backend.app.services.trake import RequiredTrakePipelineError
+from backend.app.services.trake import RequiredTrakePipelineError, TrakeStageDeadlineExceeded
 from backend.app.services.submission.csv_export import (
     SubmissionExportError,
     export_query_csv,
+    export_response_csv,
+    save_exported_csv,
 )
 
 try:  # pragma: no cover - depends on optional API runtime.
@@ -59,6 +62,13 @@ if APIRouter is not None:
         task: str
         top_k: int = Field(default=100, ge=1, le=100)
 
+    class CurrentResultsExportBody(BaseModel):
+        query_id: str = Field(min_length=1, max_length=200)
+        task: str
+        data: dict[str, object]
+        top_k: int = Field(default=100, ge=1, le=100)
+        manual_answer: str | None = Field(default=None, max_length=100)
+
     @router.post("")
     def search_endpoint(body: SearchBody) -> dict:
         try:
@@ -95,6 +105,15 @@ if APIRouter is not None:
                     "message": str(exc),
                 },
             )
+        except TrakeStageDeadlineExceeded as exc:
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "success": False,
+                    "data": exc.response,
+                    "message": str(exc),
+                },
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
@@ -121,6 +140,8 @@ if APIRouter is not None:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except RequiredTrakePipelineError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except TrakeStageDeadlineExceeded as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
         except SubmissionExportError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except ValueError as exc:
@@ -129,6 +150,40 @@ if APIRouter is not None:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post("/export-current")
+    def export_current_results_endpoint(body: CurrentResultsExportBody) -> dict:
+        """Write the already displayed result set without re-running retrieval."""
+
+        try:
+            exported = export_response_csv(
+                body.data,
+                body.task,
+                body.query_id,
+                body.top_k,
+                manual_answer=body.manual_answer,
+            )
+            target = save_exported_csv(exported)
+            try:
+                relative_path = target.relative_to(PROJECT_ROOT).as_posix()
+            except ValueError:
+                relative_path = target.as_posix()
+            return {
+                "success": True,
+                "data": {
+                    "task": exported.task.value,
+                    "filename": exported.filename,
+                    "path": relative_path,
+                    "row_count": exported.row_count,
+                },
+                "message": None,
+            }
+        except SubmissionExportError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Could not save CSV: {exc}") from exc
 else:
     router = None
 
@@ -233,7 +288,7 @@ def _dispatch_search(
         return search_online(
             query=query,
             task="trake",
-            top_k=min(100, int(top_k)),
+            top_k=100,
             **online_options,
         )
 

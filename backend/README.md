@@ -213,8 +213,8 @@ python -m backend.app.services.submission.export_query --task trake `
   --top-k 100 --output data/submissions/trake_result.csv
 ```
 
-TRAKE CSV dùng assumption `video_id,frame_id_1,...,frame_id_N` vì repository chưa
-có official sample submission. Các giá trị `frame_id_N` là original zero-based
+CSV submission chính thức không có header. TRAKE dùng mỗi row
+`video_id,frame_id_1,...,frame_id_N`. Các giá trị `frame_id_N` là original zero-based
 `frame_index`, không phải internal `RetrievalResult.frame_id`, timestamp, filename
 hay FAISS row. Serializer yêu cầu lineage khớp và dedupe theo toàn sequence.
 

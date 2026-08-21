@@ -103,7 +103,7 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
             text_queries.push({
                 query: trakeQuery.trim(),
                 mode: 'trake',
-                top_k: topK
+                top_k: 100
             });
         } else if (selectedModel === "TEMPORAL" && temporalQuery.trim()) {
             text_queries.push({
@@ -121,7 +121,7 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
             image: selectedModel === "KIST" ? imagePayload : undefined,
             colorHex: selectedModel === "KIST" ? colorHex : undefined,
             config: {
-                topK,
+                topK: selectedModel === "TRAKE" ? 100 : topK,
                 model: selectedModel,
             },
         };
@@ -362,6 +362,7 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
                         topK={topK} 
                         setTopK={setTopK} 
                         handleNumberSync={handleNumberSync} 
+                        fixedTopK={selectedModel === "TRAKE" ? 100 : undefined}
                     />
                 </div>
 

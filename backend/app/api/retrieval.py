@@ -14,7 +14,7 @@ from backend.app.services.retrieval.retrieval_manager import (
     search_visual,
 )
 from backend.app.services.retrieval.qa_pipeline import RequiredQaPipelineError
-from backend.app.services.trake import RequiredTrakePipelineError
+from backend.app.services.trake import RequiredTrakePipelineError, TrakeStageDeadlineExceeded
 
 try:  # pragma: no cover - depends on optional API runtime.
     from fastapi import APIRouter, HTTPException
@@ -129,7 +129,7 @@ if APIRouter is not None:
 
     @router.post("/trake")
     def trake_search_endpoint(body: TrakeSearchBody) -> dict:
-        return _response(lambda: search_trake(body.query, top_k=body.top_k))
+        return _response(lambda: search_trake(body.query, top_k=100))
 
     @router.post("/qa-evidence")
     def qa_evidence_search_endpoint(body: VisualSearchBody) -> dict:
@@ -167,6 +167,15 @@ if APIRouter is not None:
         except RequiredTrakePipelineError as exc:
             return JSONResponse(
                 status_code=503,
+                content={
+                    "success": False,
+                    "data": exc.response,
+                    "message": str(exc),
+                },
+            )
+        except TrakeStageDeadlineExceeded as exc:
+            return JSONResponse(
+                status_code=504,
                 content={
                     "success": False,
                     "data": exc.response,
@@ -217,7 +226,7 @@ def kis_temporal_search(query: str, top_k: int = 20) -> dict:
 
 
 def trake_search(query: str, top_k: int = 100) -> dict:
-    return search_trake(query=query, top_k=top_k)
+    return search_trake(query=query, top_k=100)
 
 
 def qa_evidence_search(question: str, top_k: int = 10) -> dict:

@@ -3,19 +3,14 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from dataclasses import asdict, is_dataclass
 from numbers import Integral
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
+from backend.app.core.environment import PROJECT_ROOT
 from backend.app.services.submission.schemas import ExportRequest, ExportedCsv, SubmissionTask
-
-
-# No official sample_submission.csv is checked into this repository.  Keep the
-# provisional TRAKE header convention isolated here so it is trivial to replace
-# without touching validation or ranking code.
-TRAKE_VIDEO_COLUMN = "video_id"
-TRAKE_FRAME_COLUMN_PREFIX = "frame_id_"
 
 
 class SubmissionExportError(RuntimeError):
@@ -99,18 +94,46 @@ def _ranked_rows(
     return rows
 
 
-def _write_csv(header: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
+def _write_csv(rows: Sequence[Sequence[Any]]) -> str:
+    """Write official headerless UTF-8 CSV content with CRLF line endings."""
+
     stream = io.StringIO(newline="")
     writer = csv.writer(stream, lineterminator="\r\n")
-    writer.writerow(header)
     writer.writerows(rows)
     return stream.getvalue()
+
+
+def _csv_row_count(content: str) -> int:
+    return sum(
+        1
+        for row in csv.reader(io.StringIO(content, newline=""))
+        if row
+    )
+
+
+def _submission_filename(query_id: str, task: SubmissionTask) -> str:
+    """Validate an official query id and derive its required CSV filename."""
+
+    cleaned = str(query_id).strip()
+    lowered = cleaned.casefold()
+    if lowered.endswith(".csv") or lowered.endswith(".txt"):
+        cleaned = cleaned[:-4]
+    match = re.fullmatch(r"query-[A-Za-z0-9][A-Za-z0-9_-]*-(kis|qa|trake)", cleaned)
+    if match is None:
+        raise SubmissionExportError(
+            "query_id must follow the official format, for example query-1-kis"
+        )
+    if match.group(1).casefold() != task.value:
+        raise SubmissionExportError(
+            f"query_id suffix must be '-{task.value}' for this task"
+        )
+    return f"{cleaned}.csv"
 
 
 def serialize_kis_csv(candidates: Sequence[Any], *, top_k: int = 100) -> str:
     request = ExportRequest.parse("serialization", "kis", top_k)
     ranked = _ranked_rows(candidates, request.top_k)
-    return _write_csv(("video_id", "frame_id"), [(video, frame) for video, frame, _ in ranked])
+    return _write_csv([(video, frame) for video, frame, _ in ranked])
 
 
 def _qa_candidates(response: Mapping[str, Any]) -> tuple[str, list[Mapping[str, Any]]]:
@@ -122,6 +145,8 @@ def _qa_candidates(response: Mapping[str, Any]) -> tuple[str, list[Mapping[str, 
     if status != "answered" or not isinstance(text, str) or not text.strip():
         reason = str(answer.get("reason") or status or "insufficient evidence")
         raise SubmissionExportError(f"grounded QA did not answer: {reason}")
+    if len(text) > 100:
+        raise SubmissionExportError("grounded QA answer exceeds the 100-character limit")
 
     evidence_raw = response.get("evidence")
     evidence = [dict(item) for item in evidence_raw or [] if isinstance(item, Mapping)]
@@ -135,16 +160,33 @@ def _qa_candidates(response: Mapping[str, Any]) -> tuple[str, list[Mapping[str, 
     return text, ordered
 
 
-def serialize_qa_csv(response: Mapping[str, Any], *, top_k: int = 100) -> str:
+def serialize_qa_csv(
+    response: Mapping[str, Any],
+    *,
+    top_k: int = 100,
+    answer_override: str | None = None,
+) -> str:
     request = ExportRequest.parse("serialization", "qa", top_k)
-    answer, candidates = _qa_candidates(response)
+    if answer_override is None:
+        answer, candidates = _qa_candidates(response)
+    else:
+        if not isinstance(answer_override, str) or not answer_override.strip():
+            raise SubmissionExportError("manual QA answer must not be empty")
+        if len(answer_override) > 100:
+            raise SubmissionExportError("manual QA answer exceeds the 100-character limit")
+        evidence_raw = response.get("evidence")
+        candidates = [
+            dict(item)
+            for item in evidence_raw or []
+            if isinstance(item, Mapping)
+        ]
+        if not candidates:
+            raise SubmissionExportError("QA response has no evidence for manual answer export")
+        answer = answer_override
     ranked = _ranked_rows(candidates, request.top_k)
     if not ranked:
         raise SubmissionExportError("grounded QA has no valid original-frame evidence")
-    return _write_csv(
-        ("video_id", "frame_id", "answer"),
-        [(video, frame, answer) for video, frame, _ in ranked],
-    )
+    return _write_csv([(video, frame, answer) for video, frame, _ in ranked])
 
 
 def _trake_hypotheses(
@@ -248,8 +290,8 @@ def serialize_trake_csv(
 ) -> str:
     """Serialize ranked TRAKE sequences using original zero-based frame indices.
 
-    The provisional columns are ``video_id,frame_id_1,...,frame_id_N``.  Invalid
-    hypotheses are omitted fail-closed.  Deduplication uses the complete
+    Each official row is ``video_id,frame_id_1,...,frame_id_N`` without a
+    header. Invalid hypotheses are omitted fail-closed. Deduplication uses the complete
     ``(video_id, frame_ids)`` sequence, so two distinct event chains may reuse
     individual frames without consuming each other's submission slot.
     """
@@ -280,11 +322,60 @@ def serialize_trake_csv(
         if len(rows) >= request.top_k:
             break
 
-    header = (
-        TRAKE_VIDEO_COLUMN,
-        *(f"{TRAKE_FRAME_COLUMN_PREFIX}{index}" for index in range(1, event_count + 1)),
+    return _write_csv(rows)
+
+
+def export_response_csv(
+    response: Mapping[str, Any],
+    task: str,
+    query_id: str,
+    top_k: int = 100,
+    *,
+    manual_answer: str | None = None,
+) -> ExportedCsv:
+    """Serialize an already-computed UI response without running retrieval again."""
+
+    request = ExportRequest.parse("current results", task, top_k)
+    if request.task is SubmissionTask.KIS:
+        candidates = response.get("candidates")
+        if not isinstance(candidates, Sequence) or isinstance(candidates, (str, bytes)):
+            raise SubmissionExportError("KIS response has no ranked candidates")
+        content = serialize_kis_csv(candidates, top_k=request.top_k)
+    elif request.task is SubmissionTask.QA:
+        content = serialize_qa_csv(
+            response,
+            top_k=request.top_k,
+            answer_override=manual_answer,
+        )
+    else:
+        content = serialize_trake_csv(response, top_k=request.top_k)
+
+    row_count = _csv_row_count(content)
+    if row_count < 1:
+        raise SubmissionExportError("there are no valid results to export")
+    filename = _submission_filename(query_id, request.task)
+    return ExportedCsv(
+        content=content,
+        filename=filename,
+        row_count=row_count,
+        task=request.task,
     )
-    return _write_csv(header, rows)
+
+
+def save_exported_csv(
+    exported: ExportedCsv,
+    *,
+    output_dir: str | Path = PROJECT_ROOT / "data" / "submission",
+) -> Path:
+    """Persist one validated export inside the fixed submission directory."""
+
+    destination = Path(output_dir).resolve(strict=False)
+    destination.mkdir(parents=True, exist_ok=True)
+    target = (destination / Path(exported.filename).name).resolve(strict=False)
+    target.relative_to(destination)
+    with target.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(exported.content)
+    return target
 
 
 def export_query_csv(
@@ -310,13 +401,13 @@ def export_query_csv(
         if not isinstance(candidates, Sequence) or isinstance(candidates, (str, bytes)):
             raise SubmissionExportError("KIS retrieval returned no ranked results")
         content = serialize_kis_csv(candidates, top_k=request.top_k)
-        row_count = max(0, content.count("\r\n") - 1)
+        row_count = _csv_row_count(content)
     elif request.task is SubmissionTask.QA:
         content = serialize_qa_csv(response, top_k=request.top_k)
-        row_count = max(0, content.count("\r\n") - 1)
+        row_count = _csv_row_count(content)
     else:
         content = serialize_trake_csv(response, top_k=request.top_k)
-        row_count = max(0, content.count("\r\n") - 1)
+        row_count = _csv_row_count(content)
     return ExportedCsv(
         content=content,
         filename=f"{request.task.value}_result.csv",

@@ -6,10 +6,13 @@ interface ConfigPanelProps {
     topK: number;
     setTopK: (val: number) => void;
     handleNumberSync: (val: string, setter: (val: number) => void, min: number, max: number) => void;
+    fixedTopK?: number;
 }
 
-export default function ConfigPanel({ topK, setTopK, handleNumberSync }: ConfigPanelProps) {
+export default function ConfigPanel({ topK, setTopK, handleNumberSync, fixedTopK }: ConfigPanelProps) {
     const [showConfig, setShowConfig] = useState(false);
+    const effectiveTopK = fixedTopK ?? topK;
+    const isFixed = fixedTopK !== undefined;
 
     return (
         <div className="flex-1 flex flex-col border border-black/10 dark:border-white/10 rounded-xl bg-white dark:bg-white/5 overflow-hidden min-h-0">
@@ -28,19 +31,26 @@ export default function ConfigPanel({ topK, setTopK, handleNumberSync }: ConfigP
                             <label className="text-xs text-gray-500 dark:text-gray-400 font-medium">Top K Results</label>
                             <input
                                 type="number"
-                                value={topK}
+                                value={effectiveTopK}
                                 onChange={(e) => handleNumberSync(e.target.value, setTopK, 1, 200)}
-                                className="w-16 p-1 text-right text-xs bg-black/5 dark:bg-black/40 rounded border-none focus:ring-1 focus:ring-blue-500 dark:text-white hide-arrows"
+                                disabled={isFixed}
+                                className="w-16 p-1 text-right text-xs bg-black/5 dark:bg-black/40 rounded border-none focus:ring-1 focus:ring-blue-500 dark:text-white hide-arrows disabled:cursor-not-allowed disabled:opacity-70"
                             />
                         </div>
                         <input
                             type="range"
                             min={1}
                             max={200}
-                            value={topK}
+                            value={effectiveTopK}
                             onChange={(e) => setTopK(parseInt(e.target.value))}
-                            className="w-full accent-blue-600"
+                            disabled={isFixed}
+                            className="w-full accent-blue-600 disabled:cursor-not-allowed disabled:opacity-70"
                         />
+                        {isFixed && (
+                            <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                                TRAKE always requests exactly {fixedTopK} complete sequences.
+                            </p>
+                        )}
                     </div>
                 </div>
             )}

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from backend.app.models.retrieval import RetrievalResult, VisualSearchResponse
 from backend.app.services.retrieval.candidate_merger import merge_candidates
@@ -91,6 +91,56 @@ class HybridSearchEngine:
             merge_pool_size=max(self.config.rerank_pool_size, requested),
             allow_wide_visual=True,
         )
+
+    def search_many_pool(
+        self,
+        queries: Sequence[str],
+        top_k: int,
+    ) -> list[VisualSearchResponse]:
+        """Batch the shared SigLIP2 branch, then preserve canonical fusion."""
+
+        requested = int(top_k)
+        if not 1 <= requested <= 10_000:
+            raise ValueError("internal hybrid candidate pool must be between 1 and 10000")
+        values = [str(query) for query in queries]
+        if not values:
+            return []
+        visual_top_k = max(self.config.stage1_top_k, requested)
+        visual_many = getattr(self.visual_engine, "search_many_pool", None)
+        if callable(visual_many):
+            visual_responses = list(visual_many(values, top_k=visual_top_k))
+        else:
+            visual_responses = [
+                self.visual_engine.search(query, top_k=visual_top_k)
+                for query in values
+            ]
+        if len(visual_responses) != len(values):
+            raise RuntimeError("batched visual responses must align with TRAKE queries")
+        output: list[VisualSearchResponse] = []
+        for query, visual_response in zip(values, visual_responses):
+            started_at = time.perf_counter()
+            candidate_groups = [visual_response.results]
+            for engine in self.text_engines.values():
+                candidate_groups.append(
+                    engine.search_results(
+                        query,
+                        top_k=max(self.config.text_stage1_top_k, requested),
+                    )
+                )
+            merged = merge_candidates(
+                candidate_groups,
+                top_k=max(self.config.rerank_pool_size, requested),
+                dedupe_same_shot=False,
+            )
+            output.append(
+                VisualSearchResponse(
+                    query=query,
+                    top_k=requested,
+                    latency_ms=round((time.perf_counter() - started_at) * 1000, 3),
+                    results=self.reranker.rerank(query=query, candidates=merged, top_k=requested),
+                )
+            )
+        return output
 
     def _search_pool(
         self,

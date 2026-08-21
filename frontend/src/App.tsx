@@ -12,7 +12,7 @@ import { RETRIEVAL_METHODS } from './constants/mode-icons';
 
 export default function App() {
   const { sendTelemetry, searchLogs, setSearchLogs, isLogModalOpen, setIsLogModalOpen } = useTelemetry();
-  const { sortedResults, isSearching, searchError, latency, sortBy, setSortBy, executeSearch, apiResponseData } = useSearch();
+  const { sortedResults, isSearching, searchError, latency, sortBy, setSortBy, executeSearch, apiResponseData, elapsedSeconds, searchStage, cancelSearch } = useSearch();
   
   const {
     currentQuery, setCurrentQuery, currentSearchId, setCurrentSearchId,
@@ -196,6 +196,9 @@ export default function App() {
         isSearching={isSearching}
         searchError={searchError}
         latency={latency}
+        elapsedSeconds={elapsedSeconds}
+        searchStage={searchStage}
+        onCancelSearch={cancelSearch}
         isFilterDropdownOpen={isFilterDropdownOpen}
         openFilterDropdown={() => setIsFilterDropdownOpen(true)}
         closeFilterDropdown={() => setIsFilterDropdownOpen(false)}

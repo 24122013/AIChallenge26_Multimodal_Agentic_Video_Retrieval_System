@@ -331,7 +331,8 @@ class OnlinePipeline:
         """Route by task, then normalize all result candidates."""
 
         started_at = time.perf_counter()
-        original_query = " ".join(str(query).split())
+        input_query = str(query)
+        original_query = " ".join(input_query.split())
         if not original_query:
             raise ValueError("query must not be empty")
         requested_task = str(task or "kis").casefold().strip()
@@ -346,12 +347,12 @@ class OnlinePipeline:
             if self.trake_pipeline is None:
                 raise RuntimeError("TRAKE pipeline is unavailable in this online runtime")
             raw_trake = self.trake_pipeline.search(
-                original_query,
+                input_query,
                 top_k=requested_top_k,
             )
             return _trake_response(
                 raw_trake,
-                query=original_query,
+                query=input_query,
                 top_k=requested_top_k,
                 started_at=started_at,
                 expansion_requested=self.runtime_config.query_expansion.enabled,
@@ -751,12 +752,14 @@ class OnlinePipeline:
             default = 20
             maximum = min(int(self.config.max_top_k), 100)
         elif task == "trake":
-            default = int(self.runtime_config.trake.max_answers)
             maximum = min(
                 int(self.config.max_top_k),
                 int(self.runtime_config.trake.max_answers),
                 100,
             )
+            if maximum < 100:
+                raise RuntimeError("TRAKE runtime must allow exactly 100 results")
+            return 100
         else:
             default = self.runtime_config.hybrid.default_top_k
             maximum = int(self.config.max_top_k)
@@ -799,7 +802,7 @@ def _trake_response(
         raise RuntimeError("TRAKE pipeline returned a non-mapping response")
     response = dict(raw)
     returned_query = " ".join(str(response.get("query") or query).split())
-    if returned_query != query:
+    if returned_query != " ".join(query.split()):
         raise RuntimeError("TRAKE response did not preserve the original query anchor")
     returned_task = str(response.get("task") or "trake").casefold().strip()
     if returned_task != "trake":
@@ -807,7 +810,7 @@ def _trake_response(
     event_plan = response.get("event_plan")
     if isinstance(event_plan, Mapping):
         plan_query = " ".join(str(event_plan.get("original_query") or query).split())
-        if plan_query != query:
+        if plan_query != " ".join(query.split()):
             raise RuntimeError(
                 "TRAKE event plan did not preserve the original query anchor"
             )

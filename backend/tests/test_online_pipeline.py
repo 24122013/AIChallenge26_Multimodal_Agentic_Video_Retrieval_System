@@ -541,7 +541,7 @@ class OnlinePipelineTest(unittest.TestCase):
         trake_response = pipeline.run(
             "a man enters then sits down",
             task="trake",
-            top_k=500,
+            top_k=5,
         )
         temporal_response = pipeline.run(
             "a man enters then sits down",

@@ -10,7 +10,11 @@ from backend.app.services.trake.models import (
     TrakeHypothesis,
     VideoCandidate,
 )
-from backend.app.services.trake.pipeline import TRAKE_SCHEMA_VERSION, TrakePipeline
+from backend.app.services.trake.pipeline import (
+    TRAKE_SCHEMA_VERSION,
+    TrakePipeline,
+    TrakeStageDeadlineExceeded,
+)
 from backend.app.services.trake.query_parser import TrakeQueryParser, parse_trake_query
 
 __all__ = [
@@ -23,6 +27,7 @@ __all__ = [
     "TemporalPath",
     "TrakeHypothesis",
     "TrakePipeline",
+    "TrakeStageDeadlineExceeded",
     "TrakeQueryParser",
     "VideoCandidate",
     "parse_trake_query",

@@ -95,9 +95,16 @@ trake:
   context_weight: 0.10
   coverage_weight: 0.45
   event_support_weight: 0.45
+  minimum_per_event_support: 0.05
+  minimum_sequence_coverage: 1.0
+  minimum_semantic_support: 0.15
+  minimum_visual_support: 0.15
+  minimum_dense_support: 0.55
+  complete_event_required: true
+  stage_deadline_seconds: 180
   alignment_method: beam
   beam_width: 200
-  k_best_paths_per_video: 10
+  k_best_paths_per_video: 20
   gap_penalty: log
   gap_lambda: 0.02
   refinement_enabled: true

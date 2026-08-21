@@ -8,7 +8,9 @@ criterion from silently changing the requested event count.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
+from typing import Any
 
 from backend.app.services.trake.models import (
     BoundaryType,
@@ -104,6 +106,14 @@ _PROTECTED_TERM = re.compile(
     r")(?!\w)",
     re.IGNORECASE,
 )
+_ADDITIONAL_PROTECTED_TERM = re.compile(
+    r"(?<!\w)(?:sau\s+đó|khởi\s+đầu|chuyển\s+sang|chuyển\s+động|"
+    r"cử\s+động\s+đầu|cử\s+động|xoay\s+vòng|quay\s+vòng|cúi\s+chào|"
+    r"tiếp\s+đất|rời\s+cột|nhấc\s+chân|hạ\s+chân|đứng\s+dậy|"
+    r"ngồi\s+xuống|tiến\s+lại|chạm\s+đất|hoàn\s+toàn|"
+    r"cột\s+số\s+\d+|\d+\s+chân(?:\s+trước)?|con\s+rồng)(?!\w)",
+    re.IGNORECASE,
+)
 _FULL_LEAVE = re.compile(
     r"(?<!\w)(?:rời\s+hoàn\s+toàn|hoàn\s+toàn\s+rời|"
     r"fully\s+(?:leaves?|left|exits?|outside)|"
@@ -123,8 +133,16 @@ _FIRST_OR_START = re.compile(
     r"first|begins?|starts?)(?!\w)",
     re.IGNORECASE,
 )
+_STRONG_START = re.compile(
+    r"(?<!\w)(?:bắt\s+đầu|khởi\s+đầu|begins?|starts?)(?!\w)",
+    re.IGNORECASE,
+)
 _TRANSITION_ACTION = re.compile(
-    r"(?<!\w)(?:vào|rời|xuất\s+hiện|biến\s+mất|chuyển|đổi|mở|đóng|"
+    r"(?<!\w)(?:bắt\s+đầu|khởi\s+đầu|chuyển\s+sang|chuyển\s+động|"
+    r"cử\s+động(?:\s+đầu)?|xoay(?:\s+vòng)?|quay(?:\s+vòng)?|"
+    r"cúi(?:\s+chào)?|chào|tiến\s+lại|tiếp\s+đất|rời\s+cột|"
+    r"nhấc\s+chân|hạ\s+chân|đứng\s+dậy|ngồi\s+xuống|"
+    r"vào|rời(?:\s+khỏi)?|xuất\s+hiện|biến\s+mất|chuyển|đổi|mở|đóng|"
     r"enter(?:s|ed|ing)?|leave(?:s|d|ing)?|left|exit(?:s|ed|ing)?|"
     r"appear(?:s|ed|ing)?|disappear(?:s|ed|ing)?|become(?:s|ing)?|"
     r"change(?:s|d|ing)?|open(?:s|ed|ing)?|close(?:s|d|ing)?)(?!\w)",
@@ -144,6 +162,7 @@ class _ParsedText:
     source: str
     confidence: float
     warnings: tuple[str, ...] = ()
+    labels: tuple[str, ...] = ()
 
 
 class TrakeQueryParser:
@@ -152,11 +171,12 @@ class TrakeQueryParser:
     def parse(self, query: str) -> TemporalEventPlan:
         if not isinstance(query, str):
             raise TypeError("query must be a string")
-        original_query = query.strip()
-        if not original_query or re.search(r"\w", original_query, re.UNICODE) is None:
+        original_query = query
+        normalized_query = _normalize_for_parsing(query)
+        if not normalized_query or re.search(r"\w", normalized_query, re.UNICODE) is None:
             raise ValueError("query must not be empty")
 
-        parsed = self._parse_text(original_query)
+        parsed = self._parse_text(normalized_query)
         warnings = list(parsed.warnings)
         if _INSTRUCTION_LIKE.search(original_query):
             # The text is retained as event/context data; the apparent command
@@ -165,36 +185,91 @@ class TrakeQueryParser:
         if len({event.casefold() for event in parsed.events}) != len(parsed.events):
             warnings.append("duplicate_event_text_preserved")
 
-        events = tuple(
-            TemporalEvent(
-                index=index,
-                name=f"event_{index + 1}",
-                original_text=text,
-                retrieval_query=_retrieval_query(parsed.context, text),
-                boundary_type=infer_boundary_type(text),
-                protected_terms=extract_protected_terms(text),
+        events_list: list[TemporalEvent] = []
+        for index, text in enumerate(parsed.events):
+            normalized_text, normalization_warnings = _normalize_event_text(text)
+            semantic = _analyze_event(normalized_text, parsed.context)
+            event_warnings = list(normalization_warnings)
+            if not text.strip():
+                event_warnings.append("empty_event_marker")
+            if semantic["boundary_type"] == BoundaryType.UNKNOWN:
+                event_warnings.append("boundary_unknown")
+            confidence = _semantic_confidence(
+                text,
+                semantic["boundary_type"],
+                event_warnings,
+                bool(semantic["target_text"]),
             )
-            for index, text in enumerate(parsed.events)
+            trace = {
+                "matched_cues": semantic["matched_cues"],
+                "matched_actions": semantic["matched_actions"],
+                "selected_boundary": semantic["boundary_type"].value,
+                "rejected_boundary_alternatives": semantic["rejected_boundaries"],
+                "normalization_warnings": list(normalization_warnings),
+                "fallback_reason": "insufficient_boundary_evidence"
+                if semantic["boundary_type"] == BoundaryType.UNKNOWN else "",
+                "semantic_confidence": confidence,
+            }
+            events_list.append(
+                TemporalEvent(
+                    index=index,
+                    name=f"event_{index + 1}",
+                    source_label=parsed.labels[index] if index < len(parsed.labels) else "",
+                    original_text=text,
+                    normalized_text=normalized_text,
+                    event_context=semantic["event_context"],
+                    target_text=semantic["target_text"],
+                    retrieval_query=_coarse_retrieval_query(
+                        parsed.context,
+                        semantic["event_context"],
+                        semantic["target_text"],
+                        normalized_text,
+                    ),
+                    refinement_query=_refinement_query(
+                        parsed.context,
+                        semantic["target_text"],
+                    ),
+                    boundary_type=semantic["boundary_type"],
+                    protected_terms=extract_protected_terms(normalized_text),
+                    parser_warnings=tuple(dict.fromkeys(event_warnings)),
+                    semantic_confidence=confidence,
+                    parser_trace=trace,
+                )
+            )
+        events = tuple(events_list)
+        semantic_confidence = (
+            sum(event.semantic_confidence for event in events) / len(events)
+            if events else 0.0
         )
+        structural_confidence = parsed.confidence
+        overall_confidence = round(
+            min(1.0, 0.55 * structural_confidence + 0.45 * semantic_confidence),
+            6,
+        )
+        for event in events:
+            warnings.extend(event.parser_warnings)
         return TemporalEventPlan(
             original_query=original_query,
             context=parsed.context,
             events=events,
             parser_source=parsed.source,
-            confidence=parsed.confidence,
+            confidence=overall_confidence,
             warnings=tuple(dict.fromkeys(warnings)),
+            structural_confidence=structural_confidence,
+            semantic_confidence=round(semantic_confidence, 6),
         )
 
     def _parse_text(self, query: str) -> _ParsedText:
         listed = _parse_explicit_list(query)
         if listed is not None:
-            context, events, warnings = listed
+            context, events, warnings, labels = listed
             return _ParsedText(
                 context=context,
                 events=events,
                 source="deterministic_list",
                 confidence=1.0,
                 warnings=warnings,
+                labels=labels,
             )
 
         context, body = _split_explicit_context(query)
@@ -245,12 +320,20 @@ def extract_protected_terms(text: str) -> tuple[str, ...]:
 
     terms: list[str] = []
     seen: set[str] = set()
-    for match in _PROTECTED_TERM.finditer(text):
+    occupied: list[tuple[int, int]] = []
+    matches = [*_PROTECTED_TERM.finditer(text), *_ADDITIONAL_PROTECTED_TERM.finditer(text)]
+    # Boundary cues first, then action/constraint terms in source order.  This
+    # keeps weak presentation words from hiding stronger later evidence.
+    matches.sort(key=lambda match: (0 if _FIRST_OR_START.fullmatch(match.group(0)) else 1, match.start(), -len(match.group(0))))
+    for match in matches:
+        if any(match.start() >= start and match.end() <= end for start, end in occupied):
+            continue
         value = match.group(0)
         folded = value.casefold()
         if folded not in seen:
             seen.add(folded)
             terms.append(value)
+            occupied.append((match.start(), match.end()))
     return tuple(terms)
 
 
@@ -262,7 +345,8 @@ def infer_boundary_type(text: str) -> BoundaryType:
     if _PEAK.search(text):
         return BoundaryType.PEAK
     contact = _CONTACT.search(text)
-    first_or_start = _FIRST_OR_START.search(text)
+    first_matches = list(_FIRST_OR_START.finditer(text))
+    first_or_start = first_matches[0] if first_matches else None
     if contact is not None:
         # An explicit ongoing contact is a state unless the criterion asks for
         # its beginning/first occurrence.  Other contact wording denotes the
@@ -279,6 +363,8 @@ def infer_boundary_type(text: str) -> BoundaryType:
         ):
             return BoundaryType.STATE
         return BoundaryType.FIRST_CONTACT
+    if _STRONG_START.search(text) is not None:
+        return BoundaryType.FIRST_TRANSITION
     if first_or_start is not None:
         # "First" may merely enumerate a list.  Require a transition action
         # unless the stronger start/begin cue itself denotes the transition.
@@ -294,7 +380,7 @@ def infer_boundary_type(text: str) -> BoundaryType:
 
 def _parse_explicit_list(
     text: str,
-) -> tuple[str, tuple[str, ...], tuple[str, ...]] | None:
+) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None:
     matches = list(_LINE_LIST_MARKER.finditer(text))
     if not matches:
         inline = list(_INLINE_NUMBERED_MARKER.finditer(text))
@@ -310,23 +396,21 @@ def _parse_explicit_list(
     prefix = text[: matches[0].start()]
     context = _clean_context(prefix)
     events: list[str] = []
-    empty_count = 0
+    labels: list[str] = []
     marker_numbers: list[int] = []
     for index, match in enumerate(matches):
         marker_number = _marker_number(match.group("marker"))
+        labels.append(match.group("marker").strip().rstrip(":.)-"))
         if marker_number is not None:
             marker_numbers.append(marker_number)
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         event = text[match.end() : end].strip()
-        if event:
-            events.append(event)
-        else:
-            empty_count += 1
-    if not events:
-        return None
+        # Preserve the marker slot even when its payload is empty.  Downstream
+        # support validation will fail closed instead of silently changing N.
+        events.append(event)
     warnings: list[str] = []
-    if empty_count:
-        warnings.append("empty_event_marker_ignored")
+    if any(not event for event in events):
+        warnings.append("empty_event_marker_preserved")
     # Labels in benchmark statements are presentation metadata, not event
     # identity.  Preserve every non-empty event in source order even when the
     # prompt contains a typo such as E1, E2, E2, E4.
@@ -335,7 +419,7 @@ def _parse_explicit_list(
             warnings.append("duplicate_event_label_preserved")
         if marker_numbers != list(range(1, len(marker_numbers) + 1)):
             warnings.append("event_labels_reindexed_by_appearance")
-    return context, tuple(events), tuple(warnings)
+    return context, tuple(events), tuple(warnings), tuple(labels)
 
 
 def _marker_number(marker: str) -> int | None:
@@ -389,6 +473,103 @@ def _retrieval_query(context: str, event_text: str) -> str:
         return event_text
     separator = " " if context.endswith((".", "!", "?", ":", ";")) else ". "
     return f"{context}{separator}{event_text}"
+
+
+def _normalize_for_parsing(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+_TYPO_ALLOWLIST = ((re.compile(r"(?<!\w)cuối\s+chào(?!\w)", re.IGNORECASE), "cúi chào", "cuối chào -> cúi chào"),)
+
+
+def _normalize_event_text(value: str) -> tuple[str, tuple[str, ...]]:
+    normalized = " ".join(unicodedata.normalize("NFKC", value).split())
+    warnings: list[str] = []
+    for pattern, replacement, description in _TYPO_ALLOWLIST:
+        if pattern.search(normalized):
+            normalized = pattern.sub(replacement, normalized)
+            warnings.append(f"normalized_probable_typo: {description}")
+    return normalized, tuple(warnings)
+
+
+_TARGET_SENTENCE = re.compile(r"(?i)^\s*(?:khoả?nh|khoảng)\s+khắc\s+(?:đầu\s+tiên\s+)?(?:mà\s+)?")
+_LOCATION = re.compile(r"(?i)(trên\s+cột\s+số\s+\d+)")
+
+
+def _analyze_event(text: str, global_context: str) -> dict[str, Any]:
+    sentences = [part.strip(" \t\n.") for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+    target_index = next((i for i in range(len(sentences) - 1, -1, -1) if _TARGET_SENTENCE.match(sentences[i])), None)
+    if target_index is None:
+        event_context = ""
+        target = text.strip()
+    else:
+        event_context = " ".join(sentences[:target_index]).strip()
+        target = _TARGET_SENTENCE.sub("", sentences[target_index]).strip()
+    event_context = re.sub(r"(?i)^sau\s+đó\s+", "", event_context).strip(" .")
+    if event_context:
+        event_context = event_context[0].upper() + event_context[1:]
+    if target:
+        if re.search(r"(?i)cử\s+động", target) and not _STRONG_START.search(target):
+            target = re.sub(r"(?i)\bcử\s+động\b", "bắt đầu cử động", target, count=1)
+        elif re.search(r"(?i)cúi\s+chào", target) and not _STRONG_START.search(target):
+            target = re.sub(r"(?i)\bcúi\s+chào\b", "bắt đầu cúi chào", target, count=1)
+        location = _LOCATION.search(event_context)
+        if location and location.group(0).casefold() not in target.casefold():
+            target = f"{target} {location.group(0)}"
+        target = target[0].upper() + target[1:]
+    boundary, boundary_trace = _boundary_analysis(text)
+    return {
+        "event_context": event_context,
+        "target_text": target,
+        "boundary_type": boundary,
+        **boundary_trace,
+    }
+
+
+def _boundary_analysis(text: str) -> tuple[BoundaryType, dict[str, list[str]]]:
+    cue_matches = [match.group(0) for match in _FIRST_OR_START.finditer(text)]
+    for pattern in (_FULL_LEAVE, _PEAK, _ONGOING_STATE):
+        cue_matches.extend(match.group(0) for match in pattern.finditer(text))
+    transition_actions = [match.group(0) for match in _TRANSITION_ACTION.finditer(text)]
+    actions = list(transition_actions)
+    actions.extend(match.group(0) for match in _CONTACT.finditer(text))
+    selected = infer_boundary_type(text)
+    alternatives: list[str] = []
+    if _FULL_LEAVE.search(text) and selected != BoundaryType.FIRST_LEAVE: alternatives.append(BoundaryType.FIRST_LEAVE.value)
+    if _PEAK.search(text) and selected != BoundaryType.PEAK: alternatives.append(BoundaryType.PEAK.value)
+    if _CONTACT.search(text) and selected != BoundaryType.FIRST_CONTACT: alternatives.append(BoundaryType.FIRST_CONTACT.value)
+    if transition_actions and selected != BoundaryType.FIRST_TRANSITION: alternatives.append(BoundaryType.FIRST_TRANSITION.value)
+    if _ONGOING_STATE.search(text) and selected != BoundaryType.STATE: alternatives.append(BoundaryType.STATE.value)
+    return selected, {
+        "matched_cues": list(dict.fromkeys(cue_matches)),
+        "matched_actions": list(dict.fromkeys(actions)),
+        "rejected_boundaries": list(dict.fromkeys(alternatives)),
+    }
+
+
+def _semantic_confidence(text: str, boundary: BoundaryType, warnings: list[str], has_target: bool) -> float:
+    if not text.strip() or not has_target:
+        return 0.0
+    value = 0.92 if boundary != BoundaryType.UNKNOWN else 0.45
+    if warnings:
+        value -= 0.05 * len(warnings)
+    return round(max(0.0, min(1.0, value)), 6)
+
+
+def _coarse_retrieval_query(context: str, event_context: str, target: str, fallback: str) -> str:
+    # A single target-only criterion remains verbatim for backwards-compatible
+    # coarse recall (and retains every contact/count constraint).  Multi-state
+    # criteria use the normalized context + isolated target representation.
+    event_payload = (
+        ". ".join(part for part in (event_context, target) if part)
+        if event_context
+        else fallback
+    )
+    return _retrieval_query(context, event_payload)
+
+
+def _refinement_query(context: str, target: str) -> str:
+    return _retrieval_query(context, target) if target else context
 
 
 def _parse_temporal_expression(value: str) -> tuple[list[str], list[str]]:

@@ -157,6 +157,15 @@ export interface TrakeData {
     
     // Output TRAKE:
     hypotheses: TrakeHypothesis[];
+    status: "ok" | "insufficient_support" | "timeout" | string;
+    warnings: string[];
+    event_plan?: Record<string, unknown>;
+    trace?: {
+        status?: string;
+        warnings?: string[];
+        latency?: Record<string, number>;
+        preflight?: Record<string, unknown>;
+    };
 }
 
 export interface TrakeHypothesis {

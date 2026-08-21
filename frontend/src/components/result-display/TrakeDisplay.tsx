@@ -28,6 +28,23 @@ export default function TrakeDisplay({
     submittedTrakeIds = new Set(),
 }: TrakeDisplayProps) {
 
+    if (trakeData.hypotheses.length === 0) {
+        const warnings = trakeData.warnings ?? trakeData.trace?.warnings ?? [];
+        return (
+            <div role="status" className="mx-auto w-full max-w-4xl rounded-xl border border-amber-200 bg-amber-50 p-6 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
+                <h3 className="font-semibold">No complete TRAKE sequence found</h3>
+                <p className="mt-2 text-sm">
+                    Status: {trakeData.status || 'insufficient_support'}. The system did not return a partial or low-support sequence.
+                </p>
+                {warnings.length > 0 && (
+                    <ul className="mt-3 list-disc space-y-1 pl-5 text-xs">
+                        {warnings.map(warning => <li key={warning}>{warning}</li>)}
+                    </ul>
+                )}
+            </div>
+        );
+    }
+
     return (
         <div className="flex flex-col gap-8 max-w-7xl mx-auto w-full pb-12">
             <div className="flex items-center gap-4 border-b border-zinc-200 dark:border-zinc-800 pb-4">
@@ -83,6 +100,7 @@ export default function TrakeDisplay({
                             {hypothesis.events?.map((ev: CandidateEvent, eIdx: number) => {
                                 const sceneData = ev.result;
                                 if (!sceneData) return null;
+                                const frameIdx = hypothesis.frame_ids[eIdx] ?? sceneData.frame_index;
 
                                 const mockScene: VideoScene = {
                                     ...sceneData,
@@ -110,9 +128,12 @@ export default function TrakeDisplay({
                                         <div className="aspect-video w-full bg-black/5 dark:bg-white/5 rounded-lg overflow-hidden mb-3 border border-zinc-200 dark:border-zinc-800">
                                             <img src={`${API_PROXY}/video/frame/${mockScene.video_id}/${mockScene.frame_id}`} alt={mockScene.frame_id} className="object-cover w-full h-full" loading="lazy" />
                                         </div>
-                                        <div className="flex justify-between items-center px-1 mb-3">
+                                        <div className="flex justify-between items-center gap-2 px-1 mb-3">
                                             <span className={`${cardSize === 'sm' ? 'text-[10px]' : 'text-xs'} font-mono font-medium text-zinc-600 dark:text-zinc-400`}>
                                                 @ {mockScene.timestamp.toFixed(1)}s
+                                            </span>
+                                            <span className={`${cardSize === 'sm' ? 'text-[10px]' : 'text-xs'} font-mono font-semibold text-zinc-700 dark:text-zinc-300`}>
+                                                frame_idx: {frameIdx}
                                             </span>
                                         </div>
                                         <div className="flex gap-2 mt-auto">

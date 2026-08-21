@@ -8,6 +8,7 @@ inside each event list so they cannot dominate temporal alignment.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -106,20 +107,112 @@ class EventRetriever:
         event_trace: list[dict[str, Any]] = []
         warnings: list[str] = []
         search_method, wide_pool_method = _search_method(self.retrieval_engine)
+        nonempty_events = [event for event in plan.events if event.original_text.strip()]
+        context = plan.context.strip()
+        context_requested = bool(
+            include_context and self.config.context_weight > 0 and context
+        )
+        batch_queries = [event.retrieval_query for event in nonempty_events]
+        if context_requested:
+            batch_queries.append(context)
+        prefetched: dict[int, Any] = {}
+        prefetched_context: Any | None = None
+        batch_calls = 0
+        batch_status = "unsupported"
+        batch_method_name = (
+            "search_many_pool" if wide_pool_method == "search_pool" else "search_many"
+        )
+        batch_method = getattr(self.retrieval_engine, batch_method_name, None)
+        if callable(batch_method) and batch_queries:
+            try:
+                responses = list(
+                    batch_method(batch_queries, top_k=self.config.event_top_k)
+                )
+                if len(responses) != len(batch_queries):
+                    raise RuntimeError("batched retrieval responses must align with queries")
+                prefetched = {
+                    event.index: response
+                    for event, response in zip(nonempty_events, responses)
+                }
+                if context_requested:
+                    prefetched_context = responses[-1]
+                batch_calls = 1
+                batch_status = "success"
+            except Exception:
+                # The batch surface is an optimization, never a semantic
+                # fallback.  Canonical single-query retrieval remains valid.
+                warnings.append("canonical_batch_retrieval_failed_sequential_fallback")
+                prefetched = {}
+                prefetched_context = None
+                batch_status = "failed_sequential_fallback"
         dense_enabled = bool(_config_value(self.config, "bge_dense_enabled", False))
         reranker_enabled = bool(
             _config_value(self.config, "bge_reranker_enabled", False)
         )
         bge_required = bool(_config_value(self.config, "bge_required", False))
         dense_calls = 0
+        dense_batch_calls = 0
+        dense_latency_ms = 0.0
+        dense_prefetched: dict[int, Any] = {}
+        dense_batch_status = "unsupported"
+        dense_many = getattr(self.dense_event_engine, "search_many", None)
+        if dense_enabled and callable(dense_many) and nonempty_events:
+            try:
+                dense_started = time.perf_counter()
+                dense_responses = list(
+                    dense_many(
+                        [event.retrieval_query for event in nonempty_events],
+                        top_k=int(
+                            _config_value(
+                                self.config,
+                                "bge_dense_top_k",
+                                self.config.event_top_k,
+                            )
+                        ),
+                    )
+                )
+                dense_latency_ms += (time.perf_counter() - dense_started) * 1000.0
+                if len(dense_responses) != len(nonempty_events):
+                    raise RuntimeError("batched BGE responses must align with events")
+                dense_prefetched = {
+                    event.index: response
+                    for event, response in zip(nonempty_events, dense_responses)
+                }
+                dense_batch_calls = 1
+                dense_calls = 1
+                dense_batch_status = "success"
+            except Exception:
+                dense_prefetched = {}
+                dense_batch_status = "failed_sequential_fallback"
+                warnings.append("bge_batch_retrieval_failed_sequential_fallback")
         reranker_calls = 0
         dense_circuit_open = False
         reranker_circuit_open = False
         for event in plan.events:
-            response = search_method(
-                event.retrieval_query,
-                top_k=self.config.event_top_k,
-            )
+            if not event.original_text.strip():
+                by_event[event.index] = ()
+                warnings.append(f"event_{event.index}_empty_marker_no_retrieval")
+                event_trace.append(
+                    {
+                        "event_index": event.index,
+                        "requested_top_k": self.config.event_top_k,
+                        "retrieved_count": 0,
+                        "valid_lineage_count": 0,
+                        "candidate_count": 0,
+                        "missing_lineage_count": 0,
+                        "status": "skipped_empty_event",
+                        "sources": {},
+                        "fusion": {"status": "skipped_empty_event"},
+                        "reranker": {"status": "skipped_empty_event"},
+                    }
+                )
+                continue
+            response = prefetched.get(event.index)
+            if response is None:
+                response = search_method(
+                    event.retrieval_query,
+                    top_k=self.config.event_top_k,
+                )
             raw_results = _response_results(response)
             valid_results, missing_lineage = _valid_event_results(raw_results)
             source_trace: dict[str, Any] = {
@@ -183,11 +276,15 @@ class EventRetriever:
                         dense_search, dense_method = _search_method(
                             self.dense_event_engine
                         )
-                        dense_calls += 1
-                        dense_response = dense_search(
-                            event.retrieval_query,
-                            top_k=dense_trace["requested_top_k"],
-                        )
+                        dense_response = dense_prefetched.get(event.index)
+                        if dense_response is None:
+                            dense_calls += 1
+                            dense_started = time.perf_counter()
+                            dense_response = dense_search(
+                                event.retrieval_query,
+                                top_k=dense_trace["requested_top_k"],
+                            )
+                            dense_latency_ms += (time.perf_counter() - dense_started) * 1000.0
                         dense_raw = _response_results(dense_response)
                         dense_valid, dense_missing_lineage = _valid_event_results(
                             dense_raw
@@ -365,13 +462,14 @@ class EventRetriever:
             "retrieved_count": 0,
             "video_count": 0,
         }
-        context = plan.context.strip()
-        if include_context and self.config.context_weight > 0 and context:
+        if context_requested:
             try:
-                response = search_method(
-                    context,
-                    top_k=self.config.event_top_k,
-                )
+                response = prefetched_context
+                if response is None:
+                    response = search_method(
+                        context,
+                        top_k=self.config.event_top_k,
+                    )
                 context_results = _response_results(response)
                 context_scores = normalize_context_video_scores(context_results)
                 context_trace = {
@@ -397,10 +495,22 @@ class EventRetriever:
             trace={
                 "event_count": len(plan.events),
                 "retrieval_calls": (
-                    len(plan.events)
+                    sum(1 for event in plan.events if event.original_text.strip())
                     + dense_calls
                     + int(context_trace["enabled"])
                 ),
+                "model_forward_calls": (
+                    batch_calls
+                    if batch_status == "success"
+                    else sum(1 for event in plan.events if event.original_text.strip())
+                    + int(context_trace["enabled"])
+                ),
+                "batch_retrieval": {
+                    "method": batch_method_name,
+                    "status": batch_status,
+                    "logical_query_count": len(batch_queries),
+                    "batch_calls": batch_calls,
+                },
                 "reranker_calls": reranker_calls,
                 "events": event_trace,
                 "context": context_trace,
@@ -414,6 +524,9 @@ class EventRetriever:
                     "dense_enabled": dense_enabled,
                     "dense_engine_available": self.dense_event_engine is not None,
                     "dense_calls": dense_calls,
+                    "dense_batch_calls": dense_batch_calls,
+                    "dense_batch_status": dense_batch_status,
+                    "dense_latency_ms": round(dense_latency_ms, 3),
                     "dense_circuit_open": dense_circuit_open,
                     "reranker_enabled": reranker_enabled,
                     "reranker_available": self.event_reranker is not None,

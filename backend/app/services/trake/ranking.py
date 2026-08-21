@@ -76,7 +76,7 @@ def rank_hypotheses(
             continue
         if not str(variant.video_id).strip():
             continue
-        if any(right < left for left, right in zip(frames, frames[1:])):
+        if any(right <= left for left, right in zip(frames, frames[1:])):
             continue
         path = variant.coarse_path
         if len(path.event_candidates) != len(frames):
