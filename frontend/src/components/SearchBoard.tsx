@@ -35,6 +35,8 @@ interface SearchBoardProps {
   onFinalSubmit: (sceneId: string) => void;
   clickedSceneIds: Set<string>;
   submittedSceneIds: Set<string>;
+  clickedTrakeIds: Set<string>;
+  submittedTrakeIds: Set<string>;
 }
 
 const SearchBoard: React.FC<SearchBoardProps> = ({
@@ -58,8 +60,10 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
   onOpenLogs,
   onSelectResult,
   onFinalSubmit,
-  clickedSceneIds,
-  submittedSceneIds
+  clickedSceneIds = new Set(),
+  submittedSceneIds = new Set(),
+  clickedTrakeIds = new Set(),
+  submittedTrakeIds = new Set()
 }) => {
   const isAnyLoading = Object.values(isSearching).some(Boolean);
   const [isSidebarExpanded, setIsSidebarExpanded] = useState(true);
@@ -87,8 +91,8 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
         return (
             <QaDisplay 
                 qaData={dataPayload as QAData}
+                cardSize={cardSize}
                 onSelectResult={onSelectResult}
-                onFinalSubmit={onFinalSubmit}
             />
         );
     }
@@ -97,8 +101,11 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
         return (
             <TrakeDisplay 
                 trakeData={dataPayload as TrakeData}
+                cardSize={cardSize}
                 onSelectResult={onSelectResult}
                 onFinalSubmit={onFinalSubmit}
+                clickedTrakeIds={clickedTrakeIds}
+                submittedTrakeIds={submittedTrakeIds}
             />
         );
     }
@@ -107,8 +114,8 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
         return (
             <TemporalDisplay
                 temporalData={dataPayload as TemporalData}
+                cardSize={cardSize}
                 onSelectResult={onSelectResult}
-                onFinalSubmit={onFinalSubmit}
                 clickedSceneIds={clickedSceneIds}
                 submittedSceneIds={submittedSceneIds}
             />
@@ -170,19 +177,17 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
               </div>
 
               <div className="flex flex-wrap items-center gap-3">
-                {(activeTask === 'KIST' || activeTask === 'TEMPORAL') && (
-                    <div className="flex items-center bg-zinc-100 dark:bg-zinc-800/80 p-1 rounded-lg border border-zinc-200 dark:border-zinc-700">
-                        <button onClick={() => setCardSize('sm')} className={`p-1.5 rounded ${cardSize === 'sm' ? 'bg-white dark:bg-zinc-600 shadow-sm text-blue-600 dark:text-blue-400' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`} title="Compact View">
-                            <Grid className="w-4 h-4" />
-                        </button>
-                        <button onClick={() => setCardSize('md')} className={`p-1.5 rounded ${cardSize === 'md' ? 'bg-white dark:bg-zinc-600 shadow-sm text-blue-600 dark:text-blue-400' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`} title="Default View">
-                            <LayoutGrid className="w-4 h-4" />
-                        </button>
-                        <button onClick={() => setCardSize('lg')} className={`p-1.5 rounded ${cardSize === 'lg' ? 'bg-white dark:bg-zinc-600 shadow-sm text-blue-600 dark:text-blue-400' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`} title="Large View">
-                            <Rows className="w-4 h-4" />
-                        </button>
-                    </div>
-                )}
+                <div className="flex items-center bg-zinc-100 dark:bg-zinc-800/80 p-1 rounded-lg border border-zinc-200 dark:border-zinc-700">
+                    <button onClick={() => setCardSize('sm')} className={`p-1.5 rounded ${cardSize === 'sm' ? 'bg-white dark:bg-zinc-600 shadow-sm text-blue-600 dark:text-blue-400' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`} title="Compact View">
+                        <Grid className="w-4 h-4" />
+                    </button>
+                    <button onClick={() => setCardSize('md')} className={`p-1.5 rounded ${cardSize === 'md' ? 'bg-white dark:bg-zinc-600 shadow-sm text-blue-600 dark:text-blue-400' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`} title="Default View">
+                        <LayoutGrid className="w-4 h-4" />
+                    </button>
+                    <button onClick={() => setCardSize('lg')} className={`p-1.5 rounded ${cardSize === 'lg' ? 'bg-white dark:bg-zinc-600 shadow-sm text-blue-600 dark:text-blue-400' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`} title="Large View">
+                        <Rows className="w-4 h-4" />
+                    </button>
+                </div>
 
                 {(activeTask === 'KIST' || activeTask === 'TEMPORAL') && (
                     <>

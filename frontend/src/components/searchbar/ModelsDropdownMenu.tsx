@@ -3,11 +3,11 @@ import {
     DropdownMenuContent,
     DropdownMenuItem,
     DropdownMenuTrigger,
-} from "./ui/dropdown-menu";
-import { cn } from '../libs/utils';
-import { MODES, MODE_ICONS } from "../constants/mode-icons";
+} from "../ui/dropdown-menu";
+import { cn } from '../../libs/utils';
+import { MODES, MODE_ICONS } from "../../constants/mode-icons";
 import { Bot, Check, ChevronDown } from "lucide-react";
-import Button from "./ui/button/Button";
+import Button from "../ui/button/Button";
 import { AnimatePresence, motion } from "framer-motion";
 
 interface ModelDropdownMenuProps {

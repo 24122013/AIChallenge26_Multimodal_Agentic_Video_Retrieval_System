@@ -1,4 +1,4 @@
-import { useRef, useCallback } from 'react';
+import { useRef, useCallback, useMemo } from 'react';
 import type { VideoScene, SearchPayload, SearchLog, ActiveTask } from './types';
 import { useTelemetry } from './hooks/useTelemetry';
 import { useSearch } from './hooks/useSearch';
@@ -17,7 +17,9 @@ export default function App() {
   const {
     currentQuery, setCurrentQuery, currentSearchId, setCurrentSearchId,
     clickedSceneIds, setClickedSceneIds,
-    submittedSceneIds, setSubmittedSceneIds
+    submittedSceneIds, setSubmittedSceneIds,
+    clickedTrakeIds, setClickedTrakeIds,
+    submittedTrakeIds, setSubmittedTrakeIds
   } = useSearchInteractions();
   
   const {
@@ -32,9 +34,20 @@ export default function App() {
 
   const searchStartTimesRef = useRef<Record<string, number>>({});
 
+  const currentLog = searchLogs.find(l => l.id === currentSearchId);
+  const activeTask = useMemo(() => {
+    return (currentLog?.taskType?.toUpperCase() || 'KIST') as ActiveTask;
+  }, [currentLog?.taskType]);
+
   const handleSelectResult = useCallback((scene: VideoScene) => {
     const clickTime = Date.now();
-    setClickedSceneIds(prev => new Set([...prev, scene.frame_id]));
+    
+    if (activeTask === 'TRAKE') {
+        setClickedTrakeIds(prev => new Set([...prev, scene.frame_id]));
+    } else {
+        setClickedSceneIds(prev => new Set([...prev, scene.frame_id]));
+    }
+    
     handleSelectResultVideo(scene);
     sendTelemetry('click_result', { frame_id: scene.frame_id }, 0);
 
@@ -48,7 +61,7 @@ export default function App() {
           : log
       ));
     }
-  }, [setClickedSceneIds, handleSelectResultVideo, sendTelemetry, currentSearchId, setSearchLogs]);
+  }, [activeTask, setClickedSceneIds, setClickedTrakeIds, handleSelectResultVideo, sendTelemetry, currentSearchId, setSearchLogs]);
 
   const handleExecuteSearch = useCallback(async (payload: SearchPayload, retraceLogId?: string) => {
     const searchId = retraceLogId || crypto.randomUUID();
@@ -99,26 +112,39 @@ export default function App() {
     handleExecuteSearch(log.payload, log.id);
   }, [handleExecuteSearch, setIsLogModalOpen]);
 
-  const handleFinalSubmit = useCallback((frameId: string) => {
-    const isUnsubmitting = submittedSceneIds.has(frameId);
+  const handleFinalSubmit = useCallback((id: string) => {
+    const isTrake = activeTask === 'TRAKE';
+    const isUnsubmitting = isTrake ? submittedTrakeIds.has(id) : submittedSceneIds.has(id);
     const submitTime = Date.now();
 
-    setSubmittedSceneIds(prev => {
-      const newSet = new Set(prev);
-      if (isUnsubmitting) {
-        newSet.delete(frameId);
-      } else {
-        newSet.add(frameId);
-      }
-      return newSet;
-    });
+    if (isTrake) {
+        setSubmittedTrakeIds(prev => {
+            const newSet = new Set(prev);
+            if (isUnsubmitting) {
+                newSet.delete(id);
+            } else {
+                newSet.add(id);
+            }
+            return newSet;
+        });
+    } else {
+        setSubmittedSceneIds(prev => {
+            const newSet = new Set(prev);
+            if (isUnsubmitting) {
+                newSet.delete(id);
+            } else {
+                newSet.add(id);
+            }
+            return newSet;
+        });
+    }
 
     if (currentSearchId) {
       setSearchLogs(prev => prev.map(log => {
         if (log.id === currentSearchId) {
           const newSubmits = isUnsubmitting 
-            ? log.submittedCandidates.filter(s => s.id !== frameId)
-            : [...(log.submittedCandidates || []), { id: frameId, timestamp: submitTime }];
+            ? log.submittedCandidates.filter(s => s.id !== id)
+            : [...(log.submittedCandidates || []), { id: id, timestamp: submitTime }];
             
           let newSolveTime = log.solveTime;
           if (!isUnsubmitting && log.solveTime === 0 && searchStartTimesRef.current[currentSearchId]) {
@@ -137,11 +163,8 @@ export default function App() {
     }
     
     const telemetryEvent = isUnsubmitting ? 'click_result' : 'submit_result';
-    sendTelemetry(telemetryEvent, { chosen_frame_id: frameId, matching_query: currentQuery });
-  }, [currentSearchId, currentQuery, submittedSceneIds, setSubmittedSceneIds, setSearchLogs, sendTelemetry]);
-
-  const currentLog = searchLogs.find(l => l.id === currentSearchId);
-  const activeTask = (currentLog?.taskType?.toUpperCase() || 'KIST') as ActiveTask;
+    sendTelemetry(telemetryEvent, { chosen_id: id, matching_query: currentQuery });
+  }, [activeTask, currentSearchId, currentQuery, submittedSceneIds, setSubmittedSceneIds, submittedTrakeIds, setSubmittedTrakeIds, setSearchLogs, sendTelemetry]);
 
   return (
     <div className="flex flex-col min-h-screen w-full bg-slate-100 dark:bg-[#09090b] font-sans text-slate-900 dark:text-slate-100 relative">
@@ -197,6 +220,8 @@ export default function App() {
         onFinalSubmit={handleFinalSubmit}
         clickedSceneIds={clickedSceneIds}
         submittedSceneIds={submittedSceneIds}
+        clickedTrakeIds={clickedTrakeIds}
+        submittedTrakeIds={submittedTrakeIds}
       />
     </div>
   );

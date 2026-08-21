@@ -4,7 +4,7 @@ import { ArrowRight, Search, ChevronLeft } from "lucide-react";
 import React, { useCallback, useState, useRef, useEffect } from "react";
 import { type ImageInputMode, type ColorScheme, COLOR_OPTIONS } from '../../constants/image-input';
 import type { TextSearchPayload, SearchPayload, ImagePayload } from '../../types';
-import ModelDropdownMenu from "../ModelsDropdownMenu";
+import ModelDropdownMenu from "./ModelsDropdownMenu";
 import { type KistMode, KIST_MODES } from '../../constants/mode-icons';
 
 import ConfigPanel from './ConfigPanel';
@@ -308,7 +308,7 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
 
     if (!isExpanded) {
         return (
-            <div className="fixed z-[50] left-4 top-1/2 -translate-y-1/2">
+            <div className="fixed z-[60] left-4 top-1/2 -translate-y-1/2">
                 <button onClick={() => setIsExpanded(true)} className="p-3 bg-blue-600 text-white rounded-full shadow-lg">
                     <Search className="w-5 h-5" />
                 </button>
