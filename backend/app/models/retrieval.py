@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from typing import Generic, TypeVar
 
+T = TypeVar("T")
 
 @dataclass(frozen=True)
 class NeighborFrame:
@@ -54,7 +56,6 @@ class RetrievalResult:
 class VisualSearchRequest:
     query: str
     top_k: int = 20
-
 
 @dataclass(frozen=True)
 class VisualSearchResponse:

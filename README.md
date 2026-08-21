@@ -51,7 +51,7 @@ query + task (KIS/AVS/temporal/TRAKE/QA/auto)
   chạm, rời hoàn toàn hoặc đạt đỉnh) và có thể nằm cạnh keyframe kỹ thuật. Local
   refinement chỉ dò một cửa sổ bounded quanh coarse frame; không tạo dense index
   toàn corpus.
-
+g
 Chi tiết truy vết theo file/function và risk register nằm tại
 [`docs/PIPELINE_AUDIT.md`](docs/PIPELINE_AUDIT.md).
 
@@ -131,6 +131,26 @@ ffprobe -version
 python -m pip check
 python -c "import torch, paddle, transformers, faiss; print({'torch': torch.__version__, 'cuda': torch.cuda.is_available(), 'paddle': paddle.__version__, 'paddle_cuda': paddle.is_compiled_with_cuda()})"
 ```
+
+### Cài đặt và chạy Frontend local
+
+Để chạy GUI cho ứng dụng, ta cần `Node JS` và `NPM` (phiên bản được sử dụng: `Node v22.15.0` và `npm@10.9.2`).
+
+Để khởi chạy Web App, ta đi vào thư mục `frontend/` và chạy lệnh:
+
+```powershell
+npm install # Tải về các thư viện cần thiết
+npm run dev # Khởi chạy Web App
+```
+
+Từ thư mục `root` của repository, khởi động server Backend FastAPI thông qua lệnh:
+
+```powershell
+# Kích hoạt venv trước đó
+uvicorn backend.run:app --reload
+```
+
+Truy cập Web App frontend ở `http://localhost:5173/`.
 
 ## Cấu hình runtime
 

@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
-    router = APIRouter(prefix="/search", tags=["search"])
+    router = APIRouter(prefix="/api/search", tags=["search"])
 
     class SearchBody(BaseModel):
         query: str

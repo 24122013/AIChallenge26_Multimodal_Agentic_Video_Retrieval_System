@@ -1,0 +1,1 @@
+export type NavBoxType = 'main_query' | 'extended' | 'imageLink' | 'imageGen' | 'uploadZone';
