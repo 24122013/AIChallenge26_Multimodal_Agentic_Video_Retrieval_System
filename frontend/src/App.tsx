@@ -1,10 +1,10 @@
 import { useRef, useCallback } from 'react';
-import type { VideoScene, SearchPayload, SearchLog } from './types';
+import type { VideoScene, SearchPayload, SearchLog, ActiveTask } from './types';
 import { useTelemetry } from './hooks/useTelemetry';
 import { useSearch } from './hooks/useSearch';
-import VideoPlayer from './components/blocks/VideoPlayer';
-import TelemetryLogModal from './components/blocks/TelemetryLogModal';
-import SearchBoard from './components/blocks/SearchBoard';
+import VideoPlayer from './components/VideoPlayer';
+import TelemetryLogModal from './components/TelemetryLogModal';
+import SearchBoard from './components/SearchBoard';
 import useVideo from './hooks/useVideo';
 import { useSearchInteractions } from './hooks/useSearchInteractions';
 import { useResultFilters } from './hooks/useResultFilter';
@@ -12,11 +12,12 @@ import { RETRIEVAL_METHODS } from './constants/mode-icons';
 
 export default function App() {
   const { sendTelemetry, searchLogs, setSearchLogs, isLogModalOpen, setIsLogModalOpen } = useTelemetry();
-  const { sortedResults, isSearching, latency, sortBy, setSortBy, executeSearch } = useSearch();
+  const { sortedResults, isSearching, latency, sortBy, setSortBy, executeSearch, apiResponseData } = useSearch();
   
   const {
     currentQuery, setCurrentQuery, currentSearchId, setCurrentSearchId,
-    clickedSceneIds, setClickedSceneIds, submittedSceneIds, setSubmittedSceneIds
+    clickedSceneIds, setClickedSceneIds,
+    submittedSceneIds, setSubmittedSceneIds
   } = useSearchInteractions();
   
   const {
@@ -26,7 +27,7 @@ export default function App() {
   
   const {
     activeVideo, setActiveVideo, neighborData, setNeighborData,
-    lastSelectedScene, handleSelectResultVideo, handleNextVideo, handlePrevVideo
+    handleSelectResultVideo, handleNextVideo, handlePrevVideo
   } = useVideo(displayedResults);
 
   const searchStartTimesRef = useRef<Record<string, number>>({});
@@ -60,7 +61,9 @@ export default function App() {
 
     const primaryQuery = payload.text_queries.find(q => q.mode !== 'qa' && q.mode !== 'trake');
     const queryStr = primaryQuery?.query || payload.text_queries[0]?.query || 'multimodal criteria context';
-    const taskType = payload.config.model === "QA" ? "qa" : payload.config.model === "TRAKE" ? "trake" : "kis";
+    const taskType = payload.config.model === "QA" ? "qa"
+      : payload.config.model === "TRAKE" ? "trake"
+      : "kist";
     const searchMode = primaryQuery?.mode || payload.text_queries[0]?.mode || 'visual';
 
     setCurrentQuery(queryStr);
@@ -137,6 +140,9 @@ export default function App() {
     sendTelemetry(telemetryEvent, { chosen_frame_id: frameId, matching_query: currentQuery });
   }, [currentSearchId, currentQuery, submittedSceneIds, setSubmittedSceneIds, setSearchLogs, sendTelemetry]);
 
+  const currentLog = searchLogs.find(l => l.id === currentSearchId);
+  const activeTask = (currentLog?.taskType?.toUpperCase() || 'KIST') as ActiveTask;
+
   return (
     <div className="flex flex-col min-h-screen w-full bg-slate-100 dark:bg-[#09090b] font-sans text-slate-900 dark:text-slate-100 relative">
       <VideoPlayer
@@ -159,6 +165,8 @@ export default function App() {
       />
       
       <SearchBoard
+        activeTask={activeTask}
+        apiResponseData={apiResponseData}
         sortedResults={sortedResults}
         displayedResults={displayedResults}
         isSearching={isSearching}
@@ -182,13 +190,13 @@ export default function App() {
         }}
         resetSources={() => setActiveSources(new Set(RETRIEVAL_METHODS))}
         availableSources={RETRIEVAL_METHODS}
-        clickedSceneIds={clickedSceneIds}
-        submittedSceneIds={submittedSceneIds}
         searchLogsLength={searchLogs.length}
         onExecuteSearch={handleExecuteSearch}
         onOpenLogs={() => setIsLogModalOpen(true)}
         onSelectResult={handleSelectResult}
         onFinalSubmit={handleFinalSubmit}
+        clickedSceneIds={clickedSceneIds}
+        submittedSceneIds={submittedSceneIds}
       />
     </div>
   );

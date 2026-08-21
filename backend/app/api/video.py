@@ -17,14 +17,8 @@ try:
     STREAM_CONFIG = StreamConfig()
 
     @lru_cache(maxsize=1)
-    def load_neighbors_metadata():
+    def load_neighbors_metadata(metadata_path: str):
         """Loads the neighbors JSONL file into memory (cached)."""
-        metadata_path = os.path.abspath(
-            os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), 
-                '../../data/metadata/neighbors_all.jsonl'
-            )
-        )
         neighbors_map = {}
         if os.path.exists(metadata_path):
             with open(metadata_path, 'r', encoding='utf-8') as f:
@@ -40,7 +34,7 @@ try:
     @video_router.get("/frame_neighbor/{frame_id}")
     def get_frame_neighbor(frame_id: str):
         """Returns the neighbor frames mapped to internal API routes."""
-        metadata = load_neighbors_metadata()
+        metadata = load_neighbors_metadata(STREAM_CONFIG.NEIGHBOR_FRAME_PATH)
         record = metadata.get(frame_id)
         
         if not record:
@@ -113,28 +107,3 @@ try:
 
 except ImportError:
     video_router = None
-
-if __name__ == "__main__":
-    @lru_cache(maxsize=1)
-    def load_neighbors_metadata():
-        """Loads the neighbors JSONL file into memory (cached)."""
-        metadata_path = os.path.abspath(
-            os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), 
-                '../../../data/metadata/neighbors_all.jsonl'
-            )
-        )
-        neighbors_map = {}
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if line.strip():
-                        record = json.loads(line)
-                        neighbors_map[record["frame_id"]] = record
-        else:
-            print(f"Neighbors metadata not found at {metadata_path}")
-            
-        return neighbors_map
-
-    metadata = load_neighbors_metadata()
-    print(metadata)

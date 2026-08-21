@@ -1,8 +1,8 @@
 import React, { useRef, useEffect, useState } from 'react';
-import type { VideoScene } from '../../types';
-import type { NeighborResponse } from '../../hooks/useVideo';
+import type { VideoScene } from '../types';
+import type { NeighborResponse } from '../hooks/useVideo';
 import { Play, X, ChevronLeft, ChevronRight, Info } from 'lucide-react';
-import { API_PROXY } from '../../constants/proxy';
+import { API_PROXY } from '../constants/proxy';
 
 const TARGET_FPS = 30;
 const FRAMES_TO_STEP = 5;
@@ -20,8 +20,8 @@ interface VideoPlayerProps {
 }
 
 const VideoPlayer: React.FC<VideoPlayerProps> = ({ 
-    activeVideo, 
-    neighborData, 
+    activeVideo,
+    neighborData,
     onClose, 
     onFinalSubmit, 
     onNext, 
@@ -55,6 +55,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     useEffect(() => {
         if (!activeVideo) return;
 
+        // Hotkeys
         const handleKeyDown = (e: KeyboardEvent) => {
             if (e.key === 'Escape') {
                 e.preventDefault();
@@ -120,9 +121,23 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
     const allNeighbors = neighborData 
         ? [
-            ...neighborData.neighbors_before, 
-            { frame_id: neighborData.frame_id, delta_seconds: 0, url: neighborData.target_url, isTarget: true, timestamp: neighborData.timestamp }, 
-            ...neighborData.neighbors_after
+            ...neighborData.neighbors_before.map(frame => ({
+                ...frame,
+                url: `${API_PROXY}/video/frame/${neighborData.video_id}/${frame.frame_id}`,
+                delta_seconds: frame.delta_seconds // Already calculated or passed from backend
+            })), 
+            { 
+                frame_id: neighborData.frame_id, 
+                delta_seconds: 0, 
+                url: `${API_PROXY}/video/frame/${neighborData.video_id}/${neighborData.frame_id}`, 
+                isTarget: true, 
+                timestamp: neighborData.timestamp 
+            }, 
+            ...neighborData.neighbors_after.map(frame => ({
+                ...frame,
+                url: `${API_PROXY}/video/frame/${neighborData.video_id}/${frame.frame_id}`,
+                delta_seconds: frame.delta_seconds
+            }))
           ] 
         : [];
 
@@ -210,7 +225,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                                             className={`relative h-full aspect-video shrink-0 rounded-md overflow-hidden border-2 transition-all group ${isTarget ? 'border-blue-500 shadow-md ring-2 ring-blue-500/30' : 'border-transparent hover:border-zinc-400 dark:hover:border-zinc-600'}`}
                                             title="Click to play from this timestamp"
                                         >
-                                            <img src={`/api${frame.url}`} alt={frame.frame_id} className="w-full h-full object-cover" loading="lazy" />
+                                            <img src={`${API_PROXY}/video/frame/${neighborData?.video_id}/${frame.frame_id}`} alt={frame.frame_id} className="w-full h-full object-cover" loading="lazy" />
                                             
                                             <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 flex items-center justify-center transition-colors">
                                                 <Play className="w-6 h-6 text-white opacity-0 group-hover:opacity-100 drop-shadow-md" fill="currentColor" />

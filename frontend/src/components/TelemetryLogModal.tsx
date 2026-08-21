@@ -1,5 +1,5 @@
 import React from 'react';
-import type { SearchLog } from '../../types';
+import type { SearchLog } from '../types';
 
 interface TelemetryLogModalProps {
   isOpen: boolean;

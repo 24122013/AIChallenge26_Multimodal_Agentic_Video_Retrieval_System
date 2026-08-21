@@ -8,3 +8,5 @@ class StreamConfig:
     
     # Standard output directory for canonical keyframes
     RETRIEVAL_KEYFRAME_ROOT: str = os.getenv("RETRIEVAL_KEYFRAME_ROOT", "data/keyframes")
+
+    NEIGHBOR_FRAME_PATH: str = os.getenv("NEIGHBOR_FRAME_PATH", 'data/metadata/neighbors_all.jsonl')

@@ -51,7 +51,7 @@ query + task (KIS/AVS/temporal/TRAKE/QA/auto)
   chạm, rời hoàn toàn hoặc đạt đỉnh) và có thể nằm cạnh keyframe kỹ thuật. Local
   refinement chỉ dò một cửa sổ bounded quanh coarse frame; không tạo dense index
   toàn corpus.
-
+g
 Chi tiết truy vết theo file/function và risk register nằm tại
 [`docs/PIPELINE_AUDIT.md`](docs/PIPELINE_AUDIT.md).
 
@@ -146,7 +146,8 @@ npm run dev # Khởi chạy Web App
 Từ thư mục `root` của repository, khởi động server Backend FastAPI thông qua lệnh:
 
 ```powershell
-.\.venv\Scripts\uvicorn.exe backend.run:app --reload
+# Kích hoạt venv trước đó
+uvicorn backend.run:app --reload
 ```
 
 Truy cập Web App frontend ở `http://localhost:5173/`.

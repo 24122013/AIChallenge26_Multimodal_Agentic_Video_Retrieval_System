@@ -1,19 +1,14 @@
 import { useState, useCallback } from 'react';
-import type { VideoScene } from '../types';
-
-export interface NeighborDetail {
-  frame_id: string;
-  delta_seconds: number;
-  url: string;
-}
+import type { VideoScene, NeighborFrame } from '../types';
+import { API_PROXY } from '../constants/proxy';
 
 export interface NeighborResponse {
   frame_id: string;
   video_id: string;
   timestamp: number;
   target_url: string;
-  neighbors_before: NeighborDetail[];
-  neighbors_after: NeighborDetail[];
+  neighbors_before: NeighborFrame[];
+  neighbors_after: NeighborFrame[];
 }
 
 function useVideo(displayedResults: VideoScene[]) {
@@ -22,18 +17,19 @@ function useVideo(displayedResults: VideoScene[]) {
   const [lastSelectedScene, setLastSelectedScene] = useState<VideoScene | null>(null);
 
   const handleSelectResultVideo = useCallback(async (scene: VideoScene) => {
-      setActiveVideo({ ...scene, video_url: `/api/video/stream/${scene.video_id}` });
+      setActiveVideo({ ...scene, video_url: `${API_PROXY}/video/stream/${scene.video_id}` });
       setLastSelectedScene(scene);
       setNeighborData(null);
       
       try {
-          const res = await fetch(`/api/video/frame_neighbor/${scene.frame_id}`);
-          if (res.ok) {
-              const data = (await res.json()) as NeighborResponse;
-              setNeighborData(data);
-          }
+        const res = await fetch(`${API_PROXY}/video/frame_neighbor/${scene.frame_id}`);
+        if (res.ok) {
+            const data = (await res.json()) as NeighborResponse;
+            console.log("Neighbor API Response:", data);
+            setNeighborData(data);
+        }
       } catch (error) {
-          console.error("Failed to fetch neighbor frames:", error);
+        console.error("Failed to fetch neighbor frames:", error);
       }
     }, []);
 

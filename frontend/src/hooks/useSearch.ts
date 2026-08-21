@@ -1,8 +1,9 @@
 import { useState, useCallback, useRef } from 'react';
-import type { VideoScene, SearchPayload, SortKey } from '../types';
-
-// Relative paths — Vite proxy forwards /search/* → http://localhost:8000
-const API_BASE = '/api';
+import type {
+    VideoScene, SearchPayload, SortKey,
+    ApiResponse, VisualSearchData, QAData, TrakeData, TemporalData
+} from '../types';
+import { API_PROXY } from '../constants/proxy';
 
 interface UseSearchReturn {
     sortedResults: VideoScene[];
@@ -11,6 +12,7 @@ interface UseSearchReturn {
     sortBy: SortKey;
     setSortBy: (key: SortKey) => void;
     executeSearch: (payload: SearchPayload) => Promise<void>;
+    apiResponseData: ApiResponse<VisualSearchData> | ApiResponse<QAData> | ApiResponse<TrakeData> | ApiResponse<TemporalData> | null;
 }
 
 // Stable sort key accessor
@@ -27,6 +29,7 @@ export function useSearch(): UseSearchReturn {
     const [isSearching, setIsSearching] = useState<boolean>(false);
     const [latency, setLatency] = useState<number>(0);
     const [sortBy, setSortBy] = useState<SortKey>('arrival');
+    const [apiResponseData, setApiResponseData] = useState<ApiResponse<VisualSearchData> | ApiResponse<QAData> | ApiResponse<TrakeData> | ApiResponse<TemporalData> | null>(null);
 
     // Track a run-ID so stale async tasks from a cancelled search don't pollute results
     const runIdRef = useRef(0);
@@ -41,70 +44,66 @@ export function useSearch(): UseSearchReturn {
         const runId = ++runIdRef.current;
         clearResults();
         setIsSearching(true);
-
+    
         console.log("🚀 [Frontend] Strictly Typed SearchPayload:", payload);
-
-        // 1. Extract all queries, explicitly skipping "qa" mode
-        const kistQueries = payload.text_queries?.filter(q => q.mode !== 'qa') || [];
-
-        if (kistQueries.length === 0) {
-            console.warn("⚠️ No KIST text queries provided. Aborting fetch.");
+    
+        // Filter out empty queries, but DO NOT skip 'qa' mode
+        const validQueries = payload.text_queries?.filter(q => q.query.trim() !== "") || [];
+    
+        if (validQueries.length === 0) {
+            console.warn("⚠️ No valid text queries provided. Aborting fetch.");
             setIsSearching(false);
             return;
         }
-
+    
         try {
-            // 2. Map each KIST query to a separate fetch promise
-            const searchPromises = kistQueries.map(async (queryParam) => {
-                if (queryParam.query != "") {
-                    const requestBody = {
-                        query: queryParam.query,
-                        mode: queryParam.mode,
-                        top_k: payload.config.topK || queryParam.top_k || 20
-                    };
+            const searchPromises = validQueries.map(async (queryParam) => {
+                const requestBody = {
+                    query: queryParam.query,
+                    mode: queryParam.mode,
+                    top_k: payload.config.topK || queryParam.top_k || 20
+                };
     
-                    console.log(`📡 [Network] Sending request to /api/search for mode [${queryParam.mode}]:`, requestBody);
+                console.log(`📡 [Network] Sending request to /api/search for mode [${queryParam.mode}]:`, requestBody);
     
-                    const res = await fetch(`${API_BASE}/search`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(requestBody),
-                    });
+                const res = await fetch(`${API_PROXY}/search`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(requestBody),
+                });
     
-                    if (!res.ok) {
-                        const errorData = await res.json().catch(async () => ({ detail: await res.text() }));
-                        const errorMsg = errorData.detail || `HTTP ${res.status}`;
-                        console.error(`❌ [Backend Crash] Mode [${queryParam.mode}] Details:`, errorMsg);
-                        // Return null for this specific query so others can still succeed
-                        return null;
-                    }
-    
-                    const json = await res.json();
-                    console.log(`✅ [Backend Response] Mode [${queryParam.mode}]:`, json);
-                    return json.data;
-                } else {
-                    console.log(`None in the query`);
-                    return {};
+                if (!res.ok) {
+                    const errorData = await res.json().catch(async () => ({ detail: await res.text() }));
+                    const errorMsg = errorData.detail || `HTTP ${res.status}`;
+                    console.error(`❌ [Backend Crash] Mode [${queryParam.mode}] Details:`, errorMsg);
+                    return null;
                 }
+    
+                // Return the full JSON response instead of setting state mid-loop
+                return await res.json();
             });
-
-            // 3. Execute all API calls concurrently
+    
             const responses = await Promise.all(searchPromises);
-
-            // Abort state update if a new search was triggered while we were waiting
+    
             if (runIdRef.current !== runId) return;
-
-            // 4. Aggregate results and latencies
+    
             let totalLatency = 0;
             const aggregatedResults: VideoScene[] = [];
             const seenIds = new Set<string>();
-
-            responses.forEach((searchData) => {
-                if (!searchData) return;
-
-                totalLatency += searchData.latency_ms ?? 0;
+            let primaryResponseData = null;
+    
+            responses.forEach((jsonResponse) => {
+                if (!jsonResponse) return;
+    
+                // Capture the first valid response payload for UI rendering (like QA data)
+                if (!primaryResponseData) {
+                    primaryResponseData = jsonResponse;
+                }
+    
+                const searchData = jsonResponse.data;
+                totalLatency += searchData?.latency_ms ?? 0;
                 
-                const scenes: VideoScene[] = searchData.results ?? [];
+                const scenes: VideoScene[] = searchData?.results ?? [];
                 scenes.forEach(scene => {
                     const uniqueId = scene.frame_id ? String(scene.frame_id) : null;
                     
@@ -118,10 +117,14 @@ export function useSearch(): UseSearchReturn {
                     }
                 });
             });
-
+    
+            // Set state once after all promises resolve
+            if (primaryResponseData) {
+                setApiResponseData(primaryResponseData);
+            }
             setResults(aggregatedResults);
             setLatency(totalLatency);
-
+    
         } catch (err) {
             console.error('💥 [useSearch] execution error:', err);
         } finally {
@@ -143,5 +146,6 @@ export function useSearch(): UseSearchReturn {
         sortBy,
         setSortBy,
         executeSearch,
+        apiResponseData,
     };
 }
