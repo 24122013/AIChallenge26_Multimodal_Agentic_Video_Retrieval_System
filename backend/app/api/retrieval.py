@@ -111,6 +111,22 @@ if APIRouter is not None:
             lambda: search_online(body.query, task="temporal", top_k=body.top_k)
         )
 
+    @router.post("/kis-visual")
+    def kis_visual_search_endpoint(body: VisualSearchBody) -> dict:
+        return _response(
+            lambda: search_online(body.query, task="kis_visual", top_k=body.top_k)
+        )
+
+    @router.post("/kis-temporal")
+    def kis_temporal_search_endpoint(body: VisualSearchBody) -> dict:
+        return _response(
+            lambda: search_online(
+                body.query,
+                task="kis_temporal",
+                top_k=body.top_k,
+            )
+        )
+
     @router.post("/trake")
     def trake_search_endpoint(body: TrakeSearchBody) -> dict:
         return _response(lambda: search_trake(body.query, top_k=body.top_k))
@@ -176,6 +192,10 @@ def hybrid_search(query: str, top_k: int = 20) -> dict:
     return search_online(query=query, task="kis", top_k=top_k)
 
 
+def kis_visual_search(query: str, top_k: int = 20) -> dict:
+    return search_online(query=query, task="kis_visual", top_k=top_k)
+
+
 def caption_search(query: str, top_k: int = 20) -> dict:
     return search_caption(query=query, top_k=top_k).to_dict()
 
@@ -190,6 +210,10 @@ def object_search(query: str, top_k: int = 20) -> dict:
 
 def temporal_search(query: str, top_k: int = 20) -> list[dict]:
     return search_online(query=query, task="temporal", top_k=top_k)["candidates"]
+
+
+def kis_temporal_search(query: str, top_k: int = 20) -> dict:
+    return search_online(query=query, task="kis_temporal", top_k=top_k)
 
 
 def trake_search(query: str, top_k: int = 100) -> dict:

@@ -28,19 +28,27 @@ _BEFORE_OR_AFTER = re.compile(
 )
 _LINE_LIST_MARKER = re.compile(
     r"^[ \t]*(?P<marker>"
-    r"(?:events?|sự\s+kiện)\s+\d+\s*[:.)-]"
-    r"|\(\d+\)[.:]?"
-    r"|\d+[:.)-]"
-    r"|[-*•]"
-    r")[ \t]+",
+    # Official TRAKE prompts use E1:, E2:, ... .  The trailing whitespace is
+    # optional for that form so pasted prompts such as ``E1:event`` also work.
+    r"e\s*\d+\s*[:.)-][ \t]*"
+    r"|(?:events?|sự\s+kiện)\s+\d+\s*[:.)-][ \t]+"
+    r"|\(\d+\)[.:]?[ \t]+"
+    r"|\d+[:.)-][ \t]+"
+    r"|[-*•][ \t]+"
+    r")",
     re.IGNORECASE | re.MULTILINE,
 )
 _INLINE_NUMBERED_MARKER = re.compile(
     r"(?<!\S)(?P<marker>"
-    r"(?:events?|sự\s+kiện)\s+\d+\s*[:.)-]"
-    r"|\(\d+\)[.:]?"
-    r"|\d+[:.)-]"
-    r")[ \t]+",
+    r"e\s*\d+\s*[:.)-][ \t]*"
+    r"|(?:events?|sự\s+kiện)\s+\d+\s*[:.)-][ \t]+"
+    r"|\(\d+\)[.:]?[ \t]+"
+    r"|\d+[:.)-][ \t]+"
+    r")",
+    re.IGNORECASE,
+)
+_NUMBERED_MARKER_VALUE = re.compile(
+    r"^(?:e|events?|sự\s+kiện)?\s*\(?(?P<number>\d+)\)?",
     re.IGNORECASE,
 )
 _EVENT_SECTION = re.compile(
@@ -55,8 +63,10 @@ _CONTEXT_LABEL = re.compile(
     re.IGNORECASE,
 )
 _TRAILING_EVENT_HEADER = re.compile(
-    r"(?:^|[\r\n;.!?])\s*(?:ordered\s+events?|events?|event\s+sequence|"
-    r"chuỗi\s+sự\s+kiện|các\s+sự\s+kiện|sự\s+kiện)\s*:?\s*$",
+    r"(?:^|[\r\n;,.!?])\s*(?:ordered\s+events?|events?|event\s+sequence|"
+    r"chuỗi\s+sự\s+kiện|các\s+sự\s+kiện|sự\s+kiện|"
+    r"(?:please\s+)?find\s+(?:the\s+)?following\s+(?:ordered\s+)?events?|"
+    r"(?:hãy\s+)?tìm\s+(?:các\s+)?sự\s+kiện\s+sau(?:\s+đây)?)\s*:?\s*$",
     re.IGNORECASE,
 )
 _GENERIC_EVENT_PREAMBLE = re.compile(
@@ -301,7 +311,11 @@ def _parse_explicit_list(
     context = _clean_context(prefix)
     events: list[str] = []
     empty_count = 0
+    marker_numbers: list[int] = []
     for index, match in enumerate(matches):
+        marker_number = _marker_number(match.group("marker"))
+        if marker_number is not None:
+            marker_numbers.append(marker_number)
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         event = text[match.end() : end].strip()
         if event:
@@ -310,10 +324,23 @@ def _parse_explicit_list(
             empty_count += 1
     if not events:
         return None
-    warnings = (
-        ("empty_event_marker_ignored",) if empty_count else ()
-    )
-    return context, tuple(events), warnings
+    warnings: list[str] = []
+    if empty_count:
+        warnings.append("empty_event_marker_ignored")
+    # Labels in benchmark statements are presentation metadata, not event
+    # identity.  Preserve every non-empty event in source order even when the
+    # prompt contains a typo such as E1, E2, E2, E4.
+    if len(marker_numbers) == len(matches):
+        if len(set(marker_numbers)) != len(marker_numbers):
+            warnings.append("duplicate_event_label_preserved")
+        if marker_numbers != list(range(1, len(marker_numbers) + 1)):
+            warnings.append("event_labels_reindexed_by_appearance")
+    return context, tuple(events), tuple(warnings)
+
+
+def _marker_number(marker: str) -> int | None:
+    match = _NUMBERED_MARKER_VALUE.match(marker.strip())
+    return int(match.group("number")) if match is not None else None
 
 
 def _split_explicit_context(text: str) -> tuple[str, str]:

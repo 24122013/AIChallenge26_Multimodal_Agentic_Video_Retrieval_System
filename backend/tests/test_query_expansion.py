@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
 from backend.app.models.retrieval import RetrievalResult
 from backend.app.services.agent.query_expansion import (
+    DEFAULT_QUERY_EXPANSION_MODEL,
+    DEFAULT_QUERY_EXPANSION_MODEL_REVISION,
     ProviderResponse,
     QueryExpansionConfig,
     QwenQueryExpansionProvider,
@@ -18,6 +22,7 @@ from backend.app.services.agent.query_expansion import (
     build_query_expansion_plan,
     protect_literals,
 )
+from backend.app.services.retrieval.qa_answerer import DEFAULT_QA_MODEL
 from backend.app.services.retrieval.advanced_rerank import rerank_dense_candidates
 from backend.app.services.retrieval.advanced_search import (
     AdvancedSearchConfig,
@@ -79,6 +84,18 @@ class _ColdStartProvider(QwenQueryExpansionProvider):
 
 
 class QueryExpansionPlanTest(unittest.TestCase):
+    def test_query_expansion_defaults_to_pinned_2b_4bit_only(self) -> None:
+        config = QueryExpansionConfig()
+        self.assertEqual(DEFAULT_QUERY_EXPANSION_MODEL, "Qwen/Qwen3.5-2B")
+        self.assertEqual(
+            DEFAULT_QUERY_EXPANSION_MODEL_REVISION,
+            "15852e8c16360a2fea060d615a32b45270f8a8fc",
+        )
+        self.assertEqual(config.model_name, DEFAULT_QUERY_EXPANSION_MODEL)
+        self.assertEqual(config.model_revision, DEFAULT_QUERY_EXPANSION_MODEL_REVISION)
+        self.assertEqual(config.quantization, "4bit")
+        self.assertEqual(DEFAULT_QA_MODEL, "Qwen/Qwen3.5-9B")
+
     def test_more_than_two_paraphrases_keeps_first_two_valid(self) -> None:
         original = "a man in a red shirt next to two cars"
         provider = _FakeProvider(
@@ -261,6 +278,86 @@ class QueryExpansionPlanTest(unittest.TestCase):
         self.assertIn("Do not translate", calls[0])
         self.assertIn("untrusted data", calls[0])
         self.assertIn('Original query JSON string:', calls[0])
+        summary = provider.runtime_summary()
+        self.assertEqual(summary["provider_call_count"], 2)
+        self.assertEqual(summary["cache_hit_count"], 1)
+        self.assertEqual(summary["model_load_count"], 0)
+
+    def test_cache_hit_does_not_load_model(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            provider = QwenQueryExpansionProvider(cache_dir=Path(raw))
+            query = "a red bus"
+            cache_path = Path(raw) / "responses" / f"{provider._cache_key(query)}.json"
+            cache_path.parent.mkdir(parents=True)
+            cache_path.write_text(json.dumps(_payload([])), encoding="utf-8")
+            with mock.patch.object(provider, "_load") as load:
+                response = provider.expand(query, protect_literals(query))
+
+        self.assertTrue(response.cache_hit)
+        load.assert_not_called()
+
+    def test_cuda_loader_passes_real_4bit_bitsandbytes_config(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeProcessor:
+            @classmethod
+            def from_pretrained(cls, model_name, **kwargs):
+                captured["processor"] = (model_name, kwargs)
+                return cls()
+
+        class FakeLoadedModel:
+            def eval(self):
+                captured["eval"] = True
+
+        class FakeModelFactory:
+            @classmethod
+            def from_pretrained(cls, model_name, **kwargs):
+                captured["model"] = (model_name, kwargs)
+                return FakeLoadedModel()
+
+        class FakeBitsAndBytesConfig:
+            def __init__(self, **kwargs):
+                captured["bnb"] = kwargs
+
+        fake_torch = SimpleNamespace(
+            float32="float32",
+            float16="float16",
+            bfloat16="bfloat16",
+            cuda=SimpleNamespace(is_bf16_supported=lambda: True),
+        )
+        fake_transformers = SimpleNamespace(
+            AutoModelForMultimodalLM=FakeModelFactory,
+            AutoProcessor=FakeProcessor,
+            BitsAndBytesConfig=FakeBitsAndBytesConfig,
+        )
+        provider = QwenQueryExpansionProvider(device="cuda")
+
+        with mock.patch.dict(
+            sys.modules,
+            {"torch": fake_torch, "transformers": fake_transformers},
+        ):
+            provider._load()
+
+        model_name, model_kwargs = captured["model"]
+        self.assertEqual(model_name, "Qwen/Qwen3.5-2B")
+        self.assertEqual(
+            model_kwargs["revision"],
+            "15852e8c16360a2fea060d615a32b45270f8a8fc",
+        )
+        self.assertIsInstance(
+            model_kwargs["quantization_config"],
+            FakeBitsAndBytesConfig,
+        )
+        self.assertEqual(
+            captured["bnb"],
+            {
+                "load_in_4bit": True,
+                "load_in_8bit": False,
+                "bnb_4bit_compute_dtype": "bfloat16",
+            },
+        )
+        self.assertEqual(model_kwargs["device_map"], "auto")
+        self.assertEqual(provider.runtime_summary()["model_load_count"], 1)
 
     def test_cache_identity_includes_generation_configuration(self) -> None:
         calls: list[str] = []

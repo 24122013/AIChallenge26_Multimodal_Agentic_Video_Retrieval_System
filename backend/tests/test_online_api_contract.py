@@ -99,6 +99,59 @@ class OnlineApiContractTest(unittest.TestCase):
             top_k=9,
         )
 
+    def test_unified_search_accepts_kis_temporal_as_a_kis_profile(self) -> None:
+        expected = {"task": "kis", "candidates": []}
+        with mock.patch.object(
+            search_api,
+            "search_online",
+            return_value=expected,
+        ) as search_online:
+            response = search_api.search(
+                "Khoảnh khắc đầu tiên người dẫn xuất hiện trên xích lô",
+                100,
+                "kis_temporal",
+            )
+
+        self.assertEqual(response, expected)
+        search_online.assert_called_once_with(
+            query="Khoảnh khắc đầu tiên người dẫn xuất hiện trên xích lô",
+            task="kis_temporal",
+            top_k=100,
+        )
+
+    def test_unified_search_routes_kis_visual_to_online_pipeline(self) -> None:
+        expected = {"task": "kis", "candidates": []}
+        with mock.patch.object(
+            search_api,
+            "search_online",
+            return_value=expected,
+        ) as search_online:
+            response = search_api.search("a red bus", 20, "kis_visual")
+
+        self.assertEqual(response, expected)
+        search_online.assert_called_once_with(
+            query="a red bus",
+            task="kis_visual",
+            top_k=20,
+        )
+
+    def test_visual_diagnostic_route_remains_direct(self) -> None:
+        visual_response = mock.Mock()
+        visual_response.to_dict.return_value = {"task": "visual", "results": []}
+        with (
+            mock.patch.object(
+                search_api,
+                "search_visual",
+                return_value=visual_response,
+            ) as search_visual,
+            mock.patch.object(search_api, "search_online") as search_online,
+        ):
+            response = search_api.search("a red bus", 20, "visual")
+
+        self.assertEqual(response["task"], "visual")
+        search_visual.assert_called_once_with(query="a red bus", top_k=20)
+        search_online.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

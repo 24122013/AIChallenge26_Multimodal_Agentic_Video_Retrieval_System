@@ -227,25 +227,10 @@ def _validate_runtime_lineage(lineage: object) -> list[str]:
                     issues.append(f"bge_dense_{artifact}_checksum_missing")
 
     reranker = lineage.get("reranker")
-    if not isinstance(reranker, Mapping) or not reranker.get("enabled"):
-        issues.append("bge_reranker_not_enabled")
-    else:
-        if not str(reranker.get("model_name") or "").strip():
-            issues.append("bge_reranker_model_name_missing")
-        if not str(reranker.get("model_revision") or "").strip():
-            issues.append("bge_reranker_model_revision_missing")
-        report = reranker.get("last_report")
-        if not isinstance(report, Mapping) or report.get("status") != "passed":
-            issues.append("bge_reranker_not_applied")
-        else:
-            for field in ("candidate_count", "scored_count", "output_count"):
-                if not _positive_int(report.get(field)):
-                    issues.append(f"bge_reranker_{field}_invalid")
-            for field in ("model_name", "model_revision"):
-                reported = str(report.get(field) or "").strip()
-                declared = str(reranker.get(field) or "").strip()
-                if reported and reported != declared:
-                    issues.append(f"bge_reranker_{field}_mismatch")
+    if not isinstance(reranker, Mapping):
+        issues.append("reranker_lineage_missing")
+    elif reranker.get("enabled") is not False:
+        issues.append("model_reranker_must_be_disabled")
 
     answer_model = lineage.get("answer_model")
     if not isinstance(answer_model, Mapping):
@@ -304,8 +289,8 @@ def _validate_task_payload(payload: Mapping[str, Any]) -> list[str]:
     if trace.get("fallback_used") or list(trace.get("fallback_reasons") or []):
         issues.append("retrieval_fallback_used")
     if task == "qa":
-        if trace.get("reranker") != "applied":
-            issues.append("routing_reranker_not_applied")
+        if trace.get("reranker") != "off":
+            issues.append("model_reranker_applied")
         modality_queries = trace.get("modality_queries")
         dense_calls = [
             item

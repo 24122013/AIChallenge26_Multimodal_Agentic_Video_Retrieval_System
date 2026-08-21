@@ -5,7 +5,7 @@ import {
     DropdownMenuTrigger,
 } from "../ui/dropdown-menu";
 import { cn } from '../../libs/utils';
-import { MODES, MODE_ICONS } from "../../constants/mode-icons";
+import { MODES, MODE_ICONS, MODE_LABELS } from "../../constants/mode-icons";
 import { Bot, Check, ChevronDown } from "lucide-react";
 import Button from "../ui/button/Button";
 import { AnimatePresence, motion } from "framer-motion";
@@ -50,7 +50,7 @@ export default function ModelDropdownMenu(
                                 selectedModel
                             ]
                         }
-                        {selectedModel}
+                        {MODE_LABELS[selectedModel] ?? selectedModel}
                         <ChevronDown className="w-3 h-3 opacity-50" />
                     </motion.div>
                 </AnimatePresence>
@@ -75,7 +75,7 @@ export default function ModelDropdownMenu(
                             {MODE_ICONS[model] || (
                                 <Bot className="w-4 h-4 opacity-50" />
                             )}
-                            <span>{model}</span>
+                            <span>{MODE_LABELS[model] ?? model}</span>
                         </div>
                         {selectedModel ===
                             model && (

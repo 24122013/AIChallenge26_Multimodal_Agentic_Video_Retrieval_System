@@ -236,7 +236,7 @@ class TrakeBgeManagerTest(unittest.TestCase):
         dense_getter.assert_not_called()
         reranker_factory.assert_not_called()
 
-    def test_enabled_components_are_injected_without_qa_coupling(self) -> None:
+    def test_dense_is_injected_but_model_reranker_is_removed(self) -> None:
         dense = SimpleNamespace(corpus_generation=None)
         reranker = object()
         pipeline, dense_getter, reranker_factory = self._build_pipeline(
@@ -249,9 +249,9 @@ class TrakeBgeManagerTest(unittest.TestCase):
         )
 
         self.assertIs(pipeline.dense_event_engine, dense)
-        self.assertIs(pipeline.event_reranker, reranker)
+        self.assertIsNone(pipeline.event_reranker)
         dense_getter.assert_called_once_with()
-        reranker_factory.assert_called_once_with()
+        reranker_factory.assert_not_called()
 
     def test_optional_dense_initialization_failure_is_sanitized_and_fails_open(
         self,

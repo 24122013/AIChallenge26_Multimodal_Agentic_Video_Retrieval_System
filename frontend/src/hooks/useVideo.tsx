@@ -22,7 +22,9 @@ function useVideo(displayedResults: VideoScene[]) {
       setNeighborData(null);
       
       try {
-        const res = await fetch(`${API_PROXY}/video/frame_neighbor/${scene.frame_id}`);
+        const res = await fetch(
+          `${API_PROXY}/video/frame_neighbor/${encodeURIComponent(scene.video_id)}/${encodeURIComponent(scene.frame_id)}`,
+        );
         if (res.ok) {
             const data = (await res.json()) as NeighborResponse;
             console.log("Neighbor API Response:", data);

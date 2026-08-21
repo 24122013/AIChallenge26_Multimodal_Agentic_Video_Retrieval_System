@@ -12,7 +12,7 @@ import { RETRIEVAL_METHODS } from './constants/mode-icons';
 
 export default function App() {
   const { sendTelemetry, searchLogs, setSearchLogs, isLogModalOpen, setIsLogModalOpen } = useTelemetry();
-  const { sortedResults, isSearching, latency, sortBy, setSortBy, executeSearch, apiResponseData } = useSearch();
+  const { sortedResults, isSearching, searchError, latency, sortBy, setSortBy, executeSearch, apiResponseData } = useSearch();
   
   const {
     currentQuery, setCurrentQuery, currentSearchId, setCurrentSearchId,
@@ -76,6 +76,7 @@ export default function App() {
     const queryStr = primaryQuery?.query || payload.text_queries[0]?.query || 'multimodal criteria context';
     const taskType = payload.config.model === "QA" ? "qa"
       : payload.config.model === "TRAKE" ? "trake"
+      : payload.config.model === "TEMPORAL" ? "temporal"
       : "kist";
     const searchMode = primaryQuery?.mode || payload.text_queries[0]?.mode || 'visual';
 
@@ -193,6 +194,7 @@ export default function App() {
         sortedResults={sortedResults}
         displayedResults={displayedResults}
         isSearching={isSearching}
+        searchError={searchError}
         latency={latency}
         isFilterDropdownOpen={isFilterDropdownOpen}
         openFilterDropdown={() => setIsFilterDropdownOpen(true)}

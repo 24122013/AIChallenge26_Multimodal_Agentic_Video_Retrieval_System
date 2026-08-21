@@ -32,6 +32,7 @@ class CSESSelection:
     visual_coverage_gain: float
     temporal_coverage_gain: float
     preserved_event_ids: tuple[str, ...]
+    temporal_bin: int = -1
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -42,6 +43,7 @@ class CSESSelection:
             "visual_coverage_gain": self.visual_coverage_gain,
             "temporal_coverage_gain": self.temporal_coverage_gain,
             "preserved_event_ids": list(self.preserved_event_ids),
+            "temporal_bin": self.temporal_bin,
         }
 
 
@@ -144,6 +146,7 @@ def select_cses(
                 visual_coverage_gain=round(facility_gain, 8),
                 temporal_coverage_gain=round(temporal_gain, 8),
                 preserved_event_ids=new_events,
+                temporal_bin=int(bins[local_row]),
             )
         )
 

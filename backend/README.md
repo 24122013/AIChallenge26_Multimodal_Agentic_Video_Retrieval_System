@@ -19,7 +19,8 @@ cache dưới `data/model_cache/` và resume theo model/revision.
 
 - SigLIP2 + FAISS giữ nguyên visual contract.
 - Text index v3 gồm caption, OCR và object labels/counts.
-- API hỗ trợ visual, caption, OCR, object, hybrid, temporal, TRAKE và QA modes.
+- API hỗ trợ visual, caption, OCR, object, hybrid, Temporal KIS, temporal
+  evidence, TRAKE và QA modes.
 - Object evidence là soft signal trong reranking, không phải hard filter.
 - `temporal` là route evidence phục vụ QA hiện hữu. `trake` là pipeline riêng tại
   `app/services/trake/`: parse N event có thứ tự, gọi hybrid retrieval theo từng
@@ -42,6 +43,8 @@ Ba nguồn frame không được đánh đồng:
 | Task canonical | Tên thường gặp | Output public | Giới hạn |
 |---|---|---|---|
 | `kis` | KIS, KIST | Ranked `candidates` theo candidate schema: video/keyframe identity, timestamp, modality/fusion/rerank scores và canonical metadata | 200 |
+| `kis_visual` | KIST Visual | Canonical `task="kis"`, ordinary `candidates`; visual-only coarse scope rồi dense rescue/CSES khi khả dụng | 200 |
+| `kis_temporal` | Temporal KIS | Canonical `task="kis"` và ranked `candidates`; query plan/CSES dùng profile `temporal` | 200 |
 | `avs` | Ad-hoc Video Search | Ranked `candidates` cùng schema KIS, profile AVS | 200 |
 | `temporal` | Temporal evidence | Evidence candidates và `temporal_matches` cho contract QA hiện hữu | 200 |
 | `trake` | Temporal Retrieval and Alignment of Key Events | Ranked `hypotheses`; mỗi item là một same-video sequence có đúng N original `frame_index` | 100 |
@@ -51,6 +54,8 @@ Ba nguồn frame không được đánh đồng:
 KIST là tên bài toán/tài liệu; identifier mà code thực sự nhận là `kis`.
 `SUPPORTED_ONLINE_TASKS` không có alias `kist`. `auto` không tự route sang TRAKE,
 vì TRAKE phải giữ chính xác event count/order do caller cung cấp.
+Riêng lựa chọn Visual trong KIST UI dùng typed route `kis_visual`; `visual` được
+giữ làm direct selected-keyframe diagnostic và không đồng nghĩa CSES đã chạy.
 
 ## Chạy CLI
 
@@ -69,7 +74,7 @@ $env:ONLINE_SEGMENT_CONTEXT_ENABLED = "true"
 
 .\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline `
   --task trake --top-k 100 `
-  --query "Context: a runner. Events: 1. first touches the bar 2. reaches peak height" `
+  --query "a runner. E1: first touches the bar E2: reaches peak height" `
   --output data/reports/trake_query.json
 
 $env:QA_ANSWER_MODE = "off"
@@ -117,8 +122,8 @@ hf download florence-community/Florence-2-base-ft `
 ```
 
 Florence-2 không phải chat model và không được ép sinh JSON. Adapter ghi caption
-text vào contract cũ với `structured_caption: null`. Qwen3.5 của grounded QA và
-query expansion không bị thay đổi.
+text vào contract cũ với `structured_caption: null`. Grounded QA giữ
+Qwen3.5-9B; query expansion dùng Qwen3.5-2B 4-bit theo inventory runtime.
 
 Gọi trực tiếp từ Python:
 
@@ -131,12 +136,12 @@ kis = search_online(
     top_k=20,
 )
 trake = search_online(
-    query="Context: a runner. Events: 1. first touches the bar 2. reaches peak height",
+    query="a runner.\nE1: first touches the bar\nE2: reaches peak height",
     task="trake",
     top_k=100,
 )
 trake_core = search_trake(
-    "Context: a runner. Events: 1. first touches the bar 2. reaches peak height",
+    "a runner.\nE1: first touches the bar\nE2: reaches peak height",
     top_k=100,
 )
 qa = search_online(
@@ -153,6 +158,16 @@ lineage khi metadata có sẵn. Mỗi dense-path candidate giữ `score_breakdow
 các identity/metadata field hiện hữu;
 `routing_trace.latency` tách thời gian planning, expansion, selected visual, text,
 fusion, dense global/rescue, CSES, deterministic rerank và context attachment.
+Temporal KIS đi qua cùng đường KIS coarse-to-dense bằng `task="kis_temporal"`;
+trace giữ `route="kis_temporal"`, `retrieval_profile="temporal"`, CSES weights,
+temporal bins, protected event IDs và số event vectors đến reranker. Nếu dense
+artifact thiếu và policy cho fallback, `coarse_to_dense.executed=false`,
+`cses.executed=false` và candidate không có CSES diagnostics giả.
+Visual KIS đi qua đường này bằng `task="kis_visual"`, nhưng query plan có
+`modality_scope=["visual"]`; coarse stage chỉ gọi selected-keyframe SigLIP2.
+Dense candidate rows sau đó được global rescue, load theo clip và đưa thật vào
+CSES. Final score breakdown gồm `coarse_visual`, `dense_visual`, `cses_gain` và
+`visual_coverage`, cộng neighbor/segment context nếu artifact/config cho phép.
 QA response giữ evidence riêng trong `evidence` và
 luôn có structured `answer` status; ở mode `off`, status cho biết answerer bị tắt,
 không có câu trả lời được bịa từ ngoài evidence.
@@ -168,10 +183,12 @@ Khi router được mount, các request chính xác là:
 | Task | Route/body |
 |---|---|
 | KIS/KIST | `POST /retrieval/online` với `{"query":"...","task":"kis","top_k":20,"expanded_queries":[],"include_context":true,"debug":true}` |
+| Visual KIS | `POST /retrieval/online` với `{"query":"...","task":"kis_visual","top_k":20}` hoặc `POST /retrieval/kis-visual` |
+| Temporal KIS | `POST /retrieval/online` với `{"query":"...","task":"kis_temporal","top_k":100}` hoặc `POST /retrieval/kis-temporal` |
 | TRAKE | `POST /retrieval/online` với `{"query":"...","task":"trake","top_k":100,"expanded_queries":[]}` hoặc `POST /retrieval/trake` với `{"query":"...","top_k":100}` |
 | QA | `POST /retrieval/qa` với `{"query":"...","top_k":5,"task_mode":"qa","expanded_queries":[]}` |
 
-`POST /search` dùng `mode="kis"|"trake"|"qa"` thay cho field `task` và cũng nhận
+`POST /search` dùng `mode="kis"|"kis_visual"|"kis_temporal"|"trake"|"qa"` thay cho field `task` và cũng nhận
 `include_context`/`debug`. Bỏ hai field này hoặc gửi `null` giữ runtime default;
 boolean là explicit per-request override. Router bọc kết quả thành
 `{"success":true,"data":...,"message":null}`. Repository hiện
@@ -186,7 +203,7 @@ python -m backend.app.services.submission.export_query --task kis `
   --output data/submissions/kis_result.csv
 
 python -m backend.app.services.submission.export_query --task trake `
-  --query "Context: a jump. Events: 1. first leaves ground 2. reaches peak" `
+  --query "a jump. E1: first leaves ground E2: reaches peak" `
   --top-k 100 --output data/submissions/trake_result.csv
 ```
 
@@ -215,6 +232,18 @@ search_online
   -> bounded neighbor/segment response attachment
   -> existing Candidate/public response schema
 ```
+
+Với `kis_visual`, bước selected retrieval ở trên chỉ có visual; caption/OCR/object
+được đánh dấu `outside_modality_scope`. CSES dùng weights KIS hiện hữu thay vì một
+profile tự đặt mới. Final visual rerank tái sử dụng typed `rerank_cses_gain_weight`
+cho cả CSES gain và facility-location visual coverage; không thêm hard-coded
+weight profile mới và không thay defaults của Hybrid/Temporal.
+
+Query expansion của KIS dùng lazy `Qwen/Qwen3.5-2B` tại revision
+`15852e8c16360a2fea060d615a32b45270f8a8fc`, `quantization=4bit`. Cache hit được
+kiểm tra trước `_load`; disabled runtime không construct provider. Trace báo model,
+revision, quantization, device, cache hit và provider call count. Grounded QA vẫn
+dùng riêng `Qwen/Qwen3.5-9B`; CSES và final deterministic rerank không phải model.
 
 `configs/retrieval.yaml` sections `hybrid`, `weights`, `text_index`,
 `query_expansion` và `online` điều khiển route này. Defaults quan trọng của
@@ -286,11 +315,11 @@ QA dùng cùng canonical corpus nhưng có feature flags riêng:
 
 | Biến | Mặc định | Hành vi |
 |---|---|---|
-| `QA_BGE_DENSE_ENABLED` | `false` | Bật BGE-M3 dense evidence retrieval |
+| `QA_BGE_DENSE_ENABLED` | `true` | Bật BGE-M3 dense evidence retrieval |
 | `QA_BGE_INDEX_ROOT` | `data/indexes/bge_m3` | Root chứa BGE FAISS/map/manifest |
-| `QA_BGE_RERANKER_ENABLED` | `false` | Bật BGE cross-encoder candidate reranker |
-| `QA_ANSWER_MODE` | `off` | `off`, `optional` hoặc `required` |
-| `QA_MODELS_LOCAL_ONLY` | `false` | Chỉ dùng checkpoint đã có trong cache khi bật |
+| `QA_BGE_RERANKER_ENABLED` | `false` | Model reranker tắt; deterministic/constraint reranking vẫn chạy |
+| `QA_ANSWER_MODE` | `required` | Phải sinh grounded answer hoặc fail rõ |
+| `QA_MODELS_LOCAL_ONLY` | `true` | Chỉ dùng checkpoint đã có trong cache khi bật |
 
 QA BGE flags không bật TRAKE BGE và ngược lại. Retrieval CLI entrypoint tự load
 `.env`; biến trong process manager hoặc shell chạy CLI có độ ưu tiên cao hơn.
@@ -372,14 +401,14 @@ Optional/fail-open trên máy có cache:
 
 ```powershell
 $env:RETRIEVAL_TRAKE_BGE_DENSE_ENABLED = "true"
-$env:RETRIEVAL_TRAKE_BGE_RERANKER_ENABLED = "true"
+$env:RETRIEVAL_TRAKE_BGE_RERANKER_ENABLED = "false"
 $env:RETRIEVAL_TRAKE_BGE_REQUIRED = "false"
 $env:RETRIEVAL_TRAKE_BGE_INDEX_ROOT = "data/indexes/bge_m3"
 $env:RETRIEVAL_TRAKE_BGE_MODEL_CACHE_DIR = "data/model_cache/bge_m3"
 $env:RETRIEVAL_TRAKE_BGE_LOCAL_FILES_ONLY = "true"
 python -m backend.app.pipelines.online_pipeline `
   --task trake --top-k 100 `
-  --query "Context: a jump. Events: 1. first leaves ground 2. reaches peak"
+  --query "a jump. E1: first leaves ground E2: reaches peak"
 ```
 
 Required benchmark dùng cùng artifact/cache nhưng đổi policy; pin revision thay
@@ -387,7 +416,7 @@ cho `main` trước benchmark chính thức:
 
 ```powershell
 $env:RETRIEVAL_TRAKE_BGE_DENSE_ENABLED = "true"
-$env:RETRIEVAL_TRAKE_BGE_RERANKER_ENABLED = "true"
+$env:RETRIEVAL_TRAKE_BGE_RERANKER_ENABLED = "false"
 $env:RETRIEVAL_TRAKE_BGE_REQUIRED = "true"
 $env:RETRIEVAL_TRAKE_BGE_INDEX_ROOT = "data/indexes/bge_m3"
 $env:RETRIEVAL_TRAKE_BGE_RERANKER_REVISION = "<exact-40-hex-commit-from-cache>"
@@ -396,7 +425,7 @@ $env:RETRIEVAL_TRAKE_BGE_MODEL_CACHE_DIR = "data/model_cache/bge_m3"
 $env:RETRIEVAL_TRAKE_BGE_LOCAL_FILES_ONLY = "true"
 python -m backend.app.pipelines.online_pipeline `
   --task trake --top-k 100 `
-  --query "Context: a jump. Events: 1. first leaves ground 2. reaches peak" `
+  --query "a jump. E1: first leaves ground E2: reaches peak" `
   --output data/reports/trake_bge_required.json
 ```
 

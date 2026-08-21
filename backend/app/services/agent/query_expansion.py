@@ -17,8 +17,10 @@ from backend.app.services.agent.prompts import (
 )
 
 
-DEFAULT_QUERY_EXPANSION_MODEL = "Qwen/Qwen3.5-9B"
-DEFAULT_QUERY_EXPANSION_MODEL_REVISION = "c202236"
+DEFAULT_QUERY_EXPANSION_MODEL = "Qwen/Qwen3.5-2B"
+DEFAULT_QUERY_EXPANSION_MODEL_REVISION = (
+    "15852e8c16360a2fea060d615a32b45270f8a8fc"
+)
 _PROVIDER_FIELDS = (
     "paraphrases",
     "objects",
@@ -237,7 +239,7 @@ class QueryExpansionProvider(Protocol):
 
 
 class QwenQueryExpansionProvider:
-    """Production local generative provider backed by the cached caption Qwen."""
+    """Lazy local Qwen3.5-2B provider with response and runtime diagnostics."""
 
     provider_name = "qwen_local_transformers"
 
@@ -262,13 +264,18 @@ class QwenQueryExpansionProvider:
         self._model: Any | None = None
         self._processor: Any | None = None
         self._load_error: Exception | None = None
+        self._provider_call_count = 0
+        self._cache_hit_count = 0
+        self._model_load_count = 0
 
     def expand(self, query: str, protected: ProtectedLiterals) -> ProviderResponse:
+        self._provider_call_count += 1
         prompt = build_query_expansion_prompt(query, protected.to_dict())
         cache_path = self.cache_dir / "responses" / f"{self._cache_key(query)}.json"
         if cache_path.is_file():
             try:
                 payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                self._cache_hit_count += 1
                 return ProviderResponse(_strict_payload(payload), cache_hit=True)
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
                 # A partial/stale cache entry must not permanently force the
@@ -340,7 +347,7 @@ class QwenQueryExpansionProvider:
                     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             model_kwargs = dict(kwargs)
             model_kwargs["torch_dtype"] = dtype
-            quantization = self.config.quantization if self.device.startswith("cuda") else "none"
+            quantization = self.config.quantization
             if quantization != "none":
                 from transformers import BitsAndBytesConfig
 
@@ -349,7 +356,9 @@ class QwenQueryExpansionProvider:
                     load_in_8bit=quantization == "8bit",
                     bnb_4bit_compute_dtype=dtype,
                 )
-                model_kwargs["device_map"] = "auto"
+                model_kwargs["device_map"] = (
+                    "auto" if self.device.startswith("cuda") else {"": self.device}
+                )
             self._model = AutoModelForMultimodalLM.from_pretrained(
                 self.model_name,
                 **model_kwargs,
@@ -357,6 +366,7 @@ class QwenQueryExpansionProvider:
             if quantization == "none":
                 self._model = self._model.to(self.device)
             self._model.eval()
+            self._model_load_count += 1
         except Exception as exc:
             self._load_error = exc
             raise
@@ -402,6 +412,20 @@ class QwenQueryExpansionProvider:
                 torch.cuda.empty_cache()
         except Exception:
             pass
+
+    def runtime_summary(self) -> dict[str, object]:
+        return {
+            "enabled": bool(self.config.enabled),
+            "provider": self.provider_name,
+            "model_name": self.model_name,
+            "model_revision": self.model_revision,
+            "quantization": self.config.quantization,
+            "device": self.device,
+            "provider_call_count": self._provider_call_count,
+            "cache_hit_count": self._cache_hit_count,
+            "model_load_count": self._model_load_count,
+            "model_loaded": self._model is not None,
+        }
 
 
 def build_production_query_expansion_provider(

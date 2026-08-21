@@ -35,6 +35,7 @@ from typing import Any
 
 import numpy as np
 
+from backend.app.core.environment import load_project_env
 from backend.app.services.indexing.build_bge_m3_index import (
     load_canonical_keyframe_records,
 )
@@ -668,12 +669,32 @@ def _file_signature(path: Path) -> dict[str, object]:
     }
 
 
+def _source_content_identity(signature: Mapping[str, Any]) -> dict[str, object]:
+    """Return the location-independent identity used by portable checkpoints."""
+
+    size_bytes = int(signature["size_bytes"])
+    sha256 = str(signature["sha256"])
+    if size_bytes < 0 or not sha256:
+        raise ValueError("source signature has an invalid size or SHA-256")
+    return {"size_bytes": size_bytes, "sha256": sha256}
+
+
+def _source_signatures_match(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    try:
+        return _source_content_identity(left) == _source_content_identity(right)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _assert_source_unchanged(
     path: Path,
     expected: Mapping[str, Any],
 ) -> None:
     current = _file_signature(path)
-    if current != dict(expected):
+    if not _source_signatures_match(current, expected):
         raise ValueError(
             "Source video changed during offline preprocessing: "
             f"expected_sha256={expected.get('sha256')} "
@@ -692,11 +713,35 @@ def _stage_contract(stage: str, **payload: object) -> dict[str, object]:
 
 
 def _contract_matches(report: Mapping[str, Any], contract: Mapping[str, Any]) -> bool:
-    return (
-        report.get("offline_contract_sha256") == contract.get("contract_sha256")
-        and report.get("offline_contract")
-        == {key: value for key, value in contract.items() if key != "contract_sha256"}
-    )
+    stored = report.get("offline_contract")
+    if not isinstance(stored, dict):
+        return False
+    expected = {
+        key: value for key, value in contract.items() if key != "contract_sha256"
+    }
+    if report.get("offline_contract_sha256") != _sha256_value(stored):
+        return False
+    if contract.get("contract_sha256") != _sha256_value(expected):
+        return False
+
+    # Schema 1.0 shot reports included an absolute path and mtime.  Normalize
+    # both sides so those reports remain resumable after moving the same bytes
+    # between Linux and Windows.  Returning the stored legacy hash from the
+    # loader preserves all downstream contract-hash lineage.
+    if stored.get("stage") == expected.get("stage") == STAGE_SHOTS:
+        stored_source = stored.get("source_video")
+        expected_source = expected.get("source_video")
+        if not isinstance(stored_source, dict) or not isinstance(
+            expected_source,
+            dict,
+        ):
+            return False
+        stored = {**stored, "source_video": _source_content_identity(stored_source)}
+        expected = {
+            **expected,
+            "source_video": _source_content_identity(expected_source),
+        }
+    return stored == expected
 
 
 def _atomic_write_json(path: Path, value: object) -> None:
@@ -1007,9 +1052,10 @@ def _shot_contract(
     *,
     source_signature: Mapping[str, Any] | None = None,
 ) -> dict[str, object]:
+    source = dict(source_signature or _file_signature(video_path))
     return _stage_contract(
         STAGE_SHOTS,
-        source_video=dict(source_signature or _file_signature(video_path)),
+        source_video=_source_content_identity(source),
         shot_threshold=config.shot_threshold,
         shot_device=config.shot_device,
     )
@@ -1062,7 +1108,9 @@ def _load_shot_stage(
         info=info,
         shots=shots,
         detector_name=detector_name,
-        contract_sha256=str(contract["contract_sha256"]),
+        # Preserve a valid legacy hash so candidate/materialization contracts
+        # created from it keep matching after a cross-platform move.
+        contract_sha256=str(report["offline_contract_sha256"]),
     )
 
 
@@ -2309,7 +2357,9 @@ def _persist_selected_artifacts(
         {
             **result.to_report(),
             "status": "passed",
-            "source_video": dict(source_signature or _file_signature(video_path)),
+            "source_video": _source_content_identity(
+                dict(source_signature or _file_signature(video_path))
+            ),
             "selected_metadata_sha256": _sha256_file(paths.selected_metadata),
             "selected_images_sha256": _images_sha256(canonical_records),
             "selected_embeddings_sha256": _sha256_file(paths.selected_embeddings),
@@ -2379,11 +2429,19 @@ def _validate_selected_bundle(
     )
     if not isinstance(shot_source, dict):
         raise ValueError("shot report has no immutable source-video lineage")
-    expected_source = dict(source_signature or shot_source)
-    if shot_source != expected_source:
-        raise ValueError("shot report source lineage does not match this run")
-    if selection_report.get("source_video") != expected_source:
+    current_source = dict(source_signature or _file_signature(video_path))
+    if not _source_signatures_match(shot_source, current_source):
+        raise ValueError("Source video changed since shot detection")
+    selected_source = selection_report.get("source_video")
+    if not isinstance(selected_source, dict) or not _source_signatures_match(
+        selected_source,
+        shot_source,
+    ):
         raise ValueError("selection artifacts came from a different source video")
+    # Retain the checkpoint's representation in validation output. Legacy
+    # reports therefore continue to match byte-for-byte, while new reports use
+    # the portable size+SHA-256 representation emitted by _shot_contract.
+    expected_source = dict(shot_source)
     _assert_source_unchanged(video_path, expected_source)
 
     records = _read_jsonl(paths.selected_metadata)
@@ -2470,7 +2528,11 @@ def _validate_selected_bundle(
         completion = _read_json(paths.completion_report)
         if completion.get("status") != "passed":
             raise ValueError("completion report is not passed")
-        if completion.get("source_video") != _file_signature(video_path):
+        completion_source = completion.get("source_video")
+        if not isinstance(completion_source, dict) or not _source_signatures_match(
+            completion_source,
+            _file_signature(video_path),
+        ):
             raise ValueError("source video changed since completion")
         if completion.get("per_video_config_sha256") != validation["per_video_config_sha256"]:
             raise ValueError("per-video configuration changed since completion")
@@ -4895,6 +4957,7 @@ def _config_from_args(args: argparse.Namespace) -> OfflinePipelineConfig:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    load_project_env()
     parser = build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(

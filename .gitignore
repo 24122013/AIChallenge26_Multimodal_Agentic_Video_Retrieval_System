@@ -3,7 +3,6 @@
 .venv/
 __pycache__/
 *.py[cod]
-.env
 
 # Ultralytics may materialize these official YOLOE assets in the process cwd.
 # The ingestion backend uses data/model_cache, but keep old/new library

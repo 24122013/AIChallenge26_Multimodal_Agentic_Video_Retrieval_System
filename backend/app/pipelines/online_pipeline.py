@@ -9,7 +9,10 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from backend.app.services.agent.query_expansion import QueryExpansionProvider
+from backend.app.services.agent.query_expansion import (
+    QueryExpansionConfig,
+    QueryExpansionProvider,
+)
 from backend.app.services.retrieval.hybrid_search import HybridSearchEngine
 from backend.app.services.retrieval.advanced_search import (
     AdvancedSearchConfig,
@@ -28,7 +31,16 @@ from backend.app.services.retrieval.retrieval_config import (
 
 
 ONLINE_SCHEMA_VERSION = "1.0"
-SUPPORTED_ONLINE_TASKS = ("auto", "kis", "avs", "temporal", "trake", "qa")
+SUPPORTED_ONLINE_TASKS = (
+    "auto",
+    "kis",
+    "kis_visual",
+    "kis_temporal",
+    "avs",
+    "temporal",
+    "trake",
+    "qa",
+)
 
 
 class TrakeSearchPipeline(Protocol):
@@ -358,14 +370,30 @@ class OnlinePipeline:
         )
         include_neighbors, include_segments = self._context_flags(include_context)
         resolved_task = requested_task
-        if requested_task in {"auto", "kis", "avs"}:
+        if requested_task in {"auto", "kis", "kis_visual", "kis_temporal", "avs"}:
+            planning_profile = {
+                "kis_visual": "kis",
+                "kis_temporal": "temporal",
+            }.get(requested_task, requested_task)
+            modality_scope = (
+                ("visual",) if requested_task == "kis_visual" else None
+            )
             plan, planning_ms, expansion_ms, expansion_provider_calls = self._plan(
                 original_query,
-                requested_task,
+                planning_profile,
+                modality_scope=modality_scope,
             )
             stage_latency["query_planning_ms"] = planning_ms
             stage_latency["query_expansion_ms"] = expansion_ms
-            resolved_task = plan.profile if requested_task == "auto" else requested_task
+            resolved_task = (
+                plan.profile
+                if requested_task == "auto"
+                else (
+                    "kis"
+                    if requested_task in {"kis_visual", "kis_temporal"}
+                    else requested_task
+                )
+            )
             if requested_task == "auto" and top_k is None and resolved_task == "qa":
                 requested_top_k = 5
 
@@ -469,11 +497,30 @@ class OnlinePipeline:
         stage_latency["total_ms"] = response["latency_ms"]
         routing_trace["latency"] = stage_latency
         routing_trace["debug_enabled"] = debug_enabled
-        routing_trace["query_expansion"] = _query_expansion_trace(
+        expansion_trace = _query_expansion_trace(
             requested=self.runtime_config.query_expansion.enabled,
             executed_calls=expansion_provider_calls,
             resolved_task=resolved_task,
             query_plan=query_plan,
+            config=self.runtime_config.query_expansion,
+            provider=self.query_expansion_provider,
+        )
+        if (
+            requested_task == "kis_temporal"
+            and expansion_trace["requested"]
+            and not expansion_trace["executed"]
+        ):
+            expansion_trace["skip_reason"] = "temporal_profile"
+        routing_trace["query_expansion"] = expansion_trace
+        routing_trace["route"] = (
+            requested_task
+            if requested_task in {"kis_visual", "kis_temporal"}
+            else resolved_task
+        )
+        routing_trace["retrieval_profile"] = (
+            "visual"
+            if requested_task == "kis_visual"
+            else str(query_plan.get("profile") or resolved_task)
         )
         response["routing_trace"] = routing_trace
         for field_name in (
@@ -489,7 +536,13 @@ class OnlinePipeline:
                 response[field_name] = raw[field_name]
         return response
 
-    def _plan(self, query: str, task: str) -> tuple[QueryPlan, float, float, int]:
+    def _plan(
+        self,
+        query: str,
+        task: str,
+        *,
+        modality_scope: Sequence[str] | None = None,
+    ) -> tuple[QueryPlan, float, float, int]:
         started = time.perf_counter()
         provider = (
             self.query_expansion_provider
@@ -502,6 +555,7 @@ class OnlinePipeline:
             profile=task,
             expansion_provider=timed_provider,
             expansion_config=self.runtime_config.query_expansion,
+            modality_scope=modality_scope,
         )
         total_ms = _elapsed_ms(started)
         expansion_ms = timed_provider.elapsed_ms if timed_provider is not None else 0.0
@@ -562,6 +616,12 @@ class OnlinePipeline:
                 "executed": False,
                 "mode": "selected_only_fallback",
                 "missing_behavior": online.dense_missing_behavior,
+                "fallback_reason": fallback_reason,
+            }
+            trace["cses"] = {
+                "requested": bool(online.cses_enabled),
+                "executed": False,
+                "profile": plan.profile,
                 "fallback_reason": fallback_reason,
             }
             neighbor_scoring_requested = bool(
@@ -798,6 +858,8 @@ def _query_expansion_trace(
     executed_calls: int,
     resolved_task: str,
     query_plan: Mapping[str, Any],
+    config: QueryExpansionConfig,
+    provider: QueryExpansionProvider | None,
 ) -> dict[str, Any]:
     expansion_plan = query_plan.get("expansion_plan")
     expansion_payload = (
@@ -817,9 +879,16 @@ def _query_expansion_trace(
     else:
         skip_reason = ""
     return {
+        "enabled": bool(config.enabled),
         "requested": bool(requested),
         "executed": executed,
         "provider_call_count": int(executed_calls),
+        "cache_hit": bool(expansion_payload.get("cache_hit", False)),
+        "provider": str(expansion_payload.get("provider_name") or ""),
+        "model_name": config.model_name,
+        "model_revision": config.model_revision,
+        "quantization": config.quantization,
+        "device": str(getattr(provider, "device", "not_constructed")),
         "skip_reason": skip_reason,
         "status": str(expansion_payload.get("status") or ""),
     }

@@ -304,7 +304,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                                 <div>
                                     <h3 className="text-xs font-bold uppercase tracking-wider text-purple-500 dark:text-purple-400 mb-2">QA Answer Extract</h3>
                                     <div className="text-sm text-purple-900 dark:text-purple-100 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800/50 p-3 rounded-lg">
-                                        {(activeVideo as any).answer}
+                                        {activeVideo.answer}
                                     </div>
                                 </div>
                             )}

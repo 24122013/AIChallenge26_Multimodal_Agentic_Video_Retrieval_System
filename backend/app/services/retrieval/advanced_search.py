@@ -21,7 +21,12 @@ from backend.app.services.retrieval.advanced_rerank import (
     ContextRerankConfig,
     rerank_dense_candidates,
 )
-from backend.app.services.retrieval.cses import CSESConfig, CSESSelection, select_cses
+from backend.app.services.retrieval.cses import (
+    PROFILE_WEIGHTS,
+    CSESConfig,
+    CSESSelection,
+    select_cses,
+)
 from backend.app.services.retrieval.online_context import OnlineContextIndex
 from backend.app.services.retrieval.query_plan import QueryPlan, build_query_plan
 from backend.app.services.retrieval.rank_fusion import (
@@ -133,6 +138,8 @@ class AdvancedSearchResponse:
     inter_modality_trace: Sequence[Mapping[str, object]]
     stage_latency_ms: Mapping[str, float] = field(default_factory=dict)
     context_trace: Mapping[str, object] = field(default_factory=dict)
+    cses_trace: Mapping[str, object] = field(default_factory=dict)
+    rerank_trace: Mapping[str, object] = field(default_factory=dict)
     exact_duplicate_count: int = 0
 
     def trace(self) -> dict[str, object]:
@@ -153,6 +160,8 @@ class AdvancedSearchResponse:
             "inter_modality_fusion": [dict(value) for value in self.inter_modality_trace],
             "rerank_canonical_query": self.plan.original_query,
             "context_scoring": dict(self.context_trace),
+            "cses": dict(self.cses_trace),
+            "deterministic_rerank": dict(self.rerank_trace),
         }
 
     def to_dict(self, top_k: int | None = None) -> dict[str, object]:
@@ -266,7 +275,11 @@ def advanced_text_search(
         "visual": [value.to_dict() for value in visual_intra]
     }
     skipped_modalities: dict[str, str] = {}
+    modality_scope = set(plan.modality_scope)
     for modality, engine in sorted(text_engines.items()):
+        if modality not in modality_scope:
+            skipped_modalities[modality] = "outside_modality_scope"
+            continue
         if modality == "caption":
             caption_groups: dict[str, Sequence[RetrievalResult]] = {}
             for index, key in enumerate(variant_groups):
@@ -297,7 +310,7 @@ def advanced_text_search(
             top_k=max(config.coarse_top_n * 2, 100),
         )
         stage_latency_ms["text_retrieval_ms"] += _elapsed_ms(stage_started)
-    if dense_text_engine is not None:
+    if dense_text_engine is not None and tuple(plan.modality_scope) != ("visual",):
         search = getattr(dense_text_engine, "search")
         stage_started = time.perf_counter()
         groups["dense_text"] = search(
@@ -462,6 +475,7 @@ def _select_and_rerank(
     stage_started = time.perf_counter()
     selections: list[CSESSelection] = []
     candidate_row_count = 0
+    cses_call_count = 0
     cses_config = CSESConfig(
         max_frames=config.dense_frames_per_clip,
         similarity_threshold=config.similarity_threshold,
@@ -471,6 +485,7 @@ def _select_and_rerank(
         rows = _validated_clip_rows(dense_index, clip)
         candidate_row_count += len(rows)
         if config.cses_enabled:
+            cses_call_count += 1
             selections.extend(
                 select_cses(
                     rows=rows,
@@ -562,6 +577,17 @@ def _select_and_rerank(
         context_index=context_index,
         rerank_enabled=config.deterministic_rerank_enabled,
     )
+    protected_event_ids = sorted(
+        {
+            str(event_id)
+            for clip in chosen_clips
+            for row in _validated_clip_rows(dense_index, clip)
+            for event_id in (
+                dense_index.records[row].get("protected_event_ids", []) or []
+            )
+        }
+    )
+    cses_weights = PROFILE_WEIGHTS[plan.profile]
     return AdvancedSearchResponse(
         plan=plan,
         results=tuple(ranked),
@@ -575,6 +601,32 @@ def _select_and_rerank(
         inter_modality_trace=inter_modality_trace,
         stage_latency_ms=stage_latency_ms,
         context_trace=context_trace,
+        cses_trace={
+            "requested": bool(config.cses_enabled),
+            "executed": bool(config.cses_enabled and cses_call_count > 0),
+            "call_count": cses_call_count,
+            "profile": plan.profile,
+            "weights": {
+                "query_relevance": cses_weights[0],
+                "visual_coverage": cses_weights[1],
+                "temporal_coverage": cses_weights[2],
+            },
+            "temporal_bins": cses_config.temporal_bins,
+            "protected_event_ids": protected_event_ids,
+            "candidate_row_count": candidate_row_count,
+            "selected_row_count": len(selections),
+            "fallback_reason": "" if config.cses_enabled else "disabled_by_config",
+        },
+        rerank_trace={
+            "requested": bool(config.deterministic_rerank_enabled),
+            "executed": bool(config.deterministic_rerank_enabled and selections),
+            "profile": plan.profile,
+            "event_vector_count": len(event_vectors),
+            "ordered_event_ids": list(plan.temporal_event_ids),
+            "ordered_events": list(plan.temporal_events),
+            "temporal_cues": list(plan.temporal_cues),
+            "max_event_gap_seconds": config.max_event_gap_seconds,
+        },
         exact_duplicate_count=exact_duplicate_count,
     )
 

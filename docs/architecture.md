@@ -117,7 +117,7 @@ User Query + explicit task
     │
     ▼
 search_online -> get_online_pipeline -> OnlinePipeline.run
-    ├── KIS / AVS
+    ├── KIS / Visual KIS / Temporal KIS / AVS
     │     └── query plan + optional expansion
     │         -> selected visual/caption/OCR/object retrieval
     │         -> weighted RRF -> coarse clips
@@ -125,7 +125,7 @@ search_online -> get_online_pipeline -> OnlinePipeline.run
     │         -> bounded neighbor/segment context scoring
     │         -> deterministic evidence rerank -> exact dedup -> Top-K
     │         -> response context attachment
-    ├── temporal / QA
+    ├── temporal evidence / QA
     │     └── existing evidence-oriented routes
     └── TRAKE
           └── event parser -> per-event retrieval -> video gating
@@ -135,6 +135,22 @@ search_online -> get_online_pipeline -> OnlinePipeline.run
     ▼
 Task-specific response
 ```
+
+`kis_temporal` enters the KIS branch above and resolves to public `task="kis"`.
+Its query plan preserves the original query, first/last/before/after cues, stable
+ordered event IDs and clauses. Dense execution uses the CSES `temporal` profile
+(`0.55` query relevance, `0.15` visual coverage, `0.30` temporal/event coverage),
+then passes ordered event vectors to the deterministic reranker for temporal
+chain/gap consistency. No learned cross-encoder or VLM reranker is added.
+
+`kis_visual` also resolves to public `task="kis"`, but its typed plan carries
+`modality_scope=("visual",)`. Both sparse fallback and dense coarse collection
+therefore call only the selected-keyframe SigLIP2 engine; caption/OCR/object and
+dense-text coarse engines are not invoked. Candidate clips continue into global
+dense SigLIP2 rescue, per-clip dense-row loading, KIS-profile CSES and a
+deterministic visual rerank using coarse visual, dense visual, CSES gain and
+visual coverage. Optional neighbor/segment scoring remains bounded and
+artifact-gated. The old `visual` route bypasses this branch as a diagnostic.
 
 `temporal` is the existing QA/evidence-oriented task. `trake` is a separate
 sequence-first task; it is selected explicitly and is not inferred by `auto`.
@@ -149,6 +165,9 @@ contract failures always fail closed. Canonical KIS/AVS has no heavy learned/VLM
 retrieval reranker; legacy settings for those branches are ignored with a warning.
 The final rerank is deterministic and exposes score breakdown, weighted
 contributions, context evidence/cap diagnostics and per-stage latency.
+For optional dense-artifact fallback, trace reports
+`coarse_to_dense.executed=false` and `cses.executed=false`; selected-only sparse
+retrieval must never be interpreted as a CSES execution.
 
 Neighbor/segment scoring is an opt-in advanced path because loading the artifacts
 is disabled by default. When requested and available, it runs after CSES and
@@ -291,6 +310,10 @@ Query
  │     ├── Bounded canonical neighbor/segment scoring
  │     ├── Deterministic evidence rerank + exact dedup + Top-K
  │     └── Bounded context payload attachment
+ │
+ ├── Visual KIS (`kis_visual`)
+ │     └── Visual selected coarse -> dense rescue -> per-clip CSES
+ │         -> deterministic visual score -> ordinary KIS Top-K
  │
  ├── Temporal Evidence / QA
  │

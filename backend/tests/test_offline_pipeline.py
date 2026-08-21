@@ -709,6 +709,74 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         self.assertEqual(first["mtime_ns"], second["mtime_ns"])
         self.assertNotEqual(first["sha256"], second["sha256"])
 
+    def test_shot_checkpoint_identity_is_portable_across_locations(self) -> None:
+        video = self._video("portable")
+        current_signature = pipeline._file_signature(video)
+        current_contract = pipeline._shot_contract(
+            video,
+            self.config,
+            source_signature=current_signature,
+        )
+        self.assertEqual(
+            current_contract["source_video"],
+            {
+                "size_bytes": current_signature["size_bytes"],
+                "sha256": current_signature["sha256"],
+            },
+        )
+
+        legacy_contract = pipeline._stage_contract(
+            pipeline.STAGE_SHOTS,
+            source_video={
+                **current_signature,
+                "path": "/root/repo/data/raw/video/portable.mp4",
+                "mtime_ns": 123456789,
+            },
+            shot_threshold=self.config.shot_threshold,
+            shot_device=self.config.shot_device,
+        )
+        report = pipeline._with_contract(
+            {
+                "status": "passed",
+                "video_info": {
+                    "video_id": video.stem,
+                    "fps": 25.0,
+                    "frame_count": 25,
+                },
+                "detector_name": "legacy-detector",
+                "shots": [
+                    {
+                        "shot_index": 0,
+                        "start_frame": 0,
+                        "end_frame": 24,
+                        "fps": 25.0,
+                    }
+                ],
+            },
+            legacy_contract,
+        )
+        report_path = self.root / "legacy-shots.json"
+        pipeline._atomic_write_json(report_path, report)
+
+        loaded = pipeline._load_shot_stage(
+            report_path,
+            contract=current_contract,
+            expected_video_id=video.stem,
+        )
+
+        self.assertEqual(loaded.contract_sha256, legacy_contract["contract_sha256"])
+        pipeline._assert_source_unchanged(video, legacy_contract["source_video"])
+
+        changed_contract = pipeline._shot_contract(
+            video,
+            self.config,
+            source_signature={
+                **current_signature,
+                "sha256": "0" * 64,
+            },
+        )
+        self.assertFalse(pipeline._contract_matches(report, changed_contract))
+
     def test_resume_skips_valid_video_and_reruns_invalid_video(self) -> None:
         video_a = self._video("video_A")
         video_b = self._video("video_B")
@@ -1022,6 +1090,18 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
             pipeline._validate_and_commit_video(video, self.config, paths)
             self.assertIsNotNone(
                 pipeline._try_load_complete_video(video, self.config, paths)
+            )
+
+            moved_video = self.root / "moved" / video.name
+            moved_video.parent.mkdir(parents=True)
+            moved_video.write_bytes(video.read_bytes())
+            self.assertNotEqual(video.resolve(), moved_video.resolve())
+            self.assertIsNotNone(
+                pipeline._try_load_complete_video(
+                    moved_video,
+                    self.config,
+                    paths,
+                )
             )
 
             paths.validation_report.write_text("{corrupt", encoding="utf-8")

@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import type { VideoScene, SortKey, SearchPayload, ActiveTask, ApiResponse, VisualSearchData, QAData, TrakeData, TemporalData } from '../types';
+import type { VideoScene, SortKey, SearchPayload, ActiveTask, ApiResponse, SearchData, QAData, TrakeData, TemporalData } from '../types';
 import { SORT_OPTIONS } from '../constants/video-scene-sort-option';
 import SearchSidebar from './searchbar/SearchSideBar';
 import { Grid, Rows, LayoutGrid } from 'lucide-react';
@@ -14,10 +14,11 @@ type GroupingMode = 'none' | 'video' | 'modality' | 'tens';
 
 interface SearchBoardProps {
   activeTask: ActiveTask;
-  apiResponseData?: ApiResponse<unknown> | null;
+  apiResponseData?: ApiResponse<SearchData> | null;
   sortedResults: VideoScene[]; 
   displayedResults: VideoScene[];
   isSearching: boolean;
+  searchError: string | null;
   latency: number;
   isFilterDropdownOpen: boolean;
   openFilterDropdown: () => void;
@@ -45,6 +46,7 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
   sortedResults, 
   displayedResults,
   isSearching,
+  searchError,
   latency,
   isFilterDropdownOpen,
   openFilterDropdown,
@@ -65,7 +67,7 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
   clickedTrakeIds = new Set(),
   submittedTrakeIds = new Set()
 }) => {
-  const isAnyLoading = Object.values(isSearching).some(Boolean);
+  const isAnyLoading = isSearching;
   const [isSidebarExpanded, setIsSidebarExpanded] = useState(true);
   
   const [interactionFilter, setInteractionFilter] = useState<'all' | 'clicked' | 'unclicked'>('all');
@@ -84,7 +86,7 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
   const renderDisplay = () => {
     if (isAnyLoading) return null;
 
-    const dataPayload = apiResponseData?.data as VisualSearchData | QAData | TrakeData | TemporalData;
+    const dataPayload = apiResponseData?.data;
     const resolvedTask = (dataPayload?.task || activeTask)?.toLowerCase();
 
     if (resolvedTask === 'qa' && dataPayload) {
@@ -93,6 +95,7 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
                 qaData={dataPayload as QAData}
                 cardSize={cardSize}
                 onSelectResult={onSelectResult}
+                clickedSceneIds={clickedSceneIds}
             />
         );
     }
@@ -280,6 +283,11 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
               </div>
             </div>
 
+            {searchError && (
+              <div role="alert" className="mb-5 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300">
+                {searchError}
+              </div>
+            )}
             {renderDisplay()}
           </div>
         </main>

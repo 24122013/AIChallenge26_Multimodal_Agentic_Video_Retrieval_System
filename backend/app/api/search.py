@@ -186,6 +186,20 @@ def _dispatch_search(
             top_k=top_k,
             **online_options,
         )
+    if normalized == "kis_visual":
+        return search_online(
+            query=query,
+            task="kis_visual",
+            top_k=top_k,
+            **online_options,
+        )
+    if normalized == "kis_temporal":
+        return search_online(
+            query=query,
+            task="kis_temporal",
+            top_k=top_k,
+            **online_options,
+        )
     if normalized == "avs":
         return search_online(
             query=query,
@@ -234,6 +248,7 @@ def _dispatch_search(
     if normalized in {"object", "objects"}:
         return search_object(query=query, top_k=top_k).to_dict()
     raise ValueError(
-        "Unsupported search mode. Expected online, KIS, AVS, temporal, TRAKE, QA, "
+        "Unsupported search mode. Expected online, KIS, kis_visual, kis_temporal, AVS, "
+        "temporal, TRAKE, QA, "
         "or a modality diagnostic (visual, caption, OCR, object)."
     )

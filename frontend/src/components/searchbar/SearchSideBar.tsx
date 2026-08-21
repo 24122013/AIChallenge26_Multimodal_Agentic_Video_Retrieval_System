@@ -8,7 +8,6 @@ import ModelDropdownMenu from "./ModelsDropdownMenu";
 import { type KistMode, KIST_MODES } from '../../constants/mode-icons';
 
 import ConfigPanel from './ConfigPanel';
-import ImageAddon from './ImageAddon';
 import QueryInputExpand from "./QueryInputExpand";
 import QueryInputPrimary from "./QueryInputPrimary";
 import type { NavBoxType } from './types';
@@ -23,7 +22,7 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
     const [selectedModel, setSelectedModel] = useState<string>("KIST");
 
     const [kistQueries, setKistQueries] = useState<Record<KistMode, string>>({
-        visual: "", hybrid: "", caption: "", ocr: "", asr: "", object: ""
+        visual: "", hybrid: "", caption: "", ocr: "", object: "", temporal: ""
     });
     const [kistMode, setKistMode] = useState<KistMode>("visual");
     const [qaQuery, setQaQuery] = useState("");
@@ -37,7 +36,7 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
     const [imageMode, setImageMode] = useState<ImageInputMode>('upload');
     const [imageLink, setImageLink] = useState("");
     const [imagePrompt, setImagePrompt] = useState("");
-    const [selectedColor, setSelectedColor] = useState<ColorScheme>('none');
+    const [selectedColor] = useState<ColorScheme>('none');
     const [topK, setTopK] = useState<number>(100);
 
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -83,7 +82,11 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
                 if (kistQueries[mode].trim()) {
                     text_queries.push({
                         query: kistQueries[mode].trim(),
-                        mode: mode,
+                        mode: mode === 'visual'
+                            ? 'kis_visual'
+                            : mode === 'temporal'
+                                ? 'kis_temporal'
+                                : mode,
                         top_k: topK,
                         expanded_queries: validExpanded.length > 0 ? validExpanded : undefined
                     });
@@ -100,8 +103,7 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
             text_queries.push({
                 query: trakeQuery.trim(),
                 mode: 'trake',
-                top_k: topK,
-                expanded_queries: validExpanded.length > 0 ? validExpanded : undefined
+                top_k: topK
             });
         } else if (selectedModel === "TEMPORAL" && temporalQuery.trim()) {
             text_queries.push({
@@ -114,7 +116,7 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
         const selectedColorObj = COLOR_OPTIONS.find(c => c.id === selectedColor);
         const colorHex = selectedColorObj && selectedColorObj.colorHex !== 'transparent' ? selectedColorObj.colorHex : undefined;
 
-        const payload = {
+        const payload: SearchPayload = {
             text_queries,
             image: selectedModel === "KIST" ? imagePayload : undefined,
             colorHex: selectedModel === "KIST" ? colorHex : undefined,
@@ -124,9 +126,9 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
             },
         };
 
-        onSearch(payload as unknown as SearchPayload);
+        onSearch(payload);
 
-        setKistQueries({ visual: "", hybrid: "", caption: "", ocr: "", asr: "", object: "" });
+        setKistQueries({ visual: "", hybrid: "", caption: "", ocr: "", object: "", temporal: "" });
         setQaQuery("");
         setTrakeQuery("");
         setTemporalQuery("");
@@ -237,6 +239,15 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
         currentBox: NavBoxType,
         extendedIndex?: number
     ) => {
+        if (selectedModel === "TRAKE" && currentBox === 'main_query' && e.key === 'Enter') {
+            if (e.ctrlKey || e.metaKey) {
+                e.preventDefault();
+                goToNextSection();
+            }
+            // A TRAKE statement is inherently multiline. Plain Enter and
+            // Shift+Enter must retain the textarea's native newline behavior.
+            return;
+        }
         if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
             e.preventDefault();
 
@@ -288,24 +299,6 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
         }
     };
 
-    const handleColorKeyDown = (e: React.KeyboardEvent, index: number) => {
-        if (e.key === 'Enter' && e.shiftKey) {
-            e.preventDefault();
-            setImageMode('generate');
-            setTimeout(() => imageGenRef.current?.focus(), 0);
-        } else if (e.key === 'ArrowRight') {
-            e.preventDefault();
-            const next = (index + 1) % COLOR_OPTIONS.length;
-            setSelectedColor(COLOR_OPTIONS[next].id);
-            colorRefs.current[next]?.focus();
-        } else if (e.key === 'ArrowLeft') {
-            e.preventDefault();
-            const prev = (index - 1 + COLOR_OPTIONS.length) % COLOR_OPTIONS.length;
-            setSelectedColor(COLOR_OPTIONS[prev].id);
-            colorRefs.current[prev]?.focus();
-        }
-    };
-
     if (!isExpanded) {
         return (
             <div className="fixed z-[60] left-4 top-1/2 -translate-y-1/2">
@@ -348,7 +341,7 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
                             kistRef={kistRef} qaRef={qaRef} trakeRef={trakeRef} temporalRef={temporalRef}
                             handleEnterNavigation={handleEnterNavigation}
                         >
-                            {selectedModel !== "TEMPORAL" && (
+                            {selectedModel !== "TEMPORAL" && selectedModel !== "TRAKE" && (
                                 <QueryInputExpand 
                                     expandedQueries={expandedQueries}
                                     setExpandedQueries={setExpandedQueries}
@@ -359,17 +352,9 @@ export default function SearchSideBar({ onSearch, isExpanded, setIsExpanded }: S
                         </QueryInputPrimary>
 
                         {selectedModel === "KIST" && (
-                            <ImageAddon 
-                                imageMode={imageMode} setImageMode={setImageMode}
-                                imageLink={imageLink} setImageLink={setImageLink}
-                                imagePrompt={imagePrompt} setImagePrompt={setImagePrompt}
-                                selectedColor={selectedColor} setSelectedColor={setSelectedColor}
-                                uploadZoneRef={uploadZoneRef} fileInputRef={fileInputRef}
-                                imageLinkRef={imageLinkRef} imageGenRef={imageGenRef}
-                                colorRefs={colorRefs}
-                                handleEnterNavigation={handleEnterNavigation}
-                                handleColorKeyDown={handleColorKeyDown}
-                            />
+                            <p className="px-2 text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
+                                Image upload/generation and color search are hidden until a matching backend API is available.
+                            </p>
                         )}
                     </div>
 

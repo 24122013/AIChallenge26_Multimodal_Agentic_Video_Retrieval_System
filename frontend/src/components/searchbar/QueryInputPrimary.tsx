@@ -38,6 +38,9 @@ export default function QueryInputPrimary({
     handleEnterNavigation,
     children
 }: QueryInputPrimaryProps) {
+    const kistPlaceholder = kistMode === 'temporal'
+        ? 'Khoảnh khắc đầu tiên người dẫn xuất hiện trên xích lô...'
+        : `Describe context or object for ${kistMode}...`;
     
     return (
         <div className="bg-white dark:bg-white/5 rounded-xl border border-black/10 dark:border-white/10 p-2 focus-within:border-blue-500 transition-colors">
@@ -91,7 +94,7 @@ export default function QueryInputPrimary({
                         value={kistQueries[kistMode]}
                         onChange={e => setKistQueries(prev => ({ ...prev, [kistMode]: e.target.value }))}
                         onKeyDown={e => handleEnterNavigation(e, 'main_query')}
-                        placeholder={`Describe context or object for ${kistMode}...`}
+                        placeholder={kistPlaceholder}
                         className="w-full bg-transparent border-none text-sm resize-none focus-visible:ring-0 dark:text-white min-h-[50px]"
                     />
                 </>
@@ -116,30 +119,34 @@ export default function QueryInputPrimary({
             {selectedModel === "TRAKE" && (
                 <>
                     <span className="text-xs font-semibold text-black/50 dark:text-white/50 flex items-center gap-1 mb-1 px-2">
-                        <Activity className="w-3 h-3" /> Trake Query
+                        <Activity className="w-3 h-3" /> TRAKE Event Sequence
                     </span>
                     <Textarea
                         ref={trakeRef}
                         value={trakeQuery}
                         onChange={e => setTrakeQuery(e.target.value)}
                         onKeyDown={e => handleEnterNavigation(e, 'main_query')}
-                        placeholder="Context: a runner. Events: 1. first touches..."
-                        className="w-full bg-transparent border-none text-sm resize-none focus-visible:ring-0 dark:text-white min-h-[70px]"
+                        placeholder={'Mô tả video/context (không bắt buộc)\nE1: Sự kiện thứ nhất...\nE2: Sự kiện thứ hai...\nE3: Sự kiện thứ ba...'}
+                        aria-label="TRAKE context and ordered E1, E2 event sequence"
+                        className="w-full bg-transparent border-none text-sm resize-y focus-visible:ring-0 dark:text-white min-h-[140px]"
                     />
+                    <p className="px-2 pb-1 text-[10px] leading-relaxed text-zinc-500 dark:text-zinc-400">
+                        Mỗi sự kiện bắt đầu bằng E1:, E2:, ...; Enter để xuống dòng, Ctrl/⌘ + Enter để tìm kiếm.
+                    </p>
                 </>
             )}
 
             {selectedModel === "TEMPORAL" && (
                 <>
                     <span className="text-xs font-semibold text-black/50 dark:text-white/50 flex items-center gap-1 mb-1 px-2">
-                        <Clock className="w-3 h-3" /> Temporal Query
+                        <Clock className="w-3 h-3" /> Temporal Evidence Query
                     </span>
                     <Textarea
                         ref={temporalRef}
                         value={temporalQuery}
                         onChange={e => setTemporalQuery(e.target.value)}
                         onKeyDown={e => handleEnterNavigation(e, 'main_query')}
-                        placeholder="Describe timeline or temporal sequence..."
+                        placeholder="Describe an ordered evidence chain for QA..."
                         className="w-full bg-transparent border-none text-sm resize-none focus-visible:ring-0 dark:text-white min-h-[70px]"
                     />
                 </>

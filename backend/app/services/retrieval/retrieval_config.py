@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from dotenv import load_dotenv
 from yaml.nodes import MappingNode, Node, ScalarNode
 
+from backend.app.core.environment import PROJECT_ENV_PATH, load_project_env
 from backend.app.services.agent.query_expansion import QueryExpansionConfig
 from backend.app.services.retrieval.advanced_rerank import (
     AdvancedRerankWeights,
@@ -22,7 +22,7 @@ from backend.app.services.retrieval.rerank import RerankConfig, RerankWeights
 
 
 DEFAULT_RETRIEVAL_CONFIG_PATH = Path("configs/retrieval.yaml")
-DEFAULT_ENV_PATH = Path(__file__).resolve().parents[4] / ".env"
+DEFAULT_ENV_PATH = PROJECT_ENV_PATH
 _LOGGER = logging.getLogger(__name__)
 _DEPRECATED_ONLINE_SETTINGS = {
     "learned_rerank_enabled": "boolean",
@@ -33,11 +33,6 @@ _DEPRECATED_ONLINE_ENV = (
     "RETRIEVAL_ONLINE_VLM_RERANK_ENABLED",
 )
 
-
-def load_project_env() -> bool:
-    """Load the repository-local .env without overriding process variables."""
-
-    return load_dotenv(DEFAULT_ENV_PATH, override=False)
 
 _CONFIG_SCHEMA = {
     "hybrid": {

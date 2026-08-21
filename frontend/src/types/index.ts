@@ -48,6 +48,8 @@ export interface VideoScene {
 
     video_url?: string;
     source?: SearchSource;
+    answer?: string;
+    context_sources?: unknown[];
 }
 
 export type SortKey = 'arrival' | 'clip_score' | 'ocr_score' | 'image_score' | 'color_score' | 'rerank_score' | (string & {});
@@ -68,7 +70,7 @@ export interface ImagePayload {
 
 export interface TextSearchPayload {
     query: string;
-    mode: string; 
+    mode: "visual" | "kis_visual" | "hybrid" | "caption" | "ocr" | "object" | "kis_temporal" | "qa" | "trake" | "temporal";
     top_k: number;
     expanded_queries?: string[];
 }
@@ -110,8 +112,20 @@ export interface VisualSearchData {
     query: string;
     top_k: number;
     latency_ms: number;
-    task: "visual";
+    task?: "visual";
     results: VisualSearchResult[];
+}
+
+export interface KistData {
+    schema_version: string;
+    query: string;
+    task: "kis" | "avs";
+    top_k: number;
+    latency_ms: number;
+    candidates: Candidate[];
+    requested_task?: "kis" | "kis_visual" | "kis_temporal" | "avs";
+    query_plan?: QueryPlan;
+    routing_trace?: Record<string, unknown>;
 }
 
 export interface VisualSearchResult {
@@ -142,7 +156,19 @@ export interface TrakeData {
     latency_ms: number;
     
     // Output TRAKE:
-    hypotheses: Candidate[]; 
+    hypotheses: TrakeHypothesis[];
+}
+
+export interface TrakeHypothesis {
+    rank: number;
+    video_id: string;
+    frame_ids: number[];
+    score: number;
+    score_breakdown: Record<string, unknown>;
+    path_id: string;
+    events: CandidateEvent[];
+    lineage: Array<Record<string, unknown>>;
+    warnings: string[];
 }
 
 export interface QAData {
@@ -180,7 +206,10 @@ export interface QueryPlan {
     profile_source: string;
     temporal_relation: string;
     temporal_events: string[];
+    temporal_event_ids: string[];
+    temporal_cues: string[];
     modality_hints: string[];
+    modality_scope: Array<"visual" | "caption" | "ocr" | "objects">;
     quoted_phrases: string[];
     expansions: string[];
     expansion_plan: ExpansionPlan;
@@ -268,6 +297,12 @@ export interface Candidate {
     modality_scores: Record<string, number>;
     temporal: TemporalCandidateInfo | Record<string, never>; // empty {} and populated objects
     context_sources: unknown[];
+    cses_selection?: CsesSelection | null;
+    score_breakdown?: Record<string, number>;
+    score_contributions?: Record<string, number>;
+
+    timestamp_source?: string;
+    timestamp_confidence?: number;
 
     events?: CandidateEvent[];
     rank?: number;
@@ -447,7 +482,25 @@ export interface TemporalMatchEvent {
 }
 
 export interface QAAnswer {
-    answer_text: string;
-    abstain: boolean;
-    [key: string]: unknown;
+    status: "answered" | "insufficient_evidence" | "disabled" | "error";
+    answer: string | null;
+    answer_type: string;
+    confidence: number;
+    evidence_ids: string[];
+    reason?: string | null;
 }
+
+export interface CsesSelection {
+    row: number;
+    selection_rank: number;
+    selection_gain: number;
+    relevance: number;
+    visual_coverage_gain: number;
+    temporal_coverage_gain: number;
+    preserved_event_ids: string[];
+    temporal_bin: number;
+}
+
+export type SearchData = VisualSearchData | KistData | QAData | TrakeData | TemporalData;
+
+export type TelemetryDetails = Record<string, unknown>;

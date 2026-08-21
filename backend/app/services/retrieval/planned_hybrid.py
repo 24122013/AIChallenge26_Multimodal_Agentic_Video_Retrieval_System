@@ -45,29 +45,34 @@ def planned_hybrid_search(
     modality_groups: dict[str, list[RetrievalResult]] = {}
     intra_modality_trace: dict[str, list[dict[str, object]]] = {}
     skipped_modalities: dict[str, str] = {}
+    modality_scope = set(plan.modality_scope)
 
-    visual_groups: dict[str, list[RetrievalResult]] = {}
-    for key, variant in zip(variant_keys, variants):
-        response = engine.visual_engine.search(
-            variant.text,
-            top_k=engine.config.stage1_top_k,
+    if "visual" in modality_scope:
+        visual_groups: dict[str, list[RetrievalResult]] = {}
+        for key, variant in zip(variant_keys, variants):
+            response = engine.visual_engine.search(
+                variant.text,
+                top_k=engine.config.stage1_top_k,
+            )
+            visual_groups[key] = response.results
+            retrieval_calls.append(
+                _call_trace("visual", variant.text, key, variant.weight)
+            )
+        visual_fused = fuse_query_variants(
+            visual_groups,
+            weights=variant_weights,
+            max_expansion_contribution=max_expansion_contribution,
         )
-        visual_groups[key] = response.results
-        retrieval_calls.append(
-            _call_trace("visual", variant.text, key, variant.weight)
-        )
-    visual_fused = fuse_query_variants(
-        visual_groups,
-        weights=variant_weights,
-        max_expansion_contribution=max_expansion_contribution,
-    )
-    modality_groups["visual"] = [
-        item.as_retrieval_result() for item in visual_fused
-    ]
-    intra_modality_trace["visual"] = [item.to_dict() for item in visual_fused]
-    searched_modalities.append("visual")
+        modality_groups["visual"] = [
+            item.as_retrieval_result() for item in visual_fused
+        ]
+        intra_modality_trace["visual"] = [item.to_dict() for item in visual_fused]
+        searched_modalities.append("visual")
 
     for modality in _TEXT_MODALITIES:
+        if modality not in modality_scope:
+            skipped_modalities[modality] = "outside_modality_scope"
+            continue
         text_engine = engine.text_engines.get(modality)
         if text_engine is None:
             skipped_modalities[modality] = "engine_unavailable"

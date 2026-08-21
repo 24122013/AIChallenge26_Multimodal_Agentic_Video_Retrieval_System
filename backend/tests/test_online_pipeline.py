@@ -356,6 +356,14 @@ class OnlinePipelineTest(unittest.TestCase):
                 expansion = response["routing_trace"]["query_expansion"]
                 self.assertTrue(expansion["executed"])
                 self.assertEqual(expansion["provider_call_count"], 1)
+                self.assertEqual(expansion["model_name"], "Qwen/Qwen3.5-2B")
+                self.assertEqual(
+                    expansion["model_revision"],
+                    "15852e8c16360a2fea060d615a32b45270f8a8fc",
+                )
+                self.assertEqual(expansion["quantization"], "4bit")
+                self.assertIn("cache_hit", expansion)
+                self.assertIn("device", expansion)
 
     def test_qa_and_trake_skip_generic_expansion_when_enabled(self) -> None:
         hybrid, _visual, _text = _hybrid()
@@ -751,6 +759,200 @@ class OnlinePipelineTest(unittest.TestCase):
             qwen_answerer,
         ):
             heavy.assert_not_called()
+
+    def test_kis_temporal_runs_dense_cses_with_temporal_profile(self) -> None:
+        visual = _DenseVisual()
+        temporal_evidence = _TemporalEvidence()
+        pipeline = OnlinePipeline(
+            hybrid_engine=HybridSearchEngine(visual, {}),
+            runtime_config=RetrievalRuntimeConfig(
+                query_expansion=QueryExpansionConfig(enabled=False),
+                online=OnlineRetrievalConfig(
+                    coarse_top_n=1,
+                    dense_global_top_k=2,
+                    dense_rescue_clips=1,
+                    max_total_clips=2,
+                    dense_frames_per_clip=2,
+                ),
+            ),
+            dense_index=_DenseIndex(),
+            qa_evidence_engine=temporal_evidence,
+        )
+        query = "A person takes a bottle after opening the refrigerator"
+
+        with mock.patch.object(
+            advanced_search,
+            "select_cses",
+            wraps=advanced_search.select_cses,
+        ) as cses_spy:
+            response = pipeline.run(query, task="kis_temporal", top_k=3)
+
+        self.assertEqual(response["requested_task"], "kis_temporal")
+        self.assertEqual(response["task"], "kis")
+        self.assertIn("candidates", response)
+        self.assertNotIn("temporal_matches", response)
+        self.assertNotIn("hypotheses", response)
+        self.assertEqual(temporal_evidence.calls, [])
+        plan = response["query_plan"]
+        self.assertEqual(plan["original_query"], query)
+        self.assertEqual(plan["profile"], "temporal")
+        self.assertEqual(
+            plan["temporal_events"],
+            ["opening the refrigerator", "A person takes a bottle"],
+        )
+        self.assertEqual(plan["temporal_event_ids"], ["event_0", "event_1"])
+        self.assertEqual(plan["temporal_cues"], ["after"])
+        trace = response["routing_trace"]
+        self.assertEqual(trace["route"], "kis_temporal")
+        self.assertEqual(trace["retrieval_profile"], "temporal")
+        self.assertTrue(trace["coarse_to_dense"]["executed"])
+        self.assertTrue(trace["cses"]["executed"])
+        self.assertEqual(trace["cses"]["profile"], "temporal")
+        self.assertEqual(
+            trace["cses"]["weights"],
+            {
+                "query_relevance": 0.55,
+                "visual_coverage": 0.15,
+                "temporal_coverage": 0.30,
+            },
+        )
+        self.assertEqual(trace["cses"]["temporal_bins"], 4)
+        self.assertIn("EVENT_BOTTLE", trace["cses"]["protected_event_ids"])
+        self.assertEqual(
+            trace["deterministic_rerank"]["event_vector_count"],
+            2,
+        )
+        self.assertEqual(
+            trace["deterministic_rerank"]["ordered_event_ids"],
+            ["event_0", "event_1"],
+        )
+        self.assertGreater(cses_spy.call_count, 0)
+        self.assertTrue(
+            all(call.kwargs["profile"] == "temporal" for call in cses_spy.call_args_list)
+        )
+        self.assertTrue(response["candidates"])
+        self.assertTrue(
+            all(candidate["cses_selection"] for candidate in response["candidates"])
+        )
+        self.assertTrue(
+            all(
+                candidate["cses_selection"]["temporal_bin"] >= 0
+                for candidate in response["candidates"]
+            )
+        )
+
+    def test_kis_visual_uses_only_visual_coarse_then_dense_cses(self) -> None:
+        visual = _DenseVisual()
+        text = {
+            "caption": _Text("caption"),
+            "ocr": _Text("ocr"),
+            "objects": _Text("objects"),
+        }
+        dense = _DenseIndex()
+        pipeline = OnlinePipeline(
+            hybrid_engine=HybridSearchEngine(visual, text),
+            runtime_config=RetrievalRuntimeConfig(
+                query_expansion=QueryExpansionConfig(enabled=False),
+                online=OnlineRetrievalConfig(
+                    coarse_top_n=1,
+                    dense_global_top_k=2,
+                    dense_rescue_clips=1,
+                    max_total_clips=2,
+                    dense_frames_per_clip=2,
+                ),
+            ),
+            dense_index=dense,
+        )
+        query = "a person opens a refrigerator"
+
+        with mock.patch.object(
+            advanced_search,
+            "select_cses",
+            wraps=advanced_search.select_cses,
+        ) as cses_spy:
+            response = pipeline.run(query, task="kis_visual", top_k=3)
+
+        self.assertEqual(response["requested_task"], "kis_visual")
+        self.assertEqual(response["task"], "kis")
+        self.assertNotIn("temporal_matches", response)
+        self.assertNotIn("hypotheses", response)
+        self.assertEqual(response["query_plan"]["original_query"], query)
+        self.assertEqual(response["query_plan"]["profile"], "kis")
+        self.assertEqual(response["query_plan"]["modality_scope"], ["visual"])
+        self.assertTrue(visual.queries)
+        self.assertTrue(visual.vector_queries)
+        self.assertTrue(all(not engine.queries for engine in text.values()))
+        self.assertEqual(dense.search_calls, [2])
+        self.assertGreater(cses_spy.call_count, 0)
+        self.assertTrue(
+            all(call.kwargs["profile"] == "kis" for call in cses_spy.call_args_list)
+        )
+        trace = response["routing_trace"]
+        self.assertEqual(trace["route"], "kis_visual")
+        self.assertEqual(trace["retrieval_profile"], "visual")
+        self.assertTrue(trace["coarse_to_dense"]["executed"])
+        self.assertEqual(trace["coarse_to_dense"]["mode"], "coarse_to_dense")
+        self.assertTrue(trace["cses"]["executed"])
+        self.assertGreater(trace["cses"]["candidate_row_count"], 0)
+        self.assertTrue(response["candidates"])
+        for candidate in response["candidates"]:
+            self.assertIsNotNone(candidate["cses_selection"])
+            self.assertTrue(
+                {"coarse_visual", "dense_visual", "cses_gain", "visual_coverage"}
+                <= set(candidate["score_breakdown"])
+            )
+
+    def test_kis_visual_missing_dense_falls_back_without_fake_cses(self) -> None:
+        hybrid, visual, text = _hybrid()
+        response = OnlinePipeline(
+            hybrid_engine=hybrid,
+            runtime_config=RetrievalRuntimeConfig(
+                query_expansion=QueryExpansionConfig(enabled=False),
+                online=OnlineRetrievalConfig(dense_missing_behavior="fallback_sparse"),
+            ),
+        ).run("a red bus", task="kis_visual", top_k=2)
+
+        self.assertEqual(response["task"], "kis")
+        self.assertEqual(response["query_plan"]["modality_scope"], ["visual"])
+        self.assertTrue(visual.queries)
+        self.assertTrue(all(not engine.queries for engine in text.values()))
+        trace = response["routing_trace"]
+        self.assertEqual(trace["route"], "kis_visual")
+        self.assertFalse(trace["coarse_to_dense"]["executed"])
+        self.assertEqual(trace["coarse_to_dense"]["mode"], "selected_only_fallback")
+        self.assertFalse(trace["cses"]["executed"])
+        self.assertTrue(trace["cses"]["fallback_reason"])
+        self.assertTrue(response["candidates"])
+        self.assertTrue(
+            all(candidate["cses_selection"] is None for candidate in response["candidates"])
+        )
+
+    def test_kis_temporal_sparse_fallback_never_claims_cses_execution(self) -> None:
+        hybrid, _visual, _text = _hybrid()
+        temporal_evidence = _TemporalEvidence()
+        response = OnlinePipeline(
+            hybrid_engine=hybrid,
+            runtime_config=RetrievalRuntimeConfig(
+                query_expansion=QueryExpansionConfig(enabled=False),
+                online=OnlineRetrievalConfig(dense_missing_behavior="fallback_sparse"),
+            ),
+            qa_evidence_engine=temporal_evidence,
+        ).run(
+            "Khoảnh khắc đầu tiên người dẫn xuất hiện trên xích lô",
+            task="kis_temporal",
+            top_k=2,
+        )
+
+        self.assertEqual(response["task"], "kis")
+        self.assertEqual(response["query_plan"]["profile"], "temporal")
+        self.assertEqual(response["query_plan"]["temporal_cues"], ["first"])
+        self.assertFalse(response["routing_trace"]["coarse_to_dense"]["executed"])
+        self.assertFalse(response["routing_trace"]["cses"]["executed"])
+        self.assertEqual(temporal_evidence.calls, [])
+        self.assertTrue(response["candidates"])
+        self.assertTrue(
+            all(candidate["cses_selection"] is None for candidate in response["candidates"])
+        )
 
     def test_dense_missing_policy_is_explicit_for_fallback_and_error(self) -> None:
         hybrid, _visual, _text = _hybrid()

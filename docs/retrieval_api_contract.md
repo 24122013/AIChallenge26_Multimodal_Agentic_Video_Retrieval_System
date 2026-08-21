@@ -107,8 +107,14 @@ object or `segments_*.jsonl` artifacts:
 Supported modes in `backend.app.api.search.search`:
 
 - `visual`: SigLIP2 query embedding against FAISS.
+- `kis_visual`: canonical Visual KIS. It returns `task="kis"`; selected-keyframe
+  coarse retrieval is visual-only, then full-dense rescue, per-clip KIS-profile
+  CSES and deterministic visual reranking run when the dense bundle is available.
 - `caption`, `ocr`, `object`: one lexical metadata modality.
 - `hybrid`: visual and available text candidates, deduplicated and reranked.
+- `kis_temporal`: Temporal KIS profile. It returns ordinary KIS `candidates` with
+  canonical `task="kis"`; when the full dense artifact is available it runs
+  dense global rescue, per-clip temporal-profile CSES and deterministic rerank.
 - `temporal`: the existing ordered evidence flow used by QA; output is normalized
   candidates plus temporal evidence/matches.
 - `trake`: a separate sequence-first task returning one same-video original
@@ -127,6 +133,8 @@ sequence-specific wrapper:
 from backend.app.services.retrieval.retrieval_manager import search_online, search_trake
 
 response = search_online(query="...", task="trake", top_k=100)
+visual_kis = search_online(query="a red bus", task="kis_visual", top_k=20)
+temporal_kis = search_online(query="first appearance on the cyclo", task="kis_temporal", top_k=100)
 core_response = search_trake(query="...", top_k=100)
 ```
 
@@ -138,9 +146,21 @@ following FastAPI router contracts are implemented but require an application
 to mount them:
 
 - `POST /retrieval/trake` with `{"query":"...","top_k":100}`;
+- `POST /retrieval/kis-temporal` with `{"query":"...","top_k":100}`;
 - `POST /retrieval/online` with
   `{"query":"...","task":"trake","top_k":100}`;
 - `POST /search` with `{"query":"...","mode":"trake","top_k":100}`.
+
+Temporal KIS is distinct from both legacy routes: `task="temporal"` remains the
+QA/evidence contract with `temporal_matches`, while `task="trake"` returns ordered
+same-video sequence `hypotheses`. A missing optional dense artifact may fall back
+to sparse KIS, but the trace must then report both coarse-to-dense and CSES as not
+executed.
+
+The direct `visual` diagnostic remains selected-keyframe-only. It must not be
+used as proof that dense rescue or CSES executed. Visual KIS fallback uses the
+same selected engine but explicitly reports `coarse_to_dense.executed=false` and
+`cses.executed=false` without synthetic CSES candidate fields.
 
 The dedicated request model accepts `top_k` in `1..100` and defaults to 100.
 Python service calls clamp to `1..min(trake.max_answers,100)`. HTTP retrieval
@@ -150,12 +170,12 @@ below abbreviates nested retrieval results and the repeated compatibility alias:
 ```json
 {
   "schema_version": "1.0",
-  "query": "Context: a runner. Events: 1. first touches the bar 2. reaches peak height",
+  "query": "a runner.\nE1: first touches the bar\nE2: reaches peak height",
   "requested_task": "trake",
   "task": "trake",
   "top_k": 100,
   "event_plan": {
-    "original_query": "Context: a runner. Events: 1. first touches the bar 2. reaches peak height",
+    "original_query": "a runner.\nE1: first touches the bar\nE2: reaches peak height",
     "context": "a runner",
     "events": [
       {
@@ -256,11 +276,13 @@ Run the same contract from the CLI:
 
 ```powershell
 python -m backend.app.pipelines.online_pipeline `
-  --task trake --top-k 100 --query "Context: ... Events: 1. ... 2. ..."
+  --task trake --top-k 100 --query "context... E1: ... E2: ..."
 ```
 
-The parser is deterministic and treats query text as untrusted data. Explicit
-numbered/bulleted event count and order are retained. Boundary-critical terms are
+The parser is deterministic and treats query text as untrusted data. Canonical
+queries contain optional free-form context followed by `E1:`, `E2:`... event
+markers. Source order is retained even when labels are duplicated or skipped;
+legacy numbered/bulleted inputs remain compatible. Boundary-critical terms are
 preserved and mapped conservatively to `first_contact`, `first_leave`,
 `first_transition`, `peak`, `state`, or `unknown`.
 
@@ -285,7 +307,7 @@ stable `trake_result.csv` filename. The equivalent CLI is:
 
 ```powershell
 python -m backend.app.services.submission.export_query `
-  --task trake --top-k 100 --query "Context: ... Events: 1. ... 2. ..." `
+  --task trake --top-k 100 --query "context... E1: ... E2: ..." `
   --output data/submissions/trake_result.csv
 ```
 

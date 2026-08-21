@@ -74,7 +74,7 @@ không bọc JSON.
 | Field | Type/default | Contract |
 |---|---|---|
 | `query` | string, bắt buộc | Service trim whitespace và từ chối query rỗng |
-| `task` | string, `auto` | `auto`, `kis`, `avs`, `temporal`, `trake`, `qa`; `auto` không tự chọn TRAKE |
+| `task` | string, `auto` | `auto`, `kis`, `kis_visual`, `kis_temporal`, `avs`, `temporal`, `trake`, `qa`; hai `kis_*` route trả canonical task KIS, `auto` không tự chọn TRAKE |
 | `top_k` | integer, `20` | Request model cho phép 1..200; TRAKE bị cap 100, QA evidence thực tế bị cap 5 |
 | `expanded_queries` | string array, `[]` | Tối đa 20; caller-owned expansion cho route phù hợp |
 | `include_context` | boolean hoặc null | Bỏ/null giữ runtime default; boolean override cả neighbor và segment cho request |
@@ -213,6 +213,8 @@ dense rescue/CSES/context scoring.
 | Task | Output chính | Ghi chú |
 |---|---|---|
 | `kis`, `avs` | `candidates`, `query_plan`, `context`, `routing_trace` | Shared candidate schema; profile khác nhau |
+| `kis_visual` request | `task="kis"`, `candidates`, visual-scoped `query_plan`, `routing_trace` | Không có `temporal_matches`/`hypotheses`; caption/OCR/object không tham gia coarse fusion |
+| `kis_temporal` request | `task="kis"`, `candidates`, temporal `query_plan`, `routing_trace` | KIS profile; không trả `temporal_matches` hoặc TRAKE `hypotheses` |
 | `temporal` | `candidates`, `temporal_matches` và trace | Evidence route, không phải TRAKE submission |
 | `qa` | `candidates`/`evidence`, structured `answer` status và reports | Tối đa 5 evidence; answerer phụ thuộc `QA_ANSWER_MODE` |
 | `trake` | `hypotheses`, `event_plan`, `trace` | Mỗi hypothesis là complete same-video sequence, tối đa 100 |
@@ -234,7 +236,25 @@ Unified wrapper dùng `mode` thay cho `task`:
 ```
 
 `mode="online"|"auto"` chuyển `task_mode` vào canonical online pipeline.
-Canonical task modes khác là `kis`, `hybrid`, `avs`, `temporal`, `trake`, `qa`.
+Canonical task modes khác là `kis`, `kis_visual`, `kis_temporal`, `hybrid`, `avs`, `temporal`,
+`trake`, `qa`. Request UI Temporal KIS dùng ví dụ:
+
+```json
+{"query":"Khoảnh khắc đầu tiên người dẫn xuất hiện trên xích lô","mode":"kis_temporal","top_k":100}
+```
+
+Response của request này có `requested_task="kis_temporal"`, `task="kis"` và
+ordinary `candidates`. `routing_trace.cses` chỉ có `executed=true` khi dense path
+thật sự gọi CSES; sparse fallback ghi `coarse_to_dense.executed=false` và
+`cses.executed=false`.
+
+KIST Visual gửi `{"query":"...","mode":"kis_visual","top_k":20}`. Response
+có `requested_task="kis_visual"`, `task="kis"`,
+`query_plan.modality_scope=["visual"]`, `routing_trace.route="kis_visual"` và
+`retrieval_profile="visual"`. Khi dense path chạy, mỗi final candidate có
+`cses_selection` cùng score breakdown `coarse_visual`, `dense_visual`,
+`cses_gain`, `visual_coverage`. Khi dense bundle thiếu, route selected-only phải
+ghi cả coarse-to-dense và CSES `executed=false` và không phát diagnostics giả.
 Các compatibility alias QA và modality-only aliases vẫn được dispatch bởi code;
 client mới nên dùng tên canonical. `expanded_queries` được dùng ở online/auto và
 QA paths, không phải mọi modality diagnostic. Semantics nullable của
@@ -245,12 +265,14 @@ QA paths, không phải mọi modality diagnostic. Semantics nullable của
 | Route | Request body | Vai trò |
 |---|---|---|
 | `POST /retrieval/visual` | `{"query":"...","top_k":20}` | Visual-only diagnostic, 1..200 |
+| `POST /retrieval/kis-visual` | `{"query":"...","top_k":20}` | Canonical Visual KIS wrapper; output task KIS |
 | `POST /retrieval/hybrid` | `{"query":"...","top_k":20}` | KIS compatibility wrapper |
 | `POST /retrieval/caption` | `{"query":"...","top_k":20}` | Caption-only diagnostic |
 | `POST /retrieval/ocr` | `{"query":"...","top_k":20}` | OCR-only diagnostic |
 | `POST /retrieval/object` | `{"query":"...","top_k":20}` | Object-only diagnostic |
 | `POST /retrieval/temporal` | `{"query":"...","top_k":20}` | Temporal evidence wrapper |
-| `POST /retrieval/trake` | `{"query":"Context: ... Events: 1. ...","top_k":100}` | Core TRAKE wrapper, 1..100 |
+| `POST /retrieval/kis-temporal` | `{"query":"...","top_k":100}` | Temporal KIS compatibility wrapper; output canonical KIS |
+| `POST /retrieval/trake` | `{"query":"context...\nE1: ...\nE2: ...","top_k":100}` | Core TRAKE wrapper, 1..100 |
 | `POST /retrieval/qa-evidence` | `{"query":"...","top_k":5}` | QA wrapper, effective Top-5 |
 | `POST /retrieval/qa` | `{"query":"...","top_k":5,"expanded_queries":[]}` | QA answer/evidence, request 1..5 |
 

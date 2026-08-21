@@ -112,6 +112,70 @@ Các sự kiện:
         self.assertEqual(plan.events[0].original_text, "first a door opens")
         self.assertEqual(plan.events[-1].original_text, "the person fully leaves")
 
+    def test_official_e_labels_without_context_are_parsed_as_ordered_events(self) -> None:
+        query = """E1: Khoảnh khắc đầu tiên bột được bỏ vào tô măng tây.
+E2: Khoảnh khắc đầu tiên thấy miếng măng tây đầu tiên tiếp xúc với dầu trong chảo.
+E3: Khoảnh khắc miếng măng tây đầu tiên rời khỏi chảo dầu.
+E4: Khoảng khắc miếng măng tây cuối cùng rời chảo dầu và nằm hoàn toàn trên đĩa."""
+
+        plan = parse_trake_query(query)
+
+        self.assertEqual(plan.context, "")
+        self.assertEqual(plan.parser_source, "deterministic_list")
+        self.assertEqual(len(plan.events), 4)
+        self.assertEqual([event.index for event in plan.events], [0, 1, 2, 3])
+        self.assertEqual(
+            plan.events[1].original_text,
+            "Khoảnh khắc đầu tiên thấy miếng măng tây đầu tiên tiếp xúc với dầu trong chảo.",
+        )
+        self.assertEqual(plan.events[1].retrieval_query, plan.events[1].original_text)
+
+    def test_freeform_context_before_e_labels_is_added_to_each_retrieval_query(self) -> None:
+        query = """Đoạn video múa lân một con lân màu vàng đen trắng, tìm các sự kiện sau:
+E1: Lân quay vòng trên cột số 4 bằng 2 chân trước rồi tiếp đất.
+E2: Khoảnh khắc 4 chân hoàn toàn chạm đất đầu tiên.
+E3: Khoảnh khắc đầu tiên 2 người biểu diễn lân cúi chào ban giám khảo.
+E4: Sau đó lân tiến lại chào một con rồng."""
+
+        plan = parse_trake_query(query)
+
+        self.assertEqual(
+            plan.context,
+            "Đoạn video múa lân một con lân màu vàng đen trắng",
+        )
+        self.assertEqual(len(plan.events), 4)
+        self.assertTrue(
+            all(
+                event.retrieval_query.startswith(
+                    "Đoạn video múa lân một con lân màu vàng đen trắng. "
+                )
+                for event in plan.events
+            )
+        )
+
+    def test_duplicate_or_skipped_e_labels_preserve_source_order_and_reindex(self) -> None:
+        query = """Trong đoạn video nấu ăn một món ăn về nấm, gồm các khoảnh khắc sơ chế:
+E1: Khoảnh khắc đầu tiên thấy cắt nấm.
+E2: Khoảnh khắc đầu tiên cắt củ năng.
+E2: Khoảnh khắc đầu tiên cắt đậu hũ.
+E4: Khoảnh khắc chảo đặt lên bếp và thấy lửa bắt đầu xuất hiện."""
+
+        plan = parse_trake_query(query)
+
+        self.assertEqual(len(plan.events), 4)
+        self.assertEqual([event.index for event in plan.events], [0, 1, 2, 3])
+        self.assertEqual(
+            [event.original_text for event in plan.events],
+            [
+                "Khoảnh khắc đầu tiên thấy cắt nấm.",
+                "Khoảnh khắc đầu tiên cắt củ năng.",
+                "Khoảnh khắc đầu tiên cắt đậu hũ.",
+                "Khoảnh khắc chảo đặt lên bếp và thấy lửa bắt đầu xuất hiện.",
+            ],
+        )
+        self.assertIn("duplicate_event_label_preserved", plan.warnings)
+        self.assertIn("event_labels_reindexed_by_appearance", plan.warnings)
+
     def test_instruction_like_text_is_data_and_cannot_change_event_count(self) -> None:
         query = """Events:
 1. a person enters the room

@@ -133,6 +133,7 @@ class AdvancedRankedFrame:
             "ocr",
             "objects",
             "cses_gain",
+            "visual_coverage",
             "temporal_consistency",
             "modality_alignment",
             "neighbor_support",
@@ -218,6 +219,14 @@ def rerank_dense_candidates(
         event_vectors=event_vectors,
         max_gap_seconds=max_event_gap_seconds,
     )
+    if plan.profile == "temporal" and len(event_vectors) <= 1:
+        boundary_scores = temporal_boundary_consistency(
+            rows=rows,
+            records=records,
+            cues=plan.temporal_cues,
+        )
+        if boundary_scores:
+            temporal_scores = boundary_scores
 
     context_summary = context_index.summary() if context_index is not None else {}
     neighbor_active = bool(
@@ -232,21 +241,29 @@ def rerank_dense_candidates(
         and row_by_frame is not None
         and int(context_summary.get("segment_record_count") or 0) > 0
     )
-    active_weight_names = [
-        "coarse_rrf",
-        "dense_visual",
-        "caption",
-        "ocr",
-        "objects",
-        "cses_gain",
-        "temporal_consistency",
-        "modality_alignment",
-    ]
+    visual_only = tuple(plan.modality_scope) == ("visual",)
+    active_weight_names = (
+        ["coarse_rrf", "dense_visual", "cses_gain", "visual_coverage"]
+        if visual_only
+        else [
+            "coarse_rrf",
+            "dense_visual",
+            "caption",
+            "ocr",
+            "objects",
+            "cses_gain",
+            "temporal_consistency",
+            "modality_alignment",
+        ]
+    )
     if neighbor_active:
         active_weight_names.append("neighbor_support")
     if segment_active:
         active_weight_names.append("segment_support")
-    total_weight = sum(float(getattr(weights, name)) for name in active_weight_names)
+    total_weight = sum(
+        float(getattr(weights, "cses_gain" if name == "visual_coverage" else name))
+        for name in active_weight_names
+    )
     if total_weight <= 0:
         raise ValueError("Active advanced rerank weights must include a positive value")
 
@@ -310,9 +327,11 @@ def rerank_dense_candidates(
             normalized_coarse = (normalized_coarse + 1.0) / 2.0
         breakdown: dict[str, float] = {
             "coarse_rrf": normalized_coarse,
+            "coarse_visual": normalized_coarse,
             "dense_visual": float(dense_scores[local_index]),
             **modality,
             "cses_gain": float(selection.selection_gain) / max_cses,
+            "visual_coverage": float(selection.visual_coverage_gain),
             "temporal_consistency": temporal_scores.get(selection.row, 0.0),
             "modality_alignment": hint_alignment,
         }
@@ -383,10 +402,18 @@ def rerank_dense_candidates(
         breakdown["segment_support"] = segment_support if segment_active else 0.0
 
         raw_contributions = {
-            name: float(getattr(weights, name)) * float(breakdown[name]) / total_weight
+            name: float(
+                getattr(weights, "cses_gain" if name == "visual_coverage" else name)
+            )
+            * float(breakdown[name])
+            / total_weight
             for name in active_weight_names
         }
-        direct_names = active_weight_names[:8]
+        direct_names = [
+            name
+            for name in active_weight_names
+            if name not in {"neighbor_support", "segment_support"}
+        ]
         raw_direct_score = sum(raw_contributions[name] for name in direct_names)
         raw_context_bonus = sum(
             raw_contributions.get(name, 0.0)
@@ -576,6 +603,39 @@ def temporal_chain_consistency(
             scores[row] = max(scores.get(row, 0.0), chain_score)
             chain_ids[row] = chain_id
     return scores, chain_ids
+
+
+def temporal_boundary_consistency(
+    *,
+    rows: Sequence[int],
+    records: Sequence[Mapping[str, object]],
+    cues: Sequence[str],
+) -> dict[int, float]:
+    """Score first/last boundary intent deterministically within each clip."""
+
+    cue_set = {str(cue).casefold() for cue in cues}
+    prefer_first = "first" in cue_set and "last" not in cue_set
+    prefer_last = "last" in cue_set and "first" not in cue_set
+    if not prefer_first and not prefer_last:
+        return {}
+    by_clip: dict[tuple[str, str], list[int]] = {}
+    for row in rows:
+        record = records[row]
+        key = (
+            str(record.get("video_id") or ""),
+            str(record.get("segment_id") or record.get("shot_id") or ""),
+        )
+        by_clip.setdefault(key, []).append(row)
+    scores: dict[int, float] = {}
+    for clip_rows in by_clip.values():
+        timestamps = [float(records[row].get("timestamp", 0.0)) for row in clip_rows]
+        start = min(timestamps)
+        end = max(timestamps)
+        width = max(end - start, 1e-9)
+        for row, timestamp in zip(clip_rows, timestamps):
+            position = (timestamp - start) / width
+            scores[row] = 1.0 - position if prefer_first else position
+    return scores
 
 
 def _normalized(vector: np.ndarray) -> np.ndarray:

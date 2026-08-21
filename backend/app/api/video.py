@@ -25,17 +25,17 @@ try:
                 for line in f:
                     if line.strip():
                         record = json.loads(line)
-                        neighbors_map[record["frame_id"]] = record
+                        neighbors_map[(record["video_id"], record["frame_id"])] = record
         else:
             logger.warning(f"Neighbors metadata not found at {metadata_path}")
             
         return neighbors_map
 
-    @video_router.get("/frame_neighbor/{frame_id}")
-    def get_frame_neighbor(frame_id: str):
+    @video_router.get("/frame_neighbor/{video_id}/{frame_id}")
+    def get_frame_neighbor(video_id: str, frame_id: str):
         """Returns the neighbor frames mapped to internal API routes."""
         metadata = load_neighbors_metadata(STREAM_CONFIG.NEIGHBOR_FRAME_PATH)
-        record = metadata.get(frame_id)
+        record = metadata.get((video_id, frame_id))
         
         if not record:
             raise HTTPException(status_code=404, detail="Frame neighbors not found")
@@ -44,34 +44,49 @@ try:
             "frame_id": record["frame_id"],
             "video_id": record["video_id"],
             "timestamp": record["timestamp"],
-            "target_url": f"/video/frame/{record['frame_id']}",
+            "target_url": (
+                f"/api/video/frame/{record['video_id']}/{record['frame_id']}"
+            ),
             "neighbors_before": [
                 {
                     "frame_id": nb["frame_id"],
                     "delta_seconds": nb["delta_seconds"],
-                    "url": f"/video/frame/{nb['frame_id']}"
+                    "url": (
+                        f"/api/video/frame/{record['video_id']}/{nb['frame_id']}"
+                    )
                 } for nb in record.get("neighbors_before", [])
             ],
             "neighbors_after": [
                 {
                     "frame_id": na["frame_id"],
                     "delta_seconds": na["delta_seconds"],
-                    "url": f"/video/frame/{na['frame_id']}"
+                    "url": (
+                        f"/api/video/frame/{record['video_id']}/{na['frame_id']}"
+                    )
                 } for na in record.get("neighbors_after", [])
             ]
         }
 
     @video_router.get("/frame/{video_id}/{frame_id}")
     def get_frame_image(video_id: str, frame_id: str):
-        """Serves the keyframe JPEG directly from the local disk config."""
+        """Serve a selected keyframe or a dense retrieval candidate JPEG."""
         # Sanitize to prevent directory traversal
         safe_frame_id = os.path.basename(frame_id)
-        file_path = os.path.join(STREAM_CONFIG.RETRIEVAL_KEYFRAME_ROOT, video_id, f"{safe_frame_id}.jpg")
-        
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="Frame image not found")
-            
-        return FileResponse(file_path, media_type="image/jpeg")
+        file_name = f"{safe_frame_id}.jpg"
+        candidate_paths = (
+            os.path.join(STREAM_CONFIG.RETRIEVAL_KEYFRAME_ROOT, video_id, file_name),
+            os.path.join(
+                STREAM_CONFIG.RETRIEVAL_DENSE_KEYFRAME_ROOT,
+                video_id,
+                file_name,
+            ),
+        )
+
+        for file_path in candidate_paths:
+            if os.path.isfile(file_path):
+                return FileResponse(file_path, media_type="image/jpeg")
+
+        raise HTTPException(status_code=404, detail="Frame image not found")
 
     @video_router.get("/stream/{video_name}")
     def stream_video(video_name: str, range: Optional[str] = Header(None)):

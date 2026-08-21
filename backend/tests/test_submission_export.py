@@ -126,7 +126,7 @@ class SubmissionApiTests(unittest.TestCase):
         )
         with mock.patch.object(search_api, "export_query_csv", return_value=exported):
             response = TestClient(app).post(
-                "/search/export", json={"query": "../unsafe", "task": "kis", "top_k": 1}
+                "/api/search/export", json={"query": "../unsafe", "task": "kis", "top_k": 1}
             )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["content-type"], "text/csv; charset=utf-8")
@@ -153,7 +153,7 @@ class SubmissionApiTests(unittest.TestCase):
         )
         with mock.patch.object(search_api, "export_query_csv", return_value=exported):
             trake = client.post(
-                "/search/export", json={"query": "events", "task": "trake", "top_k": 10}
+                "/api/search/export", json={"query": "events", "task": "trake", "top_k": 10}
             )
         self.assertEqual(trake.status_code, 200)
         self.assertEqual(
@@ -163,7 +163,7 @@ class SubmissionApiTests(unittest.TestCase):
         for top_k in (0, 101):
             with self.subTest(top_k=top_k):
                 response = client.post(
-                    "/search/export", json={"query": "frame", "task": "kis", "top_k": top_k}
+                    "/api/search/export", json={"query": "frame", "task": "kis", "top_k": top_k}
                 )
                 self.assertEqual(response.status_code, 422)
 

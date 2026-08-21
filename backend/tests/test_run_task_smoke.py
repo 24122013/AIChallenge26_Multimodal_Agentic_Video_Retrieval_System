@@ -44,17 +44,10 @@ def _runtime_lineage() -> dict:
             },
         },
         "reranker": {
-            "enabled": True,
-            "model_name": "BAAI/bge-reranker-v2-m3",
-            "model_revision": "pinned-reranker",
-            "last_report": {
-                "status": "passed",
-                "model_name": "BAAI/bge-reranker-v2-m3",
-                "model_revision": "pinned-reranker",
-                "candidate_count": 1,
-                "scored_count": 1,
-                "output_count": 1,
-            },
+            "enabled": False,
+            "model_name": "",
+            "model_revision": "",
+            "last_report": None,
         },
     }
 
@@ -63,7 +56,7 @@ def _response(task: str, image_path: Path) -> dict:
     return {
         "query_plan": {"task_mode": task, "needs_temporal": False},
         "routing_trace": {
-            "reranker": "applied",
+            "reranker": "off",
             "fallback_used": False,
             "fallback_reasons": [],
             "modality_queries": [
@@ -159,7 +152,7 @@ def _temporal_response(image_paths: list[Path]) -> dict:
             "temporal_events": event_queries,
         },
         "routing_trace": {
-            "reranker": "applied",
+            "reranker": "off",
             "fallback_used": False,
             "fallback_reasons": [],
             "modality_queries": [
@@ -316,9 +309,7 @@ class RunTaskSmokeTest(unittest.TestCase):
                 "runtime_lineage": _runtime_lineage(),
             }
             payload["routing_trace"]["modality_queries"][0]["candidate_count"] = 0
-            payload["runtime_lineage"]["reranker"]["last_report"][
-                "scored_count"
-            ] = 0
+            payload["runtime_lineage"]["reranker"]["enabled"] = True
             payload["answer_report"]["status"] = "failed"
             payload["answer_report"]["model_revision"] = "wrong"
             payload["answer_eligible"] = False
@@ -328,7 +319,7 @@ class RunTaskSmokeTest(unittest.TestCase):
             issues = _validate_task_payload(payload)
 
         self.assertIn("routing_bge_dense_not_applied", issues)
-        self.assertIn("bge_reranker_scored_count_invalid", issues)
+        self.assertIn("model_reranker_must_be_disabled", issues)
         self.assertIn("qa_answer_report_model_revision_mismatch", issues)
         self.assertIn("qa_answer_report_status_mismatch", issues)
         self.assertIn("qa_answer_not_eligible", issues)

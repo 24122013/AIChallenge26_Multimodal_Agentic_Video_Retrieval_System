@@ -1,5 +1,4 @@
 import type { QAData, VideoScene } from '../../types';
-import { useSearchInteractions } from '../../hooks/useSearchInteractions';
 import QaCard from './frame-card/QaCard';
 
 interface QaDisplayProps {
@@ -7,6 +6,7 @@ interface QaDisplayProps {
     cardSize: 'sm' | 'md' | 'lg';
     onSelectResult: (scene: VideoScene) => void;
     onFinalSubmit?: (sceneId: string) => void; 
+    clickedSceneIds: Set<string>;
 }
 
 const getOutputString = (scene: VideoScene, answerText: string): string => {
@@ -22,15 +22,15 @@ const getGridClass = (size: 'sm' | 'md' | 'lg') => {
     }
 };
 
-export default function QaDisplay({ qaData, cardSize, onSelectResult }: QaDisplayProps) {
-    const { clickedSceneIds } = useSearchInteractions();
-
+export default function QaDisplay({ qaData, cardSize, onSelectResult, clickedSceneIds }: QaDisplayProps) {
     const handleCopyOutput = (text: string) => {
         navigator.clipboard.writeText(text).catch(err => console.error("Failed to copy:", err));
     };
 
-    // Safely extract data with fallbacks to prevent undefined crashes
-    const answerText = qaData?.answer?.answer_text ?? "Generating answer...";
+    const answerText = qaData.answer.answer
+        ?? (qaData.answer.status === 'insufficient_evidence'
+            ? 'Không đủ bằng chứng để trả lời.'
+            : qaData.answer.reason ?? `QA status: ${qaData.answer.status}`);
     const evidenceList = qaData?.evidence ?? [];
 
     return (
@@ -58,7 +58,30 @@ export default function QaDisplay({ qaData, cardSize, onSelectResult }: QaDispla
 
                 <div className={`grid ${getGridClass(cardSize)}`}>
                     {evidenceList.map((evidence, index) => {
-                        const mockScene = { ...evidence } as unknown as VideoScene;
+                        const mockScene: VideoScene = {
+                            video_id: evidence.video_id,
+                            frame_id: evidence.frame_id,
+                            timestamp: evidence.timestamp,
+                            score: evidence.retrieval_score,
+                            segment_id: '',
+                            shot_id: evidence.shot_id,
+                            faiss_index: null,
+                            frame_index: evidence.frame_index,
+                            keyframe_path: evidence.image_path,
+                            thumbnail_path: evidence.image_path,
+                            timestamp_source: 'qa_evidence',
+                            timestamp_confidence: 1,
+                            caption: evidence.caption,
+                            ocr_text: evidence.ocr_text,
+                            asr_text: '',
+                            objects: evidence.objects,
+                            modality_scores: {
+                                retrieval_score: evidence.retrieval_score,
+                                constraint_score: evidence.constraint_score,
+                            },
+                            neighbors: [],
+                            answer: answerText,
+                        };
                         return (
                             <QaCard 
                                 key={`${evidence.frame_id}-${index}`}

@@ -1,7 +1,8 @@
-from dotenv import load_dotenv
+from backend.app.core.environment import load_project_env
 
-# Load variables from the .env file
-load_dotenv()
+# Load the canonical repository environment before importing application
+# modules whose settings are evaluated at import time.
+load_project_env()
 
 # Create the app instance that Uvicorn/Gunicorn will point to
 from backend.app.create_app import create_application

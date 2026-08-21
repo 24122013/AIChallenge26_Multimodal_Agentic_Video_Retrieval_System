@@ -34,6 +34,37 @@ CONSTRAINT_CATEGORIES = (
     "ocr_terms",
 )
 MAX_TEMPORAL_EVENTS = 5
+_TEMPORAL_CUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "first",
+        re.compile(
+            r"\b(?:first|earliest|initial(?:ly)?|đầu\s+tiên|lần\s+đầu|bắt\s+đầu)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "last",
+        re.compile(
+            r"\b(?:last|latest|final|finally|cuối\s+cùng|lần\s+cuối|kết\s+thúc)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "before",
+        re.compile(r"\b(?:before|trước\s+khi)\b", re.IGNORECASE),
+    ),
+    (
+        "after",
+        re.compile(r"\b(?:after|sau\s+khi|sau\s+đó)\b", re.IGNORECASE),
+    ),
+    (
+        "sequence",
+        re.compile(
+            r"\b(?:then|next|followed\s+by|tiếp\s+theo|rồi)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
 _TEMPORAL_SPLIT = re.compile(
     r"\b(?:then|after\s+that|next(?!\s+to\b)|followed\s+by|sau\s+đó|tiếp\s+theo|rồi)\b",
     re.IGNORECASE,
@@ -259,12 +290,15 @@ class QueryPlan:
     profile_source: str
     temporal_relation: str
     temporal_events: tuple[str, ...]
+    temporal_event_ids: tuple[str, ...]
+    temporal_cues: tuple[str, ...]
     modality_hints: tuple[str, ...]
     quoted_phrases: tuple[str, ...]
     expansions: tuple[str, ...]
     modality_queries: tuple[tuple[str, str], ...]
     reasons: tuple[str, ...]
     expansion_plan: QueryExpansionPlan
+    modality_scope: tuple[str, ...] = ("visual", "caption", "ocr", "objects")
     task_mode: str = ""
     answer_type: str = "unknown"
     retrieval_statement: str = ""
@@ -315,7 +349,10 @@ class QueryPlan:
             "profile_source": self.profile_source,
             "temporal_relation": self.temporal_relation,
             "temporal_events": list(self.temporal_events),
+            "temporal_event_ids": list(self.temporal_event_ids),
+            "temporal_cues": list(self.temporal_cues),
             "modality_hints": list(self.modality_hints),
+            "modality_scope": list(self.modality_scope),
             "quoted_phrases": list(self.quoted_phrases),
             "expansions": list(self.expansions),
             "expansion_plan": self.expansion_plan.to_dict(),
@@ -340,6 +377,7 @@ def build_query_plan(
     expansion_provider: QueryExpansionProvider | None = None,
     expansion_config: QueryExpansionConfig | None = None,
     expansion_plan: QueryExpansionPlan | None = None,
+    modality_scope: Sequence[str] | None = None,
 ) -> QueryPlan:
     original = " ".join(str(query).split())
     if not original or re.search(r"\w", original, re.UNICODE) is None:
@@ -349,6 +387,19 @@ def build_query_plan(
     if requested not in SUPPORTED_PROFILES:
         raise ValueError(
             f"Unsupported retrieval profile {profile!r}; expected {SUPPORTED_PROFILES}"
+        )
+    allowed_modalities = ("visual", "caption", "ocr", "objects")
+    scope = tuple(
+        dict.fromkeys(
+            str(value).strip().casefold()
+            for value in (modality_scope or allowed_modalities)
+            if str(value).strip()
+        )
+    )
+    if not scope or any(value not in allowed_modalities for value in scope):
+        raise ValueError(
+            "modality_scope must contain one or more of "
+            + ", ".join(allowed_modalities)
         )
 
     normalized = _normalize_typos(original)
@@ -361,6 +412,7 @@ def build_query_plan(
         if relation != "none" or len(raw_events) > 1
         else raw_events
     )
+    temporal_cues = _temporal_cues(normalized)
     constraints = _known_constraints(
         classification,
         quoted,
@@ -477,12 +529,17 @@ def build_query_plan(
         profile_source=source,
         temporal_relation=relation,
         temporal_events=events,
+        temporal_event_ids=tuple(
+            f"event_{index}" for index in range(len(events))
+        ),
+        temporal_cues=temporal_cues,
         modality_hints=tuple(dict.fromkeys(hints)),
         quoted_phrases=quoted,
         expansions=accepted_paraphrases,
         modality_queries=modality_queries,
         reasons=tuple(reasons),
         expansion_plan=resolved_expansion,
+        modality_scope=scope,
         task_mode=resolved,
         # Answer semantics belong to the question, not to the execution profile.
         # In particular a temporal QA route must not erase the answer slot.
@@ -1005,6 +1062,17 @@ def _temporal_events(query: str) -> tuple[tuple[str, ...], str]:
     if relation == "none":
         return raw_events, relation
     return tuple(_clean_event_clause(event) for event in raw_events), relation
+
+
+def _temporal_cues(query: str) -> tuple[str, ...]:
+    """Return canonical temporal cues in their first-occurrence order."""
+
+    matches: list[tuple[int, str]] = []
+    for cue, pattern in _TEMPORAL_CUE_PATTERNS:
+        match = pattern.search(query)
+        if match is not None:
+            matches.append((match.start(), cue))
+    return tuple(cue for _offset, cue in sorted(matches))
 
 
 def _ordered_temporal_clauses(query: str) -> tuple[tuple[str, ...], str]:

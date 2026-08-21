@@ -38,11 +38,12 @@ export default function TrakeDisplay({
             </div>
 
             {trakeData.hypotheses.map((hypothesis, hIdx) => {
-                const isSubmitted = submittedTrakeIds.has(hypothesis.video_id);
+                const sequenceId = hypothesis.path_id || `${hypothesis.video_id}:${hypothesis.frame_ids.join('-')}`;
+                const isSubmitted = submittedTrakeIds.has(sequenceId);
                 
                 return (
                     <div 
-                        key={hIdx} 
+                        key={sequenceId || hIdx}
                         className={`bg-white dark:bg-zinc-900 border transition-all rounded-2xl p-5 shadow-sm ${
                             isSubmitted 
                                 ? 'border-emerald-400 dark:border-emerald-500/50 ring-1 ring-emerald-400 bg-emerald-50/20 dark:bg-emerald-950/20' 
@@ -66,7 +67,7 @@ export default function TrakeDisplay({
                             
                             {/* Sequence Level Submit Button */}
                             <button 
-                                onClick={() => onFinalSubmit(hypothesis.frame_id)} 
+                                onClick={() => onFinalSubmit(sequenceId)}
                                 className={`text-xs py-2 px-4 rounded-lg font-semibold transition-colors border ${
                                     isSubmitted 
                                         ? 'bg-red-50 text-red-600 border-red-200 hover:bg-red-100 dark:bg-red-950/30 dark:text-red-400' 
@@ -83,12 +84,17 @@ export default function TrakeDisplay({
                                 const sceneData = ev.result;
                                 if (!sceneData) return null;
 
-                                const mockScene = {
-                                    video_id: sceneData.video_id,
-                                    frame_id: sceneData.frame_id,
-                                    timestamp: sceneData.timestamp || 0,
-                                    score: ev.normalized_score || 0,
-                                } as unknown as VideoScene;
+                                const mockScene: VideoScene = {
+                                    ...sceneData,
+                                    timestamp: sceneData.timestamp ?? 0,
+                                    score: ev.normalized_score ?? 0,
+                                    asr_text: '',
+                                    neighbors: sceneData.neighbors.map(neighbor => ({
+                                        frame_id: neighbor.frame_id,
+                                        timestamp: neighbor.timestamp,
+                                        delta_seconds: neighbor.timestamp - (sceneData.timestamp ?? 0),
+                                    })),
+                                };
 
                                 const isClicked = clickedTrakeIds.has(mockScene.frame_id);
 

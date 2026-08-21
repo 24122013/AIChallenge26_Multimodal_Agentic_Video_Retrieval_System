@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, TypeVar, cast
 
 from backend.app.models.retrieval import VisualSearchResponse
+from backend.app.core.environment import load_project_env
 from backend.app.pipelines.online_pipeline import OnlinePipeline, OnlinePipelineConfig
 from backend.app.services.agent.query_expansion import (
     QueryExpansionProvider,
@@ -583,6 +584,7 @@ def load_dense_candidate_index_config() -> DenseCandidateIndexConfig:
 
 @lru_cache(maxsize=1)
 def get_runtime_config() -> RetrievalRuntimeConfig:
+    load_project_env()
     return load_retrieval_runtime_config()
 
 
@@ -939,22 +941,13 @@ def get_qa_evidence_search_engine(
             ),
             local_files_only=_bool_from_env("QA_MODELS_LOCAL_ONLY", False),
         )
+    # Learned/model rerankers are intentionally not part of the production QA
+    # route. Keep fusion, constraint and context reranking in QaEvidenceSearchEngine.
     reranker = None
     if _bool_from_env("QA_BGE_RERANKER_ENABLED", False):
-        reranker = build_bge_candidate_reranker(
-            model_name=os.getenv(
-                "QA_BGE_RERANKER_MODEL",
-                "BAAI/bge-reranker-v2-m3",
-            ),
-            model_revision=os.getenv("QA_BGE_RERANKER_REVISION", "main"),
-            retrieval_alpha=float(os.getenv("QA_BGE_RERANKER_ALPHA", "0.5")),
-            batch_size=int(os.getenv("QA_BGE_BATCH_SIZE", "16")),
-            device=os.getenv("QA_BGE_DEVICE", "auto"),
-            cache_dir=_path_from_env(
-                "QA_BGE_MODEL_CACHE_DIR",
-                Path("data/model_cache/bge_m3"),
-            ),
-            local_files_only=_bool_from_env("QA_MODELS_LOCAL_ONLY", False),
+        _LOGGER.warning(
+            "QA_BGE_RERANKER_ENABLED is ignored: model reranking was removed; "
+            "deterministic and constraint reranking remain enabled"
         )
     hybrid_engine = get_hybrid_search_engine()
     if before is not None and getattr(
@@ -1242,7 +1235,8 @@ def _trake_bge_contract(
             "frame_map_sha256": checksum("frame_map"),
         },
         "reranker": {
-            "enabled": bool(config.bge_reranker_enabled),
+            "enabled": False,
+            "requested": bool(config.bge_reranker_enabled),
             "available": event_reranker is not None,
             "model_name": _public_model_identifier(
                 getattr(event_reranker, "model_name", None)
@@ -1350,21 +1344,24 @@ def get_trake_pipeline(
         if runtime.trake.bge_dense_enabled
         else None
     )
-    event_reranker = (
-        build_trake_bge_candidate_reranker()
-        if runtime.trake.bge_reranker_enabled
-        else None
-    )
+    # Model/cross-encoder reranking is removed from the production TRAKE route.
+    # Dense BGE retrieval, RRF, alignment and local SigLIP refinement remain.
+    event_reranker = None
+    if runtime.trake.bge_reranker_enabled:
+        _LOGGER.warning(
+            "RETRIEVAL_TRAKE_BGE_RERANKER_ENABLED is ignored: model reranking "
+            "was removed from the production TRAKE route"
+        )
     if runtime.trake.bge_required:
         if runtime.trake.bge_dense_enabled and dense_event_engine is None:
             raise _required_trake_dependency_error(
                 "Required TRAKE BGE-M3 dense retrieval is unavailable",
                 "required_bge_dense_unavailable",
             )
-        if runtime.trake.bge_reranker_enabled and event_reranker is None:
+        if runtime.trake.bge_reranker_enabled:
             raise _required_trake_dependency_error(
-                "Required TRAKE BGE candidate reranker is unavailable",
-                "required_bge_reranker_unavailable",
+                "Required TRAKE model reranking is unsupported",
+                "model_reranker_removed",
             )
     retrieval_engine = get_hybrid_search_engine()
     if (
