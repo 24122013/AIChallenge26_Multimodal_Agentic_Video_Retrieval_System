@@ -360,6 +360,29 @@ class QaEvidenceTest(unittest.TestCase):
         self.assertFalse(response["answer_eligible"])
         self.assertEqual(response["preflight_block_reason"], "no_evidence")
 
+    def test_non_temporal_evidence_is_not_capped_at_five_frames(self) -> None:
+        rows = [
+            _result(
+                f"frame_{index:03d}",
+                score=1.0 - index / 100.0,
+                timestamp=float(index),
+                shot_id=f"S{index:03d}",
+                caption="animal statues beside the stairs",
+            )
+            for index in range(12)
+        ]
+        response = QaEvidenceSearchEngine(
+            QueryResultHybrid({}, default=rows),
+        ).search(
+            "What animals are the two statues beside the stairs?",
+            top_k=12,
+        )
+
+        self.assertEqual(response["top_k"], 12)
+        self.assertEqual(response["evidence_count"], 12)
+        self.assertEqual(len(response["evidence"]), 12)
+        self.assertEqual(len(response["results"]), 12)
+
     def test_temporal_route_retrieves_each_event_and_flattens_strict_chain(
         self,
     ) -> None:

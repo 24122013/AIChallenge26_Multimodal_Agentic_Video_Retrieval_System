@@ -80,7 +80,7 @@ Chi tiết truy vết theo file/function và risk register nằm tại
 | Sparse text | Không có checkpoint | BM25 caption/OCR/objects | `build_text_index.py`, `text_index.py` | CPU | text-index JSON |
 | Dense text | `BAAI/bge-m3` | 1024-d normalized FAISS IP | `build_bge_m3_index.py`, `bge_dense.py` | CPU/CUDA | index + map + manifest |
 | Text reranker | `BAAI/bge-reranker-v2-m3` | Cross-encoder blend | `bge_reranker.py` | CPU/CUDA | scores/trace |
-| Grounded QA | `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a` | Evidence-only JSON + citation validation | `qa_answerer.py` | CPU/CUDA; lazy-load | answer/cache/report |
+| Grounded QA | `Qwen/Qwen3.5-2B` @ `15852e8c16360a2fea060d615a32b45270f8a8fc` | Multimodal evidence-only JSON + citation validation; `auto` → 4-bit trên CUDA | `qa_answerer.py` | CUDA mặc định; chỉ lazy-load trên route QA | answer/cache/report |
 | Query expansion | `Qwen/Qwen3.5-2B` @ `15852e8c16360a2fea060d615a32b45270f8a8fc` | lazy bounded paraphrase/decomposition, BitsAndBytes 4-bit | `agent/query_expansion.py`, `query_plan.py` | configured device (`cuda` in `.env`) | expansion cache/plan/trace |
 | TRAKE | Không có checkpoint/scorer production đi kèm | deterministic parse, per-event retrieval, coverage gating, K-best alignment, sequence NMS; injectable local scorer | `backend/app/services/trake/` | CPU; decoder/scorer tùy injection | sequence hypotheses + lineage/trace |
 
@@ -184,6 +184,9 @@ dẫn tuyệt đối từ repository root. Biến đã đặt bằng shell hoặ
 | `RETRIEVAL_QUERY_EXPANSION_MODEL_REVISION` | Không | immutable 2B SHA trong YAML | KIS query planner | Revision riêng của 2B |
 | `RETRIEVAL_QUERY_EXPANSION_QUANTIZATION` | Không | `4bit` | KIS query planner | Truyền `BitsAndBytesConfig(load_in_4bit=true)` khi load |
 | `QUERY_EXPANSION_DEVICE` | Không | `cpu` trong code; `.env` dùng `cuda` | KIS query planner | Device policy của provider lazy |
+| `CAPTION_MODEL` | Không | `florence-community/Florence-2-base-ft` | Offline caption | CLI rõ ràng > `.env` > hằng số code |
+| `CAPTION_MODEL_REVISION` | Không | `0b03b6f...87ea37` | Offline caption | Revision Florence-2 bất biến |
+| `CAPTION_MODEL_CACHE_DIR` | Không | `data/model_cache/caption` | Offline caption | Cache model caption riêng |
 | `ONLINE_NEIGHBOR_CONTEXT_ENABLED` | Không | `false` | Online pipeline | Đọc trực tiếp `neighbors_all.jsonl` sau rerank |
 | `ONLINE_SEGMENT_CONTEXT_ENABLED` | Không | `false` | Online/temporal | Gắn canonical segment trước temporal matching |
 | `ONLINE_NEIGHBOR_PATH` | Khi bật neighbor | `data/metadata/neighbors_all.jsonl` | Online pipeline | Canonical neighbor artifact |
@@ -191,7 +194,12 @@ dẫn tuyệt đối từ repository root. Biến đã đặt bằng shell hoặ
 | `QA_BGE_DENSE_ENABLED` | Không | `true` | QA backend | Bật BGE-M3 dense evidence retrieval |
 | `QA_BGE_INDEX_ROOT` | Khi bật BGE | `data/indexes/bge_m3` | QA backend | BGE index/map/manifest root |
 | `QA_BGE_RERANKER_ENABLED` | Không | `false` | QA backend | Model reranker tắt; giữ deterministic/constraint reranking |
-| `QA_ANSWER_MODE` | Không | `required` | QA backend | Bắt buộc sinh grounded answer hoặc trả lỗi rõ |
+| `QA_EVIDENCE_LIMIT` | Không | `100` | QA backend/UI | Giới hạn frame trả về; độc lập với 3–5 frame gửi vào answer model |
+| `QA_ANSWER_MODE` | Không | `off` | QA backend | Mặc định chỉ retrieval frame; `optional`/`required` mới lazy-load answer model |
+| `QA_ANSWER_MODEL` | Không | `Qwen/Qwen3.5-2B` | QA backend | Không dùng làm reranker; chỉ route QA lazy-load |
+| `QA_ANSWER_MODEL_REVISION` | Không | `15852e8c...f8a8fc` | QA backend | Revision 2B bất biến |
+| `QA_ANSWER_DEVICE` / `QA_ANSWER_QUANTIZATION` | Không | `cuda` / `auto` trong `.env` | QA backend | `auto` trên CUDA được resolve thành BitsAndBytes 4-bit |
+| `QA_ANSWER_MODEL_CACHE_DIR` | Không | `data/model_cache/qa_answer` | QA backend | Tách biệt khỏi `data/model_cache/query_expansion` |
 | `QA_MODELS_LOCAL_ONLY` | Không | `true` | QA backend | Chỉ đọc model cache |
 | `trake.*` trong retrieval YAML | Không | Xem `configs/retrieval.yaml` | TRAKE | Retrieval width, video gating, alignment, refinement, max answers và cutoffs |
 | `RETRIEVAL_TRAKE_VIDEO_ROOT` | Không | `data/raw/video` | TRAKE local refinement | Canonical root để resolve `<video_id>.mp4`; không nhận path từ query |
@@ -213,7 +221,9 @@ $env:RETRIEVAL_DEVICE = "cuda"
 
 Các lựa chọn QA đáng chú ý:
 
-- `QA_ANSWER_MODE=off|optional|required` (cấu hình repository dùng `required`).
+- `QA_ANSWER_MODE=off|optional|required` (cấu hình repository dùng `off` để ưu tiên tìm và kiểm tra frame thủ công).
+- Grounded answer dùng `Qwen/Qwen3.5-2B` với image evidence và citation ID; KIS,
+  temporal KIS và TRAKE không resolve answerer lazy này.
 - `QA_BGE_DENSE_ENABLED=true` và `QA_BGE_INDEX_ROOT=...` để bật dense text.
 - `QA_BGE_RERANKER_ENABLED=false`: không dùng cross-encoder/VLM reranker.
 - `QA_MODELS_LOCAL_ONLY=true` cho máy đã chuẩn bị cache và không có mạng.
@@ -475,7 +485,7 @@ Nếu cần ép loại bài toán thay vì dùng `auto`, chọn task theo contra
 | `avs` | Ad-hoc Video Search | Mô tả có thể khớp nhiều cảnh | Cùng candidate schema với KIS, dùng profile AVS | Tối đa 200 |
 | `temporal` | Temporal evidence | Câu mô tả chuỗi dùng contract evidence/QA hiện hữu | `candidates`, `temporal_matches` và temporal trace; không phải submission TRAKE | Tối đa 200 |
 | `trake` | Temporal Retrieval and Alignment of Key Events | Context và đúng N event có thứ tự | Ranked `hypotheses`; mỗi item là một complete same-video sequence gồm đúng N original zero-based `frame_index` | Tối đa 100 |
-| `qa` | Grounded QA | Câu hỏi cần evidence và câu trả lời có citation | `evidence`, `answer`, eligibility/preflight và trace; answerer có thể disabled/abstain | Tối đa 5 evidence |
+| `qa` | QA frame retrieval | Câu hỏi cần tìm frame trước khi trả lời | Ranked `evidence` hiển thị như KIS; `answer` chỉ là output tùy chọn | Tối đa 100 frame |
 | `auto` | Auto router | Query KIS/AVS/QA chưa biết profile | Giữ `requested_task="auto"`, trả `task` đã resolve | Theo task đã resolve |
 
 Tên task mà CLI/Python/API thực sự nhận là `kis`; tài liệu hoặc benchmark có thể
@@ -523,7 +533,7 @@ mặc định):
 ```powershell
 $env:QA_ANSWER_MODE = "off"
 .\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline `
-  --task qa --top-k 5 `
+  --task qa --top-k 100 `
   --query "Người phụ nữ mặc áo đỏ đang cầm vật gì?" `
   --output data/reports/qa_query.json
 ```
@@ -575,7 +585,7 @@ trake_core = search_trake(
 qa = search_online(
     query="Người phụ nữ mặc áo đỏ đang cầm vật gì?",
     task="qa",
-    top_k=5,
+    top_k=100,
 )
 print(qa["evidence"], qa["answer"])
 ```
@@ -710,7 +720,7 @@ Contract đã triển khai trong router (nhưng chưa phục vụ HTTP) dùng c�
 | KIS/KIST | `POST /retrieval/online` | `{"query":"người đang đi xe đạp","task":"kis","top_k":20,"expanded_queries":[]}` |
 | TRAKE qua online wrapper | `POST /retrieval/online` | `{"query":"a jump.\nE1: first leaves ground\nE2: reaches peak","task":"trake","top_k":100}` |
 | TRAKE core wrapper | `POST /retrieval/trake` | `{"query":"a jump.\nE1: first leaves ground\nE2: reaches peak","top_k":100}` |
-| QA | `POST /retrieval/qa` | `{"query":"Người phụ nữ đang cầm vật gì?","top_k":5,"task_mode":"qa","expanded_queries":[]}` |
+| QA | `POST /retrieval/qa` | `{"query":"Người phụ nữ đang cầm vật gì?","top_k":100,"task_mode":"qa","expanded_queries":[]}` |
 
 `POST /search` là wrapper tương đương dùng field `mode`, ví dụ KIS dùng
 `{"query":"...","mode":"kis","top_k":20}` và TRAKE dùng
@@ -795,6 +805,11 @@ Florence-2 sinh văn bản caption,
 không sinh JSON instruction-following; adapter giữ schema JSONL cũ với
 `structured_caption: null`. Quantization 4/8-bit chưa được kiểm thử cho checkpoint
 này và bị từ chối rõ ràng.
+
+Hai caption CLI đọc model, revision, cache và task prompt theo thứ tự: argument
+được truyền rõ ràng, biến `.env`, rồi hằng số code. Report caption ghi effective
+model/revision, task prompt, device và model cache directory; vì vậy một model
+khai báo trong `.env` không thể bị runtime âm thầm thay bằng default khác.
 
 Ví dụ sinh caption trên CPU và CUDA:
 

@@ -218,7 +218,7 @@ def _dispatch_search(
         return search_online(
             query=query,
             task="qa",
-            top_k=min(5, int(top_k)),
+            top_k=int(top_k),
             expanded_queries=expanded_queries or [],
             **online_options,
         )

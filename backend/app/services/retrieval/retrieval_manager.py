@@ -40,6 +40,7 @@ from backend.app.services.retrieval.qa_evidence import (
 from backend.app.services.retrieval.qa_pipeline import QaPipelineConfig, QaSearchPipeline
 from backend.app.services.retrieval.qa_answerer import (
     DEFAULT_QA_MODEL,
+    DEFAULT_QA_MODEL_CACHE_DIR,
     DEFAULT_QA_MODEL_REVISION,
     QA_PROMPT_REVISION,
 )
@@ -118,7 +119,7 @@ class _LazyQaSearchPipeline:
     def search(
         self,
         query: str,
-        top_k: int = 5,
+        top_k: int = 20,
         *,
         task_mode: str = "qa",
         expanded_queries: Sequence[str] | None = None,
@@ -146,7 +147,7 @@ class _LazyQaEvidenceSearchEngine:
     def search(
         self,
         question: str,
-        top_k: int = 5,
+        top_k: int = 20,
         *,
         task_mode: str = "qa",
         expanded_queries: Sequence[str] | None = None,
@@ -496,6 +497,10 @@ def _qa_routing_config() -> QaRoutingConfig:
         "typed_parser_enabled": _bool_from_env("QA_TYPED_PARSER_ENABLED", True),
         "router_enabled": _bool_from_env("QA_ROUTER_ENABLED", True),
         "evidence_bundle_enabled": _bool_from_env("QA_EVIDENCE_BUNDLE_ENABLED", True),
+        "per_modality_limit": int(os.getenv("QA_PER_MODALITY_LIMIT", "100")),
+        "rerank_pool_size": int(os.getenv("QA_RERANK_POOL_SIZE", "100")),
+        "fusion_pool_size": int(os.getenv("QA_FUSION_POOL_SIZE", "100")),
+        "evidence_limit": int(os.getenv("QA_EVIDENCE_LIMIT", "100")),
         "constraint_rerank_enabled": _bool_from_env(
             "QA_CONSTRAINT_RERANK_ENABLED",
             True,
@@ -975,31 +980,56 @@ def get_qa_evidence_search_engine(
     return engine
 
 
+def _qa_answer_runtime_settings() -> dict[str, Any]:
+    """Resolve the effective QA answer contract without allocating the model."""
+
+    device = (os.getenv("QA_ANSWER_DEVICE") or "auto").strip().casefold()
+    requested_quantization = os.getenv("QA_ANSWER_QUANTIZATION", "auto").strip().casefold()
+    if requested_quantization == "auto":
+        effective_quantization = (
+            "4bit" if device == "cuda" else ("none" if device == "cpu" else "auto")
+        )
+    else:
+        effective_quantization = requested_quantization
+    return {
+        "mode": _choice_from_env(
+            "QA_ANSWER_MODE",
+            "off",
+            ("off", "optional", "required"),
+        ),
+        "model_name": os.getenv("QA_ANSWER_MODEL", DEFAULT_QA_MODEL),
+        "model_revision": os.getenv(
+            "QA_ANSWER_MODEL_REVISION",
+            DEFAULT_QA_MODEL_REVISION,
+        ),
+        "device": device,
+        "requested_quantization": requested_quantization,
+        "effective_quantization": effective_quantization,
+        "model_cache_dir": _path_from_env(
+            "QA_ANSWER_MODEL_CACHE_DIR",
+            DEFAULT_QA_MODEL_CACHE_DIR,
+        ),
+        "local_files_only": _bool_from_env("QA_MODELS_LOCAL_ONLY", False),
+    }
+
+
 @_corpus_generation_cached
 def get_qa_search_pipeline(
     corpus_key: _CorpusCacheKey,
 ) -> QaSearchPipeline:
-    answer_mode = _choice_from_env(
-        "QA_ANSWER_MODE",
-        "off",
-        ("off", "optional", "required"),
-    )
+    answer_settings = _qa_answer_runtime_settings()
+    answer_mode = str(answer_settings["mode"])
     answer_runner = None
     if answer_mode != "off":
         from backend.app.services.retrieval.qa_answerer import build_local_qwen_runner
 
         answer_runner = build_local_qwen_runner(
-            model_name=os.getenv("QA_ANSWER_MODEL", DEFAULT_QA_MODEL),
-            model_revision=os.getenv(
-                "QA_ANSWER_MODEL_REVISION",
-                DEFAULT_QA_MODEL_REVISION,
-            ),
-            device=os.getenv("QA_ANSWER_DEVICE") or None,
-            quantization=os.getenv("QA_ANSWER_QUANTIZATION", "auto"),
-            cache_dir=_path_from_env(
-                "QA_ANSWER_MODEL_CACHE_DIR",
-                Path("data/model_cache/qa_answer"),
-            ),
+            model_name=str(answer_settings["model_name"]),
+            model_revision=str(answer_settings["model_revision"]),
+            device=str(answer_settings["device"]),
+            quantization=str(answer_settings["requested_quantization"]),
+            cache_dir=cast(Path, answer_settings["model_cache_dir"]),
+            local_files_only=bool(answer_settings["local_files_only"]),
         )
     evidence_engine = get_qa_evidence_search_engine()
     if (
@@ -1012,11 +1042,8 @@ def get_qa_search_pipeline(
         evidence_engine,
         config=QaPipelineConfig(
             answer_mode=answer_mode,
-            model_name=os.getenv("QA_ANSWER_MODEL", DEFAULT_QA_MODEL),
-            model_revision=os.getenv(
-                "QA_ANSWER_MODEL_REVISION",
-                DEFAULT_QA_MODEL_REVISION,
-            ),
+            model_name=str(answer_settings["model_name"]),
+            model_revision=str(answer_settings["model_revision"]),
             answer_cache_root=_path_from_env(
                 "QA_ANSWER_CACHE_DIR",
                 Path("data/cache/qa_answers"),
@@ -1489,21 +1516,49 @@ def get_qa_runtime_lineage() -> dict[str, Any]:
         source_contract = {}
 
     rerank_report = getattr(reranker, "last_report", None)
-    answer_mode = _choice_from_env(
-        "QA_ANSWER_MODE",
-        "off",
-        ("off", "optional", "required"),
+    answer_settings = _qa_answer_runtime_settings()
+    answer_mode = str(answer_settings["mode"])
+    expansion = get_runtime_config().query_expansion
+    expansion_model_cache = _path_from_env(
+        "QUERY_EXPANSION_MODEL_CACHE_DIR",
+        Path("data/model_cache/query_expansion"),
     )
+    answer_model_cache = cast(Path, answer_settings["model_cache_dir"])
     return {
         "answer_model": {
             "enabled": answer_mode != "off",
             "mode": answer_mode,
-            "name": os.getenv("QA_ANSWER_MODEL", DEFAULT_QA_MODEL),
-            "revision": os.getenv(
-                "QA_ANSWER_MODEL_REVISION",
-                DEFAULT_QA_MODEL_REVISION,
-            ),
+            "name": str(answer_settings["model_name"]),
+            "revision": str(answer_settings["model_revision"]),
             "prompt_revision": QA_PROMPT_REVISION,
+            "loader": "AutoModelForMultimodalLM",
+            "device": str(answer_settings["device"]),
+            "requested_quantization": str(
+                answer_settings["requested_quantization"]
+            ),
+            "effective_quantization": str(
+                answer_settings["effective_quantization"]
+            ),
+            "model_cache_dir": cast(
+                Path,
+                answer_settings["model_cache_dir"],
+            ).as_posix(),
+            "lazy_load": True,
+            "local_files_only": bool(answer_settings["local_files_only"]),
+            "instance_scope": "qa_answer",
+        },
+        "query_expansion": {
+            "enabled": expansion.enabled,
+            "name": expansion.model_name,
+            "revision": expansion.model_revision,
+            "device": os.getenv("QUERY_EXPANSION_DEVICE", "cpu"),
+            "quantization": expansion.quantization,
+            "model_cache_dir": expansion_model_cache.as_posix(),
+            "instance_scope": "query_expansion",
+            "shares_qa_answer_cache": (
+                expansion_model_cache.resolve(strict=False)
+                == answer_model_cache.resolve(strict=False)
+            ),
         },
         "dense_text": {
             "enabled": dense is not None,
@@ -1650,7 +1705,7 @@ def search_qa(
     task_mode: str = "qa",
     expanded_queries: tuple[str, ...] | list[str] | None = None,
 ) -> dict:
-    requested_top_k = 5 if top_k is None else int(top_k)
+    requested_top_k = 20 if top_k is None else int(top_k)
     return get_qa_search_pipeline().search(
         query=query,
         top_k=requested_top_k,

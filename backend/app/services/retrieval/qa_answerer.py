@@ -21,8 +21,9 @@ from typing import Any, Mapping, Protocol, Sequence
 
 QA_ANSWER_MODES = ("off", "optional", "required")
 QA_ANSWER_STATUSES = ("answered", "insufficient_evidence", "disabled", "error")
-DEFAULT_QA_MODEL = "Qwen/Qwen3.5-9B"
-DEFAULT_QA_MODEL_REVISION = "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+DEFAULT_QA_MODEL = "Qwen/Qwen3.5-2B"
+DEFAULT_QA_MODEL_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
+DEFAULT_QA_MODEL_CACHE_DIR = Path("data/model_cache/qa_answer")
 QA_PROMPT_REVISION = "grounded-qa-v2"
 
 
@@ -723,7 +724,8 @@ class LazyQwenGroundedRunner:
         model_revision: str = DEFAULT_QA_MODEL_REVISION,
         device: str | None = None,
         quantization: str = "auto",
-        cache_dir: Path | None = Path("data/model_cache/qa_answer"),
+        cache_dir: Path | None = DEFAULT_QA_MODEL_CACHE_DIR,
+        local_files_only: bool = False,
         max_new_tokens: int = 192,
     ) -> None:
         if quantization not in {"auto", "none", "4bit"}:
@@ -735,11 +737,13 @@ class LazyQwenGroundedRunner:
         self.requested_device = device
         self.requested_quantization = quantization
         self.cache_dir = cache_dir
+        self.local_files_only = bool(local_files_only)
         self.max_new_tokens = int(max_new_tokens)
         self._model: Any | None = None
         self._processor: Any | None = None
         self._torch: Any | None = None
         self._device = "cpu"
+        self._quantization = "none"
         self._dtype: Any | None = None
         self._load_lock = threading.Lock()
 
@@ -758,7 +762,10 @@ class LazyQwenGroundedRunner:
                     "AutoModelForMultimodalLM support"
                 ) from exc
 
-            device = self.requested_device or ("cuda" if torch.cuda.is_available() else "cpu")
+            requested_device = str(self.requested_device or "auto").casefold()
+            device = (
+                "cuda" if torch.cuda.is_available() else "cpu"
+            ) if requested_device == "auto" else requested_device
             if device == "cuda" and not torch.cuda.is_available():
                 raise RuntimeError("CUDA was requested but is unavailable")
             quantization = self.requested_quantization
@@ -773,9 +780,13 @@ class LazyQwenGroundedRunner:
             )
             kwargs: dict[str, object] = {
                 "revision": self.model_revision,
-                "torch_dtype": dtype,
+                # Transformers 5.x routes Qwen3.5 through the native
+                # multimodal auto class and uses the unified ``dtype`` kwarg.
+                "dtype": dtype,
             }
             processor_kwargs: dict[str, object] = {"revision": self.model_revision}
+            kwargs["local_files_only"] = self.local_files_only
+            processor_kwargs["local_files_only"] = self.local_files_only
             if self.cache_dir is not None:
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
                 kwargs["cache_dir"] = str(self.cache_dir)
@@ -797,6 +808,7 @@ class LazyQwenGroundedRunner:
             model.eval()
             self._torch = torch
             self._device = device
+            self._quantization = quantization
             self._dtype = dtype
             self._processor = processor
             self._model = model
@@ -824,6 +836,10 @@ class LazyQwenGroundedRunner:
                         {"type": "text", "text": f"Image for {item['evidence_id']}:"},
                         {"type": "image", "image": image},
                     ]
+                )
+            if not opened_images:
+                raise ValueError(
+                    "Grounded QA requires at least one readable evidence image"
                 )
             content.append(
                 {
@@ -871,7 +887,8 @@ def build_local_qwen_runner(
     model_revision: str = DEFAULT_QA_MODEL_REVISION,
     device: str | None = None,
     quantization: str = "auto",
-    cache_dir: Path | None = Path("data/model_cache/qa_answer"),
+    cache_dir: Path | None = DEFAULT_QA_MODEL_CACHE_DIR,
+    local_files_only: bool = False,
     max_new_tokens: int = 192,
 ) -> QaAnswerRunner:
     """Create a callable whose processor/model allocation occurs on first use."""
@@ -882,6 +899,7 @@ def build_local_qwen_runner(
         device=device,
         quantization=quantization,
         cache_dir=cache_dir,
+        local_files_only=local_files_only,
         max_new_tokens=max_new_tokens,
     )
 

@@ -86,6 +86,7 @@ from backend.app.services.indexing.extract_segments import (
 from backend.app.services.indexing.validate_frame_map import validate_frame_map
 from backend.app.services.indexing.validate_keyframes import validate_records
 from backend.app.services.ingestion.caption_pipeline import (
+    DEFAULT_MODEL_CACHE_DIR as DEFAULT_CAPTION_CACHE_DIR,
     DEFAULT_MODEL_NAME as DEFAULT_CAPTION_MODEL,
     DEFAULT_MODEL_REVISION as DEFAULT_CAPTION_REVISION,
     DEFAULT_TASK_PROMPT as DEFAULT_CAPTION_TASK_PROMPT,
@@ -190,7 +191,7 @@ class OfflinePipelineConfig:
 
     caption_model_name: str = DEFAULT_CAPTION_MODEL
     caption_model_revision: str | None = DEFAULT_CAPTION_REVISION
-    caption_model_cache_dir: Path = Path("data/model_cache/caption")
+    caption_model_cache_dir: Path = DEFAULT_CAPTION_CACHE_DIR
     caption_batch_size: int = 2
     caption_max_new_tokens: int = 256
     caption_dtype: str = "auto"
@@ -4778,11 +4779,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-batch-size", type=int, default=8)
     parser.add_argument("--bge-batch-size", type=int, default=16)
     parser.add_argument("--siglip-model-revision", default=None)
-    parser.add_argument("--caption-model-name", default=DEFAULT_CAPTION_MODEL)
-    parser.add_argument("--caption-model-revision", default=DEFAULT_CAPTION_REVISION)
+    parser.add_argument(
+        "--caption-model-name",
+        default=os.getenv("CAPTION_MODEL", DEFAULT_CAPTION_MODEL),
+    )
+    parser.add_argument(
+        "--caption-model-revision",
+        default=os.getenv("CAPTION_MODEL_REVISION", DEFAULT_CAPTION_REVISION),
+    )
+    parser.add_argument(
+        "--caption-model-cache-dir",
+        type=Path,
+        default=Path(
+            os.getenv("CAPTION_MODEL_CACHE_DIR", str(DEFAULT_CAPTION_CACHE_DIR))
+        ),
+    )
     parser.add_argument(
         "--caption-task-prompt",
-        default=DEFAULT_CAPTION_TASK_PROMPT,
+        default=os.getenv("CAPTION_TASK_PROMPT", DEFAULT_CAPTION_TASK_PROMPT),
         help="Florence-2 task token used for keyframe captioning.",
     )
     parser.add_argument("--caption-max-new-tokens", type=int, default=256)
@@ -4932,7 +4946,7 @@ def _config_from_args(args: argparse.Namespace) -> OfflinePipelineConfig:
         siglip_use_autocast=not args.no_autocast,
         caption_model_name=args.caption_model_name,
         caption_model_revision=args.caption_model_revision,
-        caption_model_cache_dir=output_dir / "model_cache" / "caption",
+        caption_model_cache_dir=args.caption_model_cache_dir,
         caption_batch_size=args.caption_batch_size,
         caption_max_new_tokens=args.caption_max_new_tokens,
         caption_dtype=args.caption_dtype,

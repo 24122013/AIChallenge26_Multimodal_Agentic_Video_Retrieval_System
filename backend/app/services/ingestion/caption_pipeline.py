@@ -32,6 +32,7 @@ from backend.app.services.ingestion.common import (
 DEFAULT_MODEL_NAME = "florence-community/Florence-2-base-ft"
 DEFAULT_MODEL_REVISION = "0b03b6f15a4a211370fb204aee4e7dd48887ea37"
 DEFAULT_TASK_PROMPT = "<MORE_DETAILED_CAPTION>"
+DEFAULT_MODEL_CACHE_DIR = Path("data/model_cache/caption")
 
 
 class CaptionBackend(Protocol):
@@ -59,7 +60,7 @@ class FlorenceCaptionBackend:
         model_name: str = DEFAULT_MODEL_NAME,
         revision: str | None = DEFAULT_MODEL_REVISION,
         device: str = "cpu",
-        cache_dir: Path | None = Path("data/model_cache/caption"),
+        cache_dir: Path | None = DEFAULT_MODEL_CACHE_DIR,
         max_new_tokens: int = 256,
         dtype: str = "auto",
         quantization: str = "none",
@@ -256,7 +257,7 @@ def run_caption_file(
     max_new_tokens: int = 256,
     dtype: str = "auto",
     quantization: str = "none",
-    model_cache_dir: Path = Path("data/model_cache/caption"),
+    model_cache_dir: Path = DEFAULT_MODEL_CACHE_DIR,
     task_prompt: str = DEFAULT_TASK_PROMPT,
     prompt: str | None = None,
 ) -> dict[str, Any]:

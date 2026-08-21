@@ -52,7 +52,7 @@ if APIRouter is not None:
 
     class QaSearchBody(BaseModel):
         query: str
-        top_k: int = Field(default=5, ge=1, le=5)
+        top_k: int = Field(default=20, ge=1, le=100)
         task_mode: str = "qa"
         expanded_queries: list[str] = Field(default_factory=list, max_length=20)
 
@@ -134,7 +134,7 @@ if APIRouter is not None:
     @router.post("/qa-evidence")
     def qa_evidence_search_endpoint(body: VisualSearchBody) -> dict:
         return _response(
-            lambda: search_online(body.query, task="qa", top_k=min(5, body.top_k))
+            lambda: search_online(body.query, task="qa", top_k=body.top_k)
         )
 
     @router.post("/qa")
@@ -221,12 +221,12 @@ def trake_search(query: str, top_k: int = 100) -> dict:
 
 
 def qa_evidence_search(question: str, top_k: int = 10) -> dict:
-    return search_online(query=question, task="qa", top_k=min(5, top_k))
+    return search_online(query=question, task="qa", top_k=top_k)
 
 
 def qa_search(
     query: str,
-    top_k: int = 5,
+    top_k: int = 20,
     *,
     task_mode: str = "qa",
     expanded_queries: list[str] | None = None,

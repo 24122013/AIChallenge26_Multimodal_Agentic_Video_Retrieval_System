@@ -205,6 +205,40 @@ class MultimodalIngestionTest(unittest.TestCase):
         )
         self.assertEqual(legacy.task_prompt, "<CAPTION>")
 
+    def test_caption_cli_env_defaults_and_explicit_override_precedence(self) -> None:
+        environment = {
+            "CAPTION_MODEL": "env/florence",
+            "CAPTION_MODEL_REVISION": "env-revision",
+            "CAPTION_MODEL_CACHE_DIR": "env/caption-cache",
+            "CAPTION_TASK_PROMPT": "<CAPTION>",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            from_env = build_caption_parser().parse_args(
+                ["--metadata-path", str(self.metadata)]
+            )
+            explicit = build_caption_parser().parse_args(
+                [
+                    "--metadata-path",
+                    str(self.metadata),
+                    "--model-name",
+                    "cli/florence",
+                    "--model-revision",
+                    "cli-revision",
+                    "--model-cache-dir",
+                    "cli/caption-cache",
+                    "--task-prompt",
+                    "<MORE_DETAILED_CAPTION>",
+                ]
+            )
+        self.assertEqual(from_env.model_name, "env/florence")
+        self.assertEqual(from_env.model_revision, "env-revision")
+        self.assertEqual(from_env.model_cache_dir, Path("env/caption-cache"))
+        self.assertEqual(from_env.task_prompt, "<CAPTION>")
+        self.assertEqual(explicit.model_name, "cli/florence")
+        self.assertEqual(explicit.model_revision, "cli-revision")
+        self.assertEqual(explicit.model_cache_dir, Path("cli/caption-cache"))
+        self.assertEqual(explicit.task_prompt, "<MORE_DETAILED_CAPTION>")
+
     def test_florence_loader_and_batch_postprocessing_without_download(self) -> None:
         import torch
 

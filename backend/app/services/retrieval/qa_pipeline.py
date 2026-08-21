@@ -52,7 +52,7 @@ class QaSearchPipeline:
     def search(
         self,
         query: str,
-        top_k: int = 5,
+        top_k: int = 20,
         *,
         task_mode: str = "qa",
         expanded_queries: Sequence[str] | None = None,

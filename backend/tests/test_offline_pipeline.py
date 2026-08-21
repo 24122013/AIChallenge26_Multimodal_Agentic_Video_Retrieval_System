@@ -678,6 +678,43 @@ class OfflinePipelineOrchestrationTests(unittest.TestCase):
         self.assertTrue(result.corpus_skipped)
         self.assertEqual(existing_index.read_text(encoding="utf-8"), "keep")
 
+    def test_offline_caption_env_and_cli_precedence(self) -> None:
+        environment = {
+            "CAPTION_MODEL": "env/florence",
+            "CAPTION_MODEL_REVISION": "env-revision",
+            "CAPTION_MODEL_CACHE_DIR": "env/cache/caption",
+            "CAPTION_TASK_PROMPT": "<CAPTION>",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            parser = pipeline.build_parser()
+            from_env = pipeline._config_from_args(
+                parser.parse_args(["--video-id", "video_A"])
+            )
+            explicit = pipeline._config_from_args(
+                parser.parse_args(
+                    [
+                        "--video-id",
+                        "video_A",
+                        "--caption-model-name",
+                        "cli/florence",
+                        "--caption-model-revision",
+                        "cli-revision",
+                        "--caption-model-cache-dir",
+                        "cli/cache/caption",
+                        "--caption-task-prompt",
+                        "<MORE_DETAILED_CAPTION>",
+                    ]
+                )
+            )
+        self.assertEqual(from_env.caption_model_name, "env/florence")
+        self.assertEqual(from_env.caption_model_revision, "env-revision")
+        self.assertEqual(from_env.caption_model_cache_dir, Path("env/cache/caption"))
+        self.assertEqual(from_env.caption_task_prompt, "<CAPTION>")
+        self.assertEqual(explicit.caption_model_name, "cli/florence")
+        self.assertEqual(explicit.caption_model_revision, "cli-revision")
+        self.assertEqual(explicit.caption_model_cache_dir, Path("cli/cache/caption"))
+        self.assertEqual(explicit.caption_task_prompt, "<MORE_DETAILED_CAPTION>")
+
     def test_empty_video_id_is_rejected_instead_of_expanding_to_full_dataset(
         self,
     ) -> None:

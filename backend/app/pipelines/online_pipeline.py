@@ -395,7 +395,7 @@ class OnlinePipeline:
                 )
             )
             if requested_task == "auto" and top_k is None and resolved_task == "qa":
-                requested_top_k = 5
+                requested_top_k = 20
 
         if resolved_task in {"kis", "avs"}:
             assert plan is not None
@@ -412,7 +412,7 @@ class OnlinePipeline:
                 raise RuntimeError("QA pipeline is unavailable in this online runtime")
             raw = self.qa_pipeline.search(
                 original_query,
-                top_k=min(requested_top_k, 5),
+                top_k=requested_top_k,
                 task_mode="auto" if requested_task == "auto" else "qa",
                 expanded_queries=tuple(expanded_queries),
             )
@@ -748,8 +748,8 @@ class OnlinePipeline:
 
     def _top_k(self, value: int | None, *, task: str) -> int:
         if task == "qa":
-            default = 5
-            maximum = int(self.config.max_top_k)
+            default = 20
+            maximum = min(int(self.config.max_top_k), 100)
         elif task == "trake":
             default = int(self.runtime_config.trake.max_answers)
             maximum = min(

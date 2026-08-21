@@ -99,6 +99,23 @@ class OnlineApiContractTest(unittest.TestCase):
             top_k=9,
         )
 
+    def test_unified_qa_forwards_requested_frame_count(self) -> None:
+        expected = {"task": "qa", "evidence": [], "answer": {"status": "disabled"}}
+        with mock.patch.object(
+            search_api,
+            "search_online",
+            return_value=expected,
+        ) as search_online:
+            response = search_api.search("What is written on the sign?", 100, "qa")
+
+        self.assertEqual(response, expected)
+        search_online.assert_called_once_with(
+            query="What is written on the sign?",
+            task="qa",
+            top_k=100,
+            expanded_queries=[],
+        )
+
     def test_unified_search_accepts_kis_temporal_as_a_kis_profile(self) -> None:
         expected = {"task": "kis", "candidates": []}
         with mock.patch.object(

@@ -556,7 +556,7 @@ def phases(doc, bullets):
         (
             "Phase 4 — Qwen3.5 Grounded QA",
             [
-                "Qwen/Qwen3.5-9B@c202236 đọc tối đa Top 3 evidence và chỉ trả JSON contract.",
+                "Qwen/Qwen3.5-2B@15852e8c đọc tối đa Top 3 evidence và chỉ trả JSON contract.",
                 "Lazy shared runner, CUDA 4-bit mặc định, generation lock tuần tự, cache theo question/evidence/model/prompt revision.",
                 "Citation phải thuộc evidence ID; answer type phải khớp parser; JSON/OOM/timeout fallback manual evidence.",
                 "QA_ANSWER_MODE=off|optional|required, mặc định off.",

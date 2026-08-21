@@ -93,9 +93,13 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
         return (
             <QaDisplay 
                 qaData={dataPayload as QAData}
+                results={filteredResults}
                 cardSize={cardSize}
+                groupBy={groupBy}
                 onSelectResult={onSelectResult}
+                onFinalSubmit={onFinalSubmit}
                 clickedSceneIds={clickedSceneIds}
+                submittedSceneIds={submittedSceneIds}
             />
         );
     }
@@ -192,7 +196,7 @@ const SearchBoard: React.FC<SearchBoardProps> = ({
                     </button>
                 </div>
 
-                {(activeTask === 'KIST' || activeTask === 'TEMPORAL') && (
+                {(activeTask === 'KIST' || activeTask === 'QA' || activeTask === 'TEMPORAL') && (
                     <>
                         <div className="h-6 w-px bg-zinc-300 dark:bg-zinc-700 mx-1" />
                         <select

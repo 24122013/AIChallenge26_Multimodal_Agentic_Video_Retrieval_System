@@ -501,6 +501,7 @@ class OnlinePipelineTest(unittest.TestCase):
         qa_response = pipeline.run(
             "What is the man holding?",
             task="qa",
+            top_k=37,
             expanded_queries=["man carries an object"],
         )
         temporal_response = pipeline.run(
@@ -511,6 +512,7 @@ class OnlinePipelineTest(unittest.TestCase):
         )
 
         self.assertEqual(qa.calls[0][2], "qa")
+        self.assertEqual(qa.calls[0][1], 37)
         self.assertEqual(qa_response["query_plan"]["original_query"], "What is the man holding?")
         self.assertIn("answer", qa_response)
         self.assertEqual(temporal.calls[0][2:], ("temporal", ()))

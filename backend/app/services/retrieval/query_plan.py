@@ -18,6 +18,7 @@ SUPPORTED_PROFILES = ("auto", "kis", "avs", "qa", "temporal")
 QA_ANSWER_TYPES = (
     "object",
     "color",
+    "material",
     "ocr",
     "action",
     "count",
@@ -76,7 +77,10 @@ _BEFORE_OR_AFTER = re.compile(
 _QUOTED = re.compile(r'''["'“”‘’]([^"'“”‘’]+)["'“”‘’]''')
 _OCR = re.compile(
     r"\b(?:text|written|printed|read|subtitle|sign|signboard|plate|menu|logo|qr|bib)\b"
-    r"|\b(?:chữ|văn\s+bản|ghi\s+(?:chữ\s+)?gì|viết\s+(?:chữ\s+)?gì|phụ\s+đề|biển\s+hiệu|biển\s+báo|biển\s+số|thực\s+đơn|mã\s+qr)\b",
+    r"|\b(?:chữ|văn\s+bản|ghi\s+(?:chữ\s+)?gì|viết\s+(?:chữ\s+)?gì|phụ\s+đề|biển\s+hiệu|biển\s+báo|biển\s+số|thực\s+đơn|mã\s+qr)\b"
+    r"|\b(?:hiện|xuất\s+hiện|hiển\s+thị)\s+trên\s+màn\s+hình\b"
+    r"|\btrên\s+bảng\s+chữ\b|\bdòng\s+chữ\b|\btên\s+hiển\s+thị\b"
+    r"|\bchữ\s+trên\s+biển\b|\bphụ\s+đề\s+ghi\b|\bmàn\s+hình\s+ghi\b",
     re.IGNORECASE,
 )
 _OBJECT = re.compile(
@@ -108,7 +112,17 @@ _ANSWER_TYPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "color",
         re.compile(
-            r"\b(?:màu\s+gì|what\s+colou?r|which\s+colou?r)\b",
+            r"\b(?:(?:những|hai)\s+)?màu(?:\s+chính)?\s+(?:gì|nào)\b"
+            r"|\b(?:what\s+colou?r|which\s+colou?r)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "material",
+        re.compile(
+            r"\b(?:vật|chất)\s+liệu\s+(?:gì|nào)\b"
+            r"|\b(?:được\s+)?(?:làm|lợp)\s+bằng\s+(?:gì|vật\s+liệu\s+nào)\b"
+            r"|\bwhat\s+material\b|\bmade\s+(?:of|from)\s+what\b",
             re.IGNORECASE,
         ),
     ),
@@ -148,6 +162,7 @@ _ANSWER_TYPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "object",
         re.compile(
             r"\b(?:cầm|giữ|mang)\b.*\b(?:gì|vật\s+gì)\b"
+            r"|\b(?:phương\s+tiện|con\s+vật|dụng\s+cụ|đồ\s+vật|vật|món)\s+(?:gì|nào)\b"
             r"|\bwhat\b.*\b(?:holding|hold|carrying|carry)\b"
             r"|\b(?:holding|hold|carrying|carry)\b.*\bwhat\b",
             re.IGNORECASE,
@@ -165,6 +180,7 @@ _ANSWER_TYPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 _SUBJECT_PHRASES = (
+    ("người dẫn chương trình", ("người dẫn chương trình", "người dẫn")),
     ("người đi xe đạp", ("người đi xe đạp",)),
     ("người phụ nữ", ("người phụ nữ",)),
     ("người đàn ông", ("người đàn ông",)),
@@ -180,6 +196,13 @@ _SUBJECT_PHRASES = (
     ("người", ("người",)),
 )
 _OBJECT_PHRASES = (
+    ("cabin cáp treo", ("cabin cáp treo",)),
+    ("đèn lồng", ("những chiếc đèn lồng", "các chiếc đèn lồng", "chiếc đèn lồng", "đèn lồng")),
+    ("lan can", ("lan can",)),
+    ("bức tượng", ("hai bức tượng", "bức tượng", "tượng")),
+    ("chòi", ("các chòi", "những chòi", "chòi")),
+    ("nồi đen", ("chiếc nồi đất đen", "nồi đất đen", "nồi đen")),
+    ("bát trắng", ("chiếc bát trắng", "bát trắng")),
     ("mũ bảo hiểm", ("mũ bảo hiểm",)),
     ("đèn giao thông", ("đèn giao thông",)),
     ("traffic light", ("the traffic light", "a traffic light", "traffic light")),
@@ -437,6 +460,7 @@ def build_query_plan(
         "object": ("visual", "objects", "caption"),
         "count": ("visual", "objects", "caption"),
         "color": ("visual", "caption"),
+        "material": ("visual", "objects", "caption"),
         "action": ("visual", "caption"),
         "location": ("visual", "caption"),
         "identity": ("visual", "caption"),
@@ -584,6 +608,18 @@ def _known_constraints(
     )
     attributes, _ = _extract_phrases(folded, _ATTRIBUTE_PHRASES)
     actions, _ = _extract_phrases(folded, _ACTION_PHRASES)
+    # ``ăn`` is a noun modifier in ``món ăn``/``thức ăn`` rather than an
+    # observed eating action.  Keep it only when another standalone occurrence
+    # remains in the question.
+    if "ăn" in actions:
+        action_scope = re.sub(
+            r"\b(?:món|thức)\s+ăn\b",
+            "",
+            folded,
+            flags=re.IGNORECASE,
+        )
+        if re.search(r"\băn\b", action_scope, re.IGNORECASE) is None:
+            actions = tuple(value for value in actions if value != "ăn")
     if not locations:
         locations = _generic_locations(folded)
     if not subjects:
@@ -685,16 +721,67 @@ def _generic_locations(query: str) -> tuple[str, ...]:
         match = re.search(pattern, query, flags=re.IGNORECASE)
         if match:
             value = stop_words.sub("", match.group(0)).strip(" ,.;?!")
-            if value:
+            value = _trim_constraint_phrase(value, category="locations")
+            if value and not _is_answer_surface_location(value):
                 return (value,)
     return ()
 
 
 def _canonical_entity(value: str) -> str:
-    cleaned = " ".join(value.strip(" ,.;?!").split())
+    cleaned = _trim_constraint_phrase(value, category="objects")
     cleaned = re.sub(r"^(?:a|an|the)\s+", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"^(?:có|what|which)\s+", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
+
+
+def _trim_constraint_phrase(value: str, *, category: str) -> str:
+    """Keep a compact noun/prepositional phrase, never an answer slot/clause."""
+
+    cleaned = " ".join(value.strip(" ,.;?!").split())
+    cleaned = re.split(
+        r"\b(?:gì|nào|bao\s+nhiêu|khi|mà|để)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    # These predicates terminate the noun phrase captured by the permissive
+    # Vietnamese fallback patterns.  The list is intentionally conservative:
+    # attributes such as colour and spatial complements remain available.
+    cleaned = re.split(
+        r"\b(?:đang|cùng|được|bị|xuất\s+hiện|hiện|hiển\s+thị|"
+        r"ngồi|đứng|đi|di\s+chuyển|dùng|sử(?:\s+dụng)?|đặt|dựng|"
+        r"treo|lợp|làm|múc|quay|nhìn|bốc)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    cleaned = cleaned.strip(" ,.;?!")
+    cleaned = re.sub(r"\s+phía$", "", cleaned, flags=re.IGNORECASE).strip()
+    if category == "locations" and cleaned.casefold() in {
+        "trên",
+        "dưới",
+        "cạnh",
+        "gần",
+        "phía sau",
+        "phía trên",
+        "phía dưới",
+    }:
+        return ""
+    return cleaned
+
+
+def _is_answer_surface_location(value: str) -> bool:
+    """Reject OCR/answer-slot surfaces incorrectly captured as locations."""
+
+    folded = value.casefold()
+    return bool(
+        re.search(
+            r"\b(?:màn\s+hình|bảng\s+chữ|dòng\s+chữ|phương\s+tiện|"
+            r"con\s+vật|dụng\s+cụ|đồ\s+vật|vật\s+liệu)\b",
+            folded,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _extract_phrases(
@@ -914,6 +1001,13 @@ def _retrieval_statement(query: str, answer_type: str) -> str:
             statement,
             flags=re.IGNORECASE,
         )
+        statement = re.sub(
+            r"\b(?:trên\s+)?(?:phương\s+tiện|dụng\s+cụ|đồ\s+vật|vật|món)\s+(?:gì|nào)\b"
+            r"|\b(?:có\s+hình\s+)?con\s+vật\s+(?:gì|nào)\b",
+            "",
+            statement,
+            flags=re.IGNORECASE,
+        )
         match = re.match(
             r"^\s*what\s+(?:is|are|was|were)\s+(.+?)\s+(holding|carrying)\s*$",
             statement,
@@ -931,7 +1025,17 @@ def _retrieval_statement(query: str, answer_type: str) -> str:
             statement = f"{match.group(1).strip()} {verb} an object"
     elif answer_type == "color":
         statement = re.sub(
-            r"\b(?:có\s+)?màu\s+gì\b|\bwhat\s+colou?r\b|\bwhich\s+colou?r\b",
+            r"\b(?:được\s+sơn\s+)?(?:(?:những|hai)\s+)?màu(?:\s+chính)?\s+(?:gì|nào)\b"
+            r"|\bwhat\s+colou?r\b|\bwhich\s+colou?r\b",
+            "",
+            statement,
+            flags=re.IGNORECASE,
+        )
+    elif answer_type == "material":
+        statement = re.sub(
+            r"\b(?:sử\s+dụng\s+)?(?:vật|chất)\s+liệu\s+(?:gì|nào)\b"
+            r"|\b(?:được\s+)?(?:làm|lợp)\s+bằng\s+(?:gì|vật\s+liệu\s+nào)\b"
+            r"|\bwhat\s+material\b|\bmade\s+(?:of|from)\s+what\b",
             "",
             statement,
             flags=re.IGNORECASE,
@@ -949,7 +1053,8 @@ def _retrieval_statement(query: str, answer_type: str) -> str:
         statement = re.sub(
             r"\b(?:đó\s+)?là\s+ai\b"
             r"|^\s*who\s+(?:is|are|was|were)\s+"
-            r"|\b(?:tên|name)\b.*?\b(?:là\s+gì|what)\b",
+            r"|^\s*(?:tên|name)\s+"
+            r"|\b(?:là\s+gì|is\s+what)\s*$",
             "",
             statement,
             flags=re.IGNORECASE,
@@ -1019,6 +1124,12 @@ def _retrieval_statement(query: str, answer_type: str) -> str:
         )
         statement = re.sub(r"\bkhông\s*$", "", statement, flags=re.IGNORECASE)
     cleaned = " ".join(statement.split()).strip(" ?.!;,")
+    cleaned = re.sub(
+        r"\b(?:có|được|để|is|are|was|were)\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip(" ?.!;,")
     return cleaned or query.strip(" ?.!;,")
 
 

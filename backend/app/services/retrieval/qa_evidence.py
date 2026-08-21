@@ -186,8 +186,10 @@ class QaRoutingConfig:
     evidence_bundle_enabled: bool = True
     per_modality_limit: int = 100
     rerank_pool_size: int = 100
-    fusion_pool_size: int = 20
-    evidence_limit: int = 5
+    fusion_pool_size: int = 100
+    # This limits frame results returned to callers, not the much smaller
+    # bundle sent to the optional answer model (bounded in qa_pipeline.py).
+    evidence_limit: int = 100
     rrf_k: int = 60
     modality_hint_boost: float = 1.5
     consensus_bonus: float = 0.03
@@ -318,6 +320,7 @@ class _RoutingTrace:
             "per_modality_limit": config.per_modality_limit,
             "fusion_pool_size": config.fusion_pool_size,
             "rerank_pool_size": config.rerank_pool_size,
+            "evidence_limit": config.evidence_limit,
             "fallback_used": self.fallback_used,
             "fallback_reasons": list(dict.fromkeys(self.fallback_reasons)),
             "reranker": self.reranker,
@@ -372,7 +375,7 @@ class QaEvidenceSearchEngine:
     def search(
         self,
         question: str,
-        top_k: int = 5,
+        top_k: int = 20,
         *,
         task_mode: str = "qa",
         expanded_queries: Sequence[str] | None = None,
@@ -439,6 +442,12 @@ class QaEvidenceSearchEngine:
                 "external_expansions_ignored": False,
             },
         )
+        if plan.answer_type == "unknown":
+            trace.fallback_used = True
+            _append_reason(
+                trace,
+                "typed_parser_unknown_answer_type:generic_multimodal_retrieval",
+            )
         if plan.needs_temporal:
             trace.fallback_used = True
             _append_reason(trace, "temporal:temporal_routing_disabled")
@@ -930,6 +939,23 @@ class QaEvidenceSearchEngine:
             trace.constraint_rerank = {
                 "applied": False,
                 "status": "no_context_constraints",
+                "weight": self.config.constraint_weight,
+                "min_signal": self.config.constraint_min_signal,
+            }
+            return candidates, base_details
+
+        # An ambiguous parser result must remain fail-open.  All multimodal
+        # branches still run, but uncertain extracted phrases are not allowed
+        # to impose a strong deterministic rerank.
+        if plan.answer_type == "unknown":
+            trace.fallback_used = True
+            _append_reason(
+                trace,
+                "constraint_rerank_skipped:unknown_answer_type",
+            )
+            trace.constraint_rerank = {
+                "applied": False,
+                "status": "unknown_answer_type",
                 "weight": self.config.constraint_weight,
                 "min_signal": self.config.constraint_min_signal,
             }

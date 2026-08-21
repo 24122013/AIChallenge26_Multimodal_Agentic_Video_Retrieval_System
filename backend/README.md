@@ -48,7 +48,7 @@ Ba nguồn frame không được đánh đồng:
 | `avs` | Ad-hoc Video Search | Ranked `candidates` cùng schema KIS, profile AVS | 200 |
 | `temporal` | Temporal evidence | Evidence candidates và `temporal_matches` cho contract QA hiện hữu | 200 |
 | `trake` | Temporal Retrieval and Alignment of Key Events | Ranked `hypotheses`; mỗi item là một same-video sequence có đúng N original `frame_index` | 100 |
-| `qa` | Grounded QA | `evidence`, eligibility/preflight, `answer` và citations/trace | 5 evidence |
+| `qa` | QA frame retrieval | Ranked `evidence` dùng cùng frame-review UX với KIS; `answer` là tùy chọn | 100 |
 | `auto` | Auto router | `requested_task="auto"` và task KIS/AVS/QA đã resolve | Theo task |
 
 KIST là tên bài toán/tài liệu; identifier mà code thực sự nhận là `kis`.
@@ -79,7 +79,7 @@ $env:ONLINE_SEGMENT_CONTEXT_ENABLED = "true"
 
 $env:QA_ANSWER_MODE = "off"
 .\.venv\Scripts\python.exe -m backend.app.pipelines.online_pipeline `
-  --task qa --top-k 5 `
+  --task qa --top-k 100 `
   --query "Người phụ nữ mặc áo đỏ đang cầm vật gì?" `
   --output data/reports/qa_query.json
 ```
@@ -123,7 +123,13 @@ hf download florence-community/Florence-2-base-ft `
 
 Florence-2 không phải chat model và không được ép sinh JSON. Adapter ghi caption
 text vào contract cũ với `structured_caption: null`. Grounded QA giữ
-Qwen3.5-9B; query expansion dùng Qwen3.5-2B 4-bit theo inventory runtime.
+Qwen3.5-2B trong cache `data/model_cache/qa_answer`; query expansion là instance
+khác trong `data/model_cache/query_expansion`, dù cùng tên checkpoint.
+
+`run_caption.py` và offline pipeline resolve `CAPTION_MODEL`,
+`CAPTION_MODEL_REVISION`, `CAPTION_MODEL_CACHE_DIR` và `CAPTION_TASK_PROMPT` theo
+thứ tự CLI argument > `.env` > code default. Caption report luôn ghi effective
+model/revision/task prompt/device/cache directory.
 
 Gọi trực tiếp từ Python:
 
@@ -147,7 +153,7 @@ trake_core = search_trake(
 qa = search_online(
     query="Người phụ nữ mặc áo đỏ đang cầm vật gì?",
     task="qa",
-    top_k=5,
+    top_k=100,
 )
 ```
 
@@ -186,7 +192,7 @@ Khi router được mount, các request chính xác là:
 | Visual KIS | `POST /retrieval/online` với `{"query":"...","task":"kis_visual","top_k":20}` hoặc `POST /retrieval/kis-visual` |
 | Temporal KIS | `POST /retrieval/online` với `{"query":"...","task":"kis_temporal","top_k":100}` hoặc `POST /retrieval/kis-temporal` |
 | TRAKE | `POST /retrieval/online` với `{"query":"...","task":"trake","top_k":100,"expanded_queries":[]}` hoặc `POST /retrieval/trake` với `{"query":"...","top_k":100}` |
-| QA | `POST /retrieval/qa` với `{"query":"...","top_k":5,"task_mode":"qa","expanded_queries":[]}` |
+| QA | `POST /retrieval/qa` với `{"query":"...","top_k":100,"task_mode":"qa","expanded_queries":[]}` |
 
 `POST /search` dùng `mode="kis"|"kis_visual"|"kis_temporal"|"trake"|"qa"` thay cho field `task` và cũng nhận
 `include_context`/`debug`. Bỏ hai field này hoặc gửi `null` giữ runtime default;
@@ -243,7 +249,7 @@ Query expansion của KIS dùng lazy `Qwen/Qwen3.5-2B` tại revision
 `15852e8c16360a2fea060d615a32b45270f8a8fc`, `quantization=4bit`. Cache hit được
 kiểm tra trước `_load`; disabled runtime không construct provider. Trace báo model,
 revision, quantization, device, cache hit và provider call count. Grounded QA vẫn
-dùng riêng `Qwen/Qwen3.5-9B`; CSES và final deterministic rerank không phải model.
+dùng instance riêng `Qwen/Qwen3.5-2B`; CSES và final deterministic rerank không phải model.
 
 `configs/retrieval.yaml` sections `hybrid`, `weights`, `text_index`,
 `query_expansion` và `online` điều khiển route này. Defaults quan trọng của
@@ -318,7 +324,12 @@ QA dùng cùng canonical corpus nhưng có feature flags riêng:
 | `QA_BGE_DENSE_ENABLED` | `true` | Bật BGE-M3 dense evidence retrieval |
 | `QA_BGE_INDEX_ROOT` | `data/indexes/bge_m3` | Root chứa BGE FAISS/map/manifest |
 | `QA_BGE_RERANKER_ENABLED` | `false` | Model reranker tắt; deterministic/constraint reranking vẫn chạy |
-| `QA_ANSWER_MODE` | `required` | Phải sinh grounded answer hoặc fail rõ |
+| `QA_EVIDENCE_LIMIT` | `100` | Giới hạn frame trả về UI; answer model vẫn chỉ nhận tối đa 3–5 frame |
+| `QA_ANSWER_MODE` | `off` | Mặc định chỉ retrieval frame; dùng `optional`/`required` khi thực sự cần answer model |
+| `QA_ANSWER_MODEL` | `Qwen/Qwen3.5-2B` | Chỉ lazy-load khi route QA cần answer |
+| `QA_ANSWER_MODEL_REVISION` | `15852e8c16360a2fea060d615a32b45270f8a8fc` | Pinned checkpoint revision |
+| `QA_ANSWER_DEVICE` / `QA_ANSWER_QUANTIZATION` | `cuda` / `auto` | Auto resolve thành 4-bit trên CUDA |
+| `QA_ANSWER_MODEL_CACHE_DIR` | `data/model_cache/qa_answer` | Cache riêng, không dùng chung query expansion |
 | `QA_MODELS_LOCAL_ONLY` | `true` | Chỉ dùng checkpoint đã có trong cache khi bật |
 
 QA BGE flags không bật TRAKE BGE và ngược lại. Retrieval CLI entrypoint tự load

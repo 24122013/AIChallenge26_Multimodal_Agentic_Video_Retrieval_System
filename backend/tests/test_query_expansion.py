@@ -94,7 +94,7 @@ class QueryExpansionPlanTest(unittest.TestCase):
         self.assertEqual(config.model_name, DEFAULT_QUERY_EXPANSION_MODEL)
         self.assertEqual(config.model_revision, DEFAULT_QUERY_EXPANSION_MODEL_REVISION)
         self.assertEqual(config.quantization, "4bit")
-        self.assertEqual(DEFAULT_QA_MODEL, "Qwen/Qwen3.5-9B")
+        self.assertEqual(DEFAULT_QA_MODEL, "Qwen/Qwen3.5-2B")
 
     def test_more_than_two_paraphrases_keeps_first_two_valid(self) -> None:
         original = "a man in a red shirt next to two cars"

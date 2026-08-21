@@ -4,12 +4,19 @@ import tempfile
 import threading
 import time
 import unittest
+import sys
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 from unittest.mock import patch
+
+from PIL import Image
 
 from backend.app.services.retrieval.qa_answerer import (
     GroundedAnswer,
     LazyQwenGroundedRunner,
+    DEFAULT_QA_MODEL,
+    DEFAULT_QA_MODEL_REVISION,
     QA_PROMPT_REVISION,
     RequiredQaAnswerError,
     answer_question,
@@ -432,6 +439,102 @@ class QaAnswererTest(unittest.TestCase):
 
 
 class PromptAndLazyRunnerTest(unittest.TestCase):
+    def test_qwen35_2b_multimodal_loader_json_and_citation_contract(self) -> None:
+        import torch
+
+        transformers = ModuleType("transformers")
+        model_calls: list[tuple[str, dict[str, Any]]] = []
+        processor_calls: list[tuple[str, dict[str, Any]]] = []
+        messages_seen: list[list[dict[str, object]]] = []
+        quantization_calls: list[dict[str, Any]] = []
+
+        class FakeBitsAndBytesConfig:
+            def __init__(self, **kwargs: Any) -> None:
+                quantization_calls.append(kwargs)
+
+        class FakeModel:
+            device = torch.device("cpu")
+
+            def eval(self) -> None:
+                return None
+
+            def generate(self, **kwargs: Any) -> Any:
+                self.generate_kwargs = kwargs
+                return torch.tensor([[10, 11, 12]])
+
+        class FakeModelFactory:
+            @classmethod
+            def from_pretrained(cls, name: str, **kwargs: Any) -> FakeModel:
+                model_calls.append((name, kwargs))
+                return FakeModel()
+
+        class FakeProcessor:
+            @classmethod
+            def from_pretrained(cls, name: str, **kwargs: Any) -> "FakeProcessor":
+                processor_calls.append((name, kwargs))
+                return cls()
+
+            def apply_chat_template(self, messages: Any, **kwargs: Any) -> dict[str, Any]:
+                messages_seen.extend(messages)
+                return {
+                    "input_ids": torch.tensor([[10, 11]]),
+                    "pixel_values": torch.zeros((1, 3, 2, 2)),
+                }
+
+            def batch_decode(self, *_: Any, **__: Any) -> list[str]:
+                return [
+                    '{"status":"answered","answer":"muỗng","answer_type":'
+                    '"object","confidence":0.9,"evidence_ids":["E001"]}'
+                ]
+
+        transformers.AutoModelForMultimodalLM = FakeModelFactory  # type: ignore[attr-defined]
+        transformers.AutoProcessor = FakeProcessor  # type: ignore[attr-defined]
+        transformers.BitsAndBytesConfig = FakeBitsAndBytesConfig  # type: ignore[attr-defined]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image_path = root / "evidence.jpg"
+            Image.new("RGB", (8, 8), color="white").save(image_path)
+            runner = LazyQwenGroundedRunner(
+                device="cuda",
+                quantization="auto",
+                cache_dir=root / "qa-model-cache",
+            )
+            with (
+                patch.dict(sys.modules, {"transformers": transformers}),
+                patch.object(torch.cuda, "is_available", return_value=True),
+                patch.object(torch.cuda, "is_bf16_supported", return_value=False),
+            ):
+                answer, report = answer_question(
+                    "Dụng cụ nào đang được dùng?",
+                    [_evidence(image_path=str(image_path))],
+                    answer_type="object",
+                    mode="required",
+                    cache_root=root / "answer-cache",
+                    runner=runner,
+                )
+
+        self.assertEqual(DEFAULT_QA_MODEL, "Qwen/Qwen3.5-2B")
+        self.assertEqual(
+            DEFAULT_QA_MODEL_REVISION,
+            "15852e8c16360a2fea060d615a32b45270f8a8fc",
+        )
+        self.assertEqual(model_calls[0][0], DEFAULT_QA_MODEL)
+        self.assertEqual(model_calls[0][1]["revision"], DEFAULT_QA_MODEL_REVISION)
+        self.assertIn("dtype", model_calls[0][1])
+        self.assertNotIn("torch_dtype", model_calls[0][1])
+        self.assertEqual(processor_calls[0][0], DEFAULT_QA_MODEL)
+        self.assertTrue(quantization_calls[0]["load_in_4bit"])
+        self.assertEqual(runner._quantization, "4bit")
+        content = messages_seen[0]["content"]  # type: ignore[index]
+        self.assertTrue(any(item.get("type") == "image" for item in content))  # type: ignore[union-attr]
+        joined_text = " ".join(str(item.get("text", "")) for item in content)  # type: ignore[union-attr]
+        self.assertIn("Dụng cụ nào đang được dùng?", joined_text)
+        self.assertIn("E001", joined_text)
+        self.assertEqual(answer.status, "answered")
+        self.assertEqual(answer.evidence_ids, ("E001",))
+        self.assertEqual(report.model_name, "Qwen/Qwen3.5-2B")
+
     def test_prompt_is_grounded_json_only_and_has_no_transcript(self) -> None:
         prompt = build_grounded_prompt(
             "Người phụ nữ cầm gì?",

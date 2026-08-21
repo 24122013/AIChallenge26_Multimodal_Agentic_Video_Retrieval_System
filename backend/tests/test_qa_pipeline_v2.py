@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -100,6 +101,105 @@ class FakeHybrid:
 
 
 class QueryParserV2Test(unittest.TestCase):
+    def test_all_l27_qa_questions_have_typed_grounded_plans(self) -> None:
+        fixture_path = (
+            Path(__file__).resolve().parents[2]
+            / "data"
+            / "questions"
+            / "L27_V001_tasks.json"
+        )
+        questions = json.loads(fixture_path.read_text(encoding="utf-8"))["tasks"]["qa"]
+        expected = {
+            "QA_L27_V001_001": ("identity", {"ocr", "visual", "caption"}, {"subject": "người dẫn chương trình"}),
+            "QA_L27_V001_002": ("object", {"visual", "objects", "caption"}, {"subject": "người dẫn chương trình"}),
+            "QA_L27_V001_003": ("object", {"visual", "objects", "caption"}, {"objects": "bức tượng"}),
+            "QA_L27_V001_004": ("object", {"visual", "objects", "caption"}, {"objects": "bức tượng"}),
+            "QA_L27_V001_005": ("count", {"visual", "objects", "caption"}, {"objects": "cabin cáp treo"}),
+            "QA_L27_V001_006": ("color", {"visual", "caption"}, {"objects": "đèn lồng"}),
+            "QA_L27_V001_007": ("color", {"visual", "caption"}, {"objects": "lan can"}),
+            "QA_L27_V001_008": ("object", {"visual", "objects", "caption"}, {"locations": "bên trái"}),
+            "QA_L27_V001_009": ("material", {"visual", "objects", "caption"}, {"locations": "trên mặt hồ"}),
+            "QA_L27_V001_010": ("count", {"visual", "objects", "caption"}, {"subject": "người đàn ông"}),
+            "QA_L27_V001_011": ("identity", {"ocr", "visual", "caption"}, {"objects": "nồi đen"}),
+            "QA_L27_V001_012": ("object", {"visual", "objects", "caption"}, {"objects": "bát trắng"}),
+        }
+
+        self.assertEqual(len(questions), 12)
+        for item in questions:
+            with self.subTest(question_id=item["id"]):
+                plan = build_query_plan(item["question"], task_mode="qa")
+                answer_type, hints, required_constraints = expected[item["id"]]
+                self.assertEqual(plan.answer_type, answer_type)
+                self.assertTrue(hints.issubset(set(plan.modality_hints)))
+                self.assertTrue(plan.retrieval_statement)
+                self.assertIsNone(
+                    re.search(
+                        r"\b(?:gì|nào|bao\s+nhiêu)\b",
+                        plan.retrieval_statement,
+                        re.IGNORECASE,
+                    )
+                )
+                for category, phrase in required_constraints.items():
+                    self.assertIn(phrase, plan.constraints[category])
+                self.assertTrue(
+                    all(
+                        role == "context"
+                        for category_roles in plan.roles.values()
+                        for role in category_roles.values()
+                    )
+                )
+                self.assertFalse(plan.needs_temporal)
+                self.assertGreaterEqual(plan.confidence, 0.9)
+
+        serialized = json.dumps(
+            [build_query_plan(item["question"], task_mode="qa").constraints for item in questions],
+            ensure_ascii=False,
+        )
+        for invalid in (
+            "trên phương tiện gì",
+            "trên bảng chữ khi",
+            "trên mặt hồ sử",
+            "cabin cáp treo cùng xuất hiện",
+        ):
+            self.assertNotIn(invalid, serialized)
+
+    def test_vietnamese_object_color_material_and_ocr_cue_variants(self) -> None:
+        typed_cases = (
+            ("Đó là phương tiện nào?", "object"),
+            ("Đây là con vật gì?", "object"),
+            ("Dụng cụ nào được dùng?", "object"),
+            ("Đồ vật gì ở cạnh cửa?", "object"),
+            ("Vật nào nằm trên bàn?", "object"),
+            ("Món gì được đặt trong nồi?", "object"),
+            ("Vật có màu nào?", "color"),
+            ("Hai màu chính nào xuất hiện?", "color"),
+            ("Mái dùng chất liệu nào?", "material"),
+            ("Mái được lợp bằng gì?", "material"),
+            ("Bàn được làm bằng gì?", "material"),
+        )
+        for question, answer_type in typed_cases:
+            with self.subTest(question=question):
+                self.assertEqual(
+                    build_query_plan(question, task_mode="qa").answer_type,
+                    answer_type,
+                )
+
+        for cue in (
+            "hiện trên màn hình",
+            "xuất hiện trên màn hình",
+            "hiển thị trên màn hình",
+            "trên bảng chữ",
+            "dòng chữ",
+            "tên hiển thị",
+            "chữ trên biển",
+            "phụ đề ghi",
+            "màn hình ghi",
+        ):
+            with self.subTest(cue=cue):
+                plan = build_query_plan(f"Tên món ăn {cue} là gì?", task_mode="qa")
+                self.assertEqual(plan.answer_type, "identity")
+                self.assertTrue({"ocr", "visual", "caption"}.issubset(plan.modality_hints))
+
     def test_typed_vietnamese_object_contract(self) -> None:
         plan = build_query_plan(
             "Người phụ nữ áo đỏ cầm vật gì?",
@@ -325,6 +425,23 @@ class QueryParserV2Test(unittest.TestCase):
 
 
 class QaRouterEvidenceTest(unittest.TestCase):
+    def test_unknown_parse_is_traceable_and_skips_constraint_rerank(self) -> None:
+        response = QaEvidenceSearchEngine(FakeHybrid()).search(
+            "Khung cảnh bên trái cửa thế nào?",
+            top_k=1,
+        )
+        trace = response["routing_trace"]
+        self.assertTrue(trace["fallback_used"])
+        self.assertIn(
+            "typed_parser_unknown_answer_type:generic_multimodal_retrieval",
+            trace["fallback_reasons"],
+        )
+        self.assertEqual(trace["constraint_rerank"]["status"], "unknown_answer_type")
+        self.assertEqual(
+            {item["modality"] for item in trace["modality_queries"]},
+            {"visual", "caption", "ocr", "objects"},
+        )
+
     def test_external_expansion_is_passthrough_and_traceable(self) -> None:
         hybrid = FakeHybrid()
         response = QaEvidenceSearchEngine(hybrid).search(

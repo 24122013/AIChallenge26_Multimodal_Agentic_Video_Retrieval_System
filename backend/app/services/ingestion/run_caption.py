@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
+from backend.app.core.environment import load_project_env
 from backend.app.services.ingestion.caption_pipeline import (
+    DEFAULT_MODEL_CACHE_DIR,
     DEFAULT_MODEL_NAME,
     DEFAULT_MODEL_REVISION,
     DEFAULT_TASK_PROMPT,
@@ -22,10 +25,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=Path("data/metadata"))
     parser.add_argument("--output-path", type=Path, help="Only valid for one input file.")
     parser.add_argument("--report-path", type=Path, help="Only valid for one input file.")
-    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME, help="Florence-2 checkpoint name.")
-    parser.add_argument("--model-revision", default=DEFAULT_MODEL_REVISION, help="Pinned Hugging Face commit revision.")
-    parser.add_argument("--model-cache-dir", type=Path, default=Path("data/model_cache/caption"))
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument(
+        "--model-name",
+        default=os.getenv("CAPTION_MODEL", DEFAULT_MODEL_NAME),
+        help="Florence-2 checkpoint name (default: CAPTION_MODEL or code default).",
+    )
+    parser.add_argument(
+        "--model-revision",
+        default=os.getenv("CAPTION_MODEL_REVISION", DEFAULT_MODEL_REVISION),
+        help="Pinned commit (default: CAPTION_MODEL_REVISION or code default).",
+    )
+    parser.add_argument(
+        "--model-cache-dir",
+        type=Path,
+        default=Path(os.getenv("CAPTION_MODEL_CACHE_DIR", str(DEFAULT_MODEL_CACHE_DIR))),
+    )
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default=os.getenv("CAPTION_DEVICE", "auto"),
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument(
@@ -43,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--task-prompt",
         "--prompt",
         dest="task_prompt",
-        default=DEFAULT_TASK_PROMPT,
+        default=os.getenv("CAPTION_TASK_PROMPT", DEFAULT_TASK_PROMPT),
         help="Florence-2 task token (legacy alias: --prompt).",
     )
     parser.add_argument("--segment-caption", action="store_true")
@@ -53,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_project_env()
     args = build_parser().parse_args(argv)
     configure_logging(args.verbose)
     inputs = discover_files(args.metadata_path, "keyframes_*.jsonl")
