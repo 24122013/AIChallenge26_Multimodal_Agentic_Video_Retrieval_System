@@ -103,9 +103,10 @@ trên máy đích thay vì dựa vào một ước lượng chung.
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
+cd AIVIETNAM-AIO-DucTam/AIChallenge26_Multimodal_Agentic_Video_Retrieval_System
+python -m pip install -r requirements.txt
 python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
 python -m pip install paddlepaddle==3.2.0
-python -m pip install -r requirements.txt
 ```
 
 ### NVIDIA CUDA 11.8
