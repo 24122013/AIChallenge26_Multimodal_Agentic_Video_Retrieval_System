@@ -410,18 +410,21 @@ python -m backend.app.pipelines.offline_pipeline `
 
 Phase 2: Build corpus (Nếu đã có đầy đủ artifacts - không cần dùng tới keyframes)
 ```powershell
-python -m build_corpus_artifacts_only.py `
+python -m build_corpus_artifacts_only `
   --data-dir data `
   --expected-videos 873 `
   # --bge-batch-size [...] ` set tuỳ khả năng của GPU
   --device cuda
 ```
 
-Workflow retrieval phải build global FAISS/BM25/BGE, vì vậy các lệnh canonical
-ở trên luôn ghi rõ `--build-corpus`. Corpus mới chứa đúng tập video đang request;
-với quick mode một video, corpus chỉ chứa video đó. Pipeline không tự quét artifact
-cũ vì làm vậy có thể kéo metadata stale vào index. Chỉ dùng `--skip-corpus` khi
-chủ đích muốn tạo/publish artifact per-video mà chưa dùng chúng cho retrieval.
+Workflow khuyến nghị được tách thành hai phase:
+1. offline_pipeline --skip-corpus để hoàn tất toàn bộ per-video artifacts.
+2. build_corpus_artifacts_only.py để build global FAISS/BM25/BGE từ artifacts.
+
+Có thể dùng --build-corpus trực tiếp trong offline_pipeline nếu muốn chạy
+monolithic workflow và vẫn giữ đầy đủ raw video/keyframe workspace local.
+Corpus mới chứa đúng tập video đang request; với quick mode một video, corpus chỉ chứa video đó. Pipeline không tự quét artifact
+cũ vì làm vậy có thể kéo metadata stale vào index. Chỉ dùng `--skip-corpus` khi chủ đích muốn tạo/publish artifact per-video mà chưa dùng chúng cho retrieval.
 
 `--resume` là mặc định và chỉ skip stage khi contract, checksum, identity
 alignment và artifact validator đều pass. `--force` recompute toàn bộ;
