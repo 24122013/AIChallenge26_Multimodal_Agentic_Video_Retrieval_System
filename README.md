@@ -379,27 +379,42 @@ canonical publish/validation trước khi video kế tiếp bắt đầu. Chỉ 
 video requested thành công, pipeline mới build FAISS, BM25, BGE-M3, neighbor
 mapping và segment/event metadata rồi commit tất cả thành một corpus generation.
 
+Phase 1: Preprocess
 ```powershell
 python -m backend.app.pipelines.offline_pipeline `
   --video-dir data/raw/video `
   --video-glob "*.mp4" `
   --output-dir data `
-  --dense-interval 0.5 `
+  --dense-interval 1.0 `
   --device cuda `
+  # --ocr-batch-size [...] ` set tuỳ khả năng của GPU
+  # --caption-batch-size [...] ` set tuỳ khả năng của GPU
+  # Thêm --bge-batch-size [...] nếu gắn flag --build-corpus thay vì --skip-corpus
   --resume `
-  --build-corpus
+  --skip-corpus # Hoặc đổi thành --build-corpus nếu muốn build và sẽ cần giữ lại keyframes trong kho
+  
 ```
 
-Quick mode cho một video và build corpus retrieval chứa video đó:
+Quick mode cho một video:
 
 ```powershell
 python -m backend.app.pipelines.offline_pipeline `
   --video-dir data/raw/video `
   --video-id L01_V001 `
   --output-dir data `
+  --dense-interval 1.0 `
   --device cuda `
   --resume `
-  --build-corpus
+  --skip-corpus
+```
+
+Phase 2: Build corpus (Nếu đã có đầy đủ artifacts - không cần dùng tới keyframes)
+```powershell
+python -m build_corpus_artifacts_only.py `
+  --data-dir data `
+  --expected-videos 873 `
+  # --bge-batch-size [...] ` set tuỳ khả năng của GPU
+  --device cuda
 ```
 
 Workflow retrieval phải build global FAISS/BM25/BGE, vì vậy các lệnh canonical
